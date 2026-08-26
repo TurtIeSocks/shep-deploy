@@ -83,22 +83,17 @@ mod tests {
     /// exhausted rather than panicking or returning an empty `Vec`. `Probed`
     /// calls `describe` many times inside a single wait, and these tests
     /// only need to name the interesting statuses, not one per poll.
-    ///
-    /// Named fields rather than a tuple struct, so that `Statuses`'s only
-    /// entry in the value namespace is the plain function below - this is
-    /// what lets `Statuses(vec![...])` at the call site build a value that
-    /// also carries a `Cell` for the read position, without the test bodies
-    /// naming it.
     struct Statuses {
         sequence: Vec<ProcStatus>,
         next: Cell<usize>,
     }
 
-    #[allow(non_snake_case)]
-    fn Statuses(sequence: Vec<ProcStatus>) -> Statuses {
-        Statuses {
-            sequence,
-            next: Cell::new(0),
+    impl Statuses {
+        fn new(sequence: Vec<ProcStatus>) -> Self {
+            Self {
+                sequence,
+                next: Cell::new(0),
+            }
         }
     }
 
@@ -110,7 +105,9 @@ mod tests {
             unimplemented!()
         }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            let last = self.sequence.len() - 1;
+            let Some(last) = self.sequence.len().checked_sub(1) else {
+                return Ok(Vec::new());
+            };
             let index = self.next.get().min(last);
             self.next.set((index + 1).min(last));
             Ok(vec![instance(self.sequence[index])])
@@ -131,7 +128,7 @@ mod tests {
     /// ready", so Online is the ONLY status that means the probe passed.
     #[tokio::test]
     async fn starting_is_not_success() {
-        let daemon = Statuses(vec![ProcStatus::Starting, ProcStatus::Starting]);
+        let daemon = Statuses::new(vec![ProcStatus::Starting, ProcStatus::Starting]);
         let ok = wait(&daemon, "web", Verify::Probed, Duration::from_millis(50))
             .await
             .unwrap();
@@ -141,7 +138,7 @@ mod tests {
     /// fails if reaching Online is not treated as success.
     #[tokio::test]
     async fn reaching_online_is_success() {
-        let daemon = Statuses(vec![ProcStatus::Starting, ProcStatus::Online]);
+        let daemon = Statuses::new(vec![ProcStatus::Starting, ProcStatus::Online]);
         assert!(
             wait(&daemon, "web", Verify::Probed, Duration::from_secs(5))
                 .await
@@ -154,11 +151,45 @@ mod tests {
     /// running after the window is enough.
     #[tokio::test]
     async fn alive_accepts_a_still_running_process() {
-        let daemon = Statuses(vec![ProcStatus::Starting, ProcStatus::Starting]);
+        let daemon = Statuses::new(vec![ProcStatus::Starting, ProcStatus::Starting]);
         assert!(
             wait(&daemon, "web", Verify::Alive, Duration::from_millis(50))
                 .await
                 .unwrap()
         );
+    }
+
+    /// fails if a sheep the shepherd cannot find (an empty `describe`
+    /// result) is ever treated as verified. Both modes must fail closed
+    /// here: there is nothing to have come up healthy.
+    #[tokio::test]
+    async fn an_empty_describe_is_failure_in_both_modes() {
+        let empty = Statuses::new(Vec::new());
+        assert!(
+            !wait(&empty, "web", Verify::Probed, Duration::from_millis(50))
+                .await
+                .unwrap()
+        );
+        let empty = Statuses::new(Vec::new());
+        assert!(
+            !wait(&empty, "web", Verify::Alive, Duration::from_millis(50))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// fails if the fixture stops repeating its last status once its
+    /// sequence is exhausted, whether by panicking or by returning an empty
+    /// `Vec`. `Probed` polls every 100ms, so a 350ms window against a
+    /// two-element sequence outlives it several times over; every one of
+    /// those extra polls must keep reading the last status rather than
+    /// running off the end.
+    #[tokio::test]
+    async fn the_fixture_repeats_its_last_status_past_exhaustion() {
+        let daemon = Statuses::new(vec![ProcStatus::Starting, ProcStatus::Starting]);
+        let ok = wait(&daemon, "web", Verify::Probed, Duration::from_millis(350))
+            .await
+            .unwrap();
+        assert!(!ok);
     }
 }
