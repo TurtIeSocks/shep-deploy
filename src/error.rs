@@ -104,10 +104,12 @@ pub enum Error {
         sheep: String,
         /// The release `current` and `deploy.toml` both name now.
         on: String,
-        /// The release the running process may still be executing.
+        /// The release one or more instances may still be executing.
         running: String,
-        /// Why the reload could not be issued.
+        /// Why a rollback was wanted in the first place.
         why: String,
+        /// Why the reload could not be issued.
+        source: Box<Error>,
     },
     /// A release was swapped in, something went wrong afterwards, and the
     /// rollback that followed succeeded.
@@ -190,12 +192,13 @@ impl fmt::Display for Error {
                 on,
                 running,
                 why,
+                source,
             } => write!(
                 f,
-                "{sheep} is left split: current and deploy.toml both name {on}, but the shepherd \
-                 would not reload onto it ({why}), so the running process may still be {running}. \
-                 Once `shep flock` shows no reload in flight, `shep reload {sheep}` puts it back \
-                 on {on}."
+                "{sheep}: {why}, so it was rolled back to {on} - but the shepherd would not \
+                 reload onto it ({source}). current and deploy.toml both name {on}; one or more \
+                 instances may still be running {running}. Once `shep flock` shows no {sheep} \
+                 row in `stopping`, `shep reload {sheep}` finishes the rollback."
             ),
             Self::RolledBack { to, source } => {
                 write!(f, "rolled back to {to} after: {source}")
@@ -219,14 +222,13 @@ impl core::error::Error for Error {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
             Self::Io { source, .. } => Some(source),
-            Self::RollbackFailed { source, .. } | Self::RolledBack { source, .. } => {
-                Some(&**source)
-            }
+            Self::RollbackFailed { source, .. }
+            | Self::RolledBack { source, .. }
+            | Self::Split { source, .. } => Some(&**source),
             Self::Protocol(_)
             | Self::Config(_)
             | Self::Git { .. }
             | Self::Raced { .. }
-            | Self::Split { .. }
             | Self::Unverified { .. }
             | Self::Build { .. } => None,
         }
@@ -326,24 +328,66 @@ mod tests {
         assert!(shown.contains("deploy.toml"), "{shown}");
     }
 
+    /// A `Split` with the shape the deploy sequence builds.
+    fn split() -> Error {
+        Error::Split {
+            sheep: "web".to_owned(),
+            on: "a1b2c3d".to_owned(),
+            running: "e4f5a6b".to_owned(),
+            why: "it did not come up and stay up, 32s after the reload".to_owned(),
+            source: Box::new(Error::Protocol(
+                "the daemon reported Internal: web is already being reloaded".to_owned(),
+            )),
+        }
+    }
+
     /// fails if the one state this crate cannot repair stops naming all
     /// three of the things an operator has to compare, or stops saying what
     /// to run. A message that says "something went wrong" here leaves a
     /// half-deployed sheep and no way to reason about it.
     #[test]
     fn a_split_state_names_all_three_and_the_way_out() {
-        let err = Error::Split {
-            sheep: "web".to_owned(),
-            on: "a1b2c3d".to_owned(),
-            running: "e4f5a6b".to_owned(),
-            why: "web is already being reloaded".to_owned(),
-        };
-        let shown = err.to_string();
+        let shown = split().to_string();
         assert!(shown.contains("current"), "{shown}");
         assert!(shown.contains("deploy.toml"), "{shown}");
         assert!(shown.contains("a1b2c3d"), "{shown}");
         assert!(shown.contains("e4f5a6b"), "{shown}");
         assert!(shown.contains("shep reload web"), "{shown}");
+        // Why the rollback was wanted, which used to live in a wrapper
+        // around this and is now carried here.
+        assert!(shown.contains("did not come up and stay up"), "{shown}");
+    }
+
+    /// fails if `Split` stops naming an observable an operator can act on.
+    /// "Once no reload is in flight" is not something `shep flock` reports:
+    /// what it shows is a row in `stopping`, and a message that names a
+    /// state with no display is a message that cannot be followed.
+    #[test]
+    fn a_split_state_names_something_an_operator_can_see() {
+        let shown = split().to_string();
+        assert!(shown.contains("stopping"), "{shown}");
+        assert!(!shown.contains("no reload in flight"), "{shown}");
+    }
+
+    /// fails if `Split` collapses a multi-instance flock into one process.
+    /// A reload replaces instances one at a time, so what it interrupts is
+    /// a mixture - some instances on the new release, some on the old - and
+    /// "the running process" describes a flock of one.
+    #[test]
+    fn a_split_state_does_not_promise_a_single_process() {
+        let shown = split().to_string();
+        assert!(shown.contains("one or more instances"), "{shown}");
+        assert!(!shown.contains("the running process"), "{shown}");
+    }
+
+    /// fails if the reload's own failure stops being reachable through the
+    /// error chain. `Split` used to flatten it into a string, which loses
+    /// the RPC code for anything walking `source()` - the same code
+    /// `crate::deploy`'s retry decision is made on.
+    #[test]
+    fn a_split_state_keeps_the_reload_failure_in_the_chain() {
+        let err = split();
+        assert!(err.source().is_some(), "{err:?}");
     }
 
     /// fails if a deploy that was rolled back reports only the failure and

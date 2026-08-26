@@ -58,7 +58,9 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep};
 
+use shep_client::RequestError;
 use shep_client::shep_core::config::AppConfig;
+use shep_client::shep_core::protocol::RpcErrorCode;
 
 use crate::daemon::Daemon;
 use crate::error::Error;
@@ -218,6 +220,7 @@ pub async fn deploy<D: Daemon>(
     }
     swap::point_at(&tree.current(), &release)?;
 
+    let reloaded_at = Instant::now();
     match settle(daemon, sheep, state.verify, budget).await {
         Ok(true) => {
             state.deployed = Some(head.clone());
@@ -225,9 +228,12 @@ pub async fn deploy<D: Daemon>(
             Ok(Outcome::Deployed { sha: head })
         }
         Ok(false) => {
+            // What actually elapsed, not the budget. An `Alive` verdict
+            // takes its turnover wait PLUS the dwell, so quoting the budget
+            // understated the wait every time that mode failed.
             let why = format!(
                 "it did not come up and stay up, {}s after the reload",
-                budget.as_secs()
+                reloaded_at.elapsed().as_secs()
             );
             let to = roll_back(
                 daemon,
@@ -434,11 +440,18 @@ async fn roll_back<D: Daemon>(
     };
 
     let to = sha_of(previous);
-    restore(daemon, tree, state, previous, attempted, patience)
+    restore(daemon, tree, state, previous, attempted, why, patience)
         .await
-        .map_err(|source| Error::RollbackFailed {
-            why: why.to_owned(),
-            source: Box::new(source),
+        // `Split` already carries `why`, and says more about the machine
+        // than the wrapper's own tail could - wrapping it produced a
+        // message that ended by telling an operator to go and check the
+        // three things the inner half had just told them.
+        .map_err(|source| match source {
+            split @ Error::Split { .. } => split,
+            source => Error::RollbackFailed {
+                why: why.to_owned(),
+                source: Box::new(source),
+            },
         })?;
 
     Ok(to)
@@ -483,6 +496,7 @@ async fn restore<D: Daemon>(
     state: &mut State,
     previous: &Path,
     attempted: &str,
+    why: &str,
     patience: Duration,
 ) -> Result<(), Error> {
     let sheep = tree.sheep();
@@ -495,39 +509,79 @@ async fn restore<D: Daemon>(
         state.write(&tree.state_file())?;
     }
 
-    reload_until(daemon, sheep, patience)
-        .await
-        .map_err(|err| Error::Split {
+    match reload_until(daemon, sheep, patience).await {
+        Ok(()) => Ok(()),
+        // A failure that could have cleared and did not is the split state:
+        // the reload may yet be pending, so the process may be on either
+        // release. A failure that could never clear is not - it is just
+        // that failure, and dressing it as a split would claim a running
+        // process that a `NotFound` says is not there.
+        Err(source) if is_retryable(&source) => Err(Error::Split {
             sheep: sheep.to_owned(),
             on: to,
             running: attempted.to_owned(),
-            why: err.to_string(),
-        })
+            why: why.to_owned(),
+            source: Box::new(source),
+        }),
+        Err(source) => Err(source),
+    }
 }
 
 /// How long to leave between attempts at a reload the shepherd would not
 /// take.
 const RETRY_EVERY: Duration = Duration::from_millis(500);
 
-/// Reloads `sheep`, retrying until `patience` runs out.
+/// Whether a failed request is worth asking again.
+///
+/// The refusal this whole retry exists for is `ReloadInFlight`, which shep
+/// maps to [`RpcErrorCode::Internal`] under protest: it carries no code of
+/// its own, so `Internal` is as close as this crate can get to naming it,
+/// and everything else that arrives as `Internal` is at least plausibly
+/// transient too. [`RequestError::Timeout`] and `DeadlineExceeded` are the
+/// same shape of answer from the other two layers.
+///
+/// Everything else is refused at once, which is the half that was missing.
+/// `NotFound` means the selector matched nothing, and asking a second time
+/// cannot make a sheep exist: retrying it burned the entire budget and then
+/// reported a split state claiming a running process there was none of, with
+/// a suggested `shep reload` that fails identically. `Closed` cannot clear
+/// either - this client's connection is gone and nothing here reconnects.
+///
+/// An unrecognised code is NOT retried. [`RpcErrorCode`] is
+/// `#[non_exhaustive]`, so this arm is the one a future variant lands in,
+/// and failing fast on an unknown code is the mistake that costs a bounded
+/// delay rather than the one that costs an operator a wrong diagnosis.
+fn is_retryable(err: &Error) -> bool {
+    match err {
+        Error::Request(RequestError::Timeout { .. }) => true,
+        Error::Request(RequestError::Rpc(rpc)) => matches!(
+            rpc.code,
+            RpcErrorCode::Internal | RpcErrorCode::DeadlineExceeded
+        ),
+        _ => false,
+    }
+}
+
+/// Reloads `sheep`, retrying a failure that could clear until `patience`
+/// runs out.
 ///
 /// The refusal this exists for is transient and self-clearing: the shepherd
 /// will not start a reload while another is in flight, and the one in flight
 /// is precisely what verification just gave up waiting for. Retrying is
 /// therefore the difference between a rollback that lands a few seconds late
-/// and one that cannot happen at all.
-///
-/// Every error is retried, not only that one.
+/// and one that cannot happen at all. What is retried and what is not is
+/// [`is_retryable`]'s decision.
 ///
 /// # Errors
-/// The last failure, once `patience` has run out.
+/// The failure, at once if it could never clear, or the last one after
+/// `patience` has run out.
 async fn reload_until<D: Daemon>(daemon: &D, sheep: &str, patience: Duration) -> Result<(), Error> {
     let deadline = Instant::now() + patience;
     loop {
         match daemon.reload(sheep).await {
             Ok(()) => return Ok(()),
             Err(err) => {
-                if Instant::now() >= deadline {
+                if !is_retryable(&err) || Instant::now() >= deadline {
                     return Err(err);
                 }
                 sleep(RETRY_EVERY).await;
@@ -564,7 +618,7 @@ mod tests {
     use std::process::Command;
 
     use shep_client::shep_core::config::AppConfig;
-    use shep_client::shep_core::protocol::ProcessInfo;
+    use shep_client::shep_core::protocol::{ProcessInfo, RpcError};
     use shep_client::shep_core::status::ProcStatus;
     use shep_client::shep_core::values::UpDuration;
     use tempfile::TempDir;
@@ -734,6 +788,18 @@ mod tests {
         /// The first is never refused, because that is the deploy's own and
         /// the case being modelled is a ROLLBACK arriving while it runs.
         refusals: Cell<u32>,
+        /// The code those refusals carry. `Internal` is what a real
+        /// `ReloadInFlight` arrives as; `NotFound` is the one that can
+        /// never clear.
+        refusal_code: RpcErrorCode,
+        /// Every `reload` call, refused ones included - which is how a test
+        /// can see whether something was retried.
+        attempts: Cell<u32>,
+        /// Whether the pid moves on every `describe`, standing in for a
+        /// release that comes up and then keeps dying and being restarted.
+        flapping: bool,
+        /// Counted only so [`Self::flapping`] has something to move with.
+        describes: Cell<u32>,
         reloads: Cell<u32>,
     }
 
@@ -750,6 +816,10 @@ mod tests {
                 describe_fails: false,
                 plant: None,
                 refusals: Cell::new(0),
+                refusal_code: RpcErrorCode::Internal,
+                attempts: Cell::new(0),
+                flapping: false,
+                describes: Cell::new(0),
                 reloads: Cell::new(0),
             }
         }
@@ -801,6 +871,30 @@ mod tests {
             shepherd
         }
 
+        /// A release that comes up and then will not stay up: a fresh pid
+        /// on every look, which is what a crash loop looks like from
+        /// `describe`.
+        fn flapping() -> Self {
+            Self {
+                flapping: true,
+                ..Self::ready()
+            }
+        }
+
+        /// A shepherd that has never heard of this sheep: every reload
+        /// after the first is `NotFound`, which no amount of asking again
+        /// can change.
+        fn unregistered() -> Self {
+            Self {
+                refusal_code: RpcErrorCode::NotFound,
+                ..Self::busy_for(u32::MAX)
+            }
+        }
+
+        fn attempt_count(&self) -> u32 {
+            self.attempts.get()
+        }
+
         fn reload_count(&self) -> u32 {
             self.reloads.get()
         }
@@ -808,11 +902,15 @@ mod tests {
         /// The pid currently serving: a fresh one per reload, unless this
         /// shepherd keeps the old instance.
         fn pid(&self) -> u32 {
-            if self.replaces {
-                FIRST_PID + self.reloads.get()
-            } else {
-                FIRST_PID
+            if !self.replaces {
+                return FIRST_PID;
             }
+            let churn = if self.flapping {
+                self.describes.get()
+            } else {
+                0
+            };
+            FIRST_PID + self.reloads.get() + churn
         }
 
         /// The status currently serving: whatever this shepherd settles to
@@ -842,6 +940,7 @@ mod tests {
             {
                 std::os::unix::fs::symlink("somewhere", plant).expect("plant a stale tmp link");
             }
+            self.describes.set(self.describes.get() + 1);
             if self.describe_fails && self.reloads.get() > 0 {
                 return Err(Error::Protocol("the shepherd stopped answering".to_owned()));
             }
@@ -855,14 +954,20 @@ mod tests {
             unimplemented!()
         }
         async fn reload(&self, sheep: &str) -> Result<(), Error> {
+            self.attempts.set(self.attempts.get() + 1);
             let refusals = self.refusals.get();
             if self.reloads.get() > 0 && refusals > 0 {
                 if refusals != u32::MAX {
                     self.refusals.set(refusals - 1);
                 }
-                return Err(Error::Protocol(format!(
-                    "the daemon reported Internal: {sheep} is already being reloaded"
-                )));
+                // The shape shep really answers with: `ReloadInFlight` has
+                // no code of its own, so it arrives as `Internal`. A fake
+                // that answered `Protocol` here would let a retry policy
+                // that cannot read codes look correct.
+                return Err(Error::Request(RequestError::Rpc(RpcError {
+                    code: self.refusal_code,
+                    message: format!("{sheep} is already being reloaded"),
+                })));
             }
             self.reloads.set(self.reloads.get() + 1);
             Ok(())
@@ -1010,6 +1115,33 @@ mod tests {
         assert_eq!(budget(&app), Duration::from_secs(78));
     }
 
+    /// fails if a request that can never succeed is retried anyway. The
+    /// retry exists for `ReloadInFlight`, which shep can only report as
+    /// `Internal`; a `NotFound` means the selector matched nothing, and
+    /// asking again cannot make a sheep exist. Retrying it burned the whole
+    /// budget and then reported a split state claiming a running process
+    /// there was none of.
+    #[test]
+    fn only_a_failure_that_could_clear_is_retried() {
+        let rpc = |code| {
+            Error::Request(RequestError::Rpc(RpcError {
+                code,
+                message: "web is already being reloaded".to_owned(),
+            }))
+        };
+
+        assert!(is_retryable(&rpc(RpcErrorCode::Internal)));
+        assert!(is_retryable(&rpc(RpcErrorCode::DeadlineExceeded)));
+        assert!(is_retryable(&Error::Request(RequestError::Timeout {
+            after: Duration::from_secs(1)
+        })));
+
+        assert!(!is_retryable(&rpc(RpcErrorCode::NotFound)));
+        assert!(!is_retryable(&rpc(RpcErrorCode::InvalidConfig)));
+        assert!(!is_retryable(&Error::Request(RequestError::Closed)));
+        assert!(!is_retryable(&Error::Protocol("nonsense".to_owned())));
+    }
+
     /// fails if a rollback gives up the first time the shepherd says it is
     /// busy. That refusal is transient and self-clearing - it means the
     /// reload verification just gave up on is still running - so retrying
@@ -1021,11 +1153,14 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         commit_on_origin(&fixture, "second.txt");
 
-        let outcome = deploy(&Shepherd::busy_for(3), &fixture.tree, &mut fixture.state)
+        let daemon = Shepherd::busy_for(3);
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
             .await
             .expect("completes");
 
         assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+        // The deploy's own reload, three refusals, then the one that took.
+        assert_eq!(daemon.attempt_count(), 5);
         assert_eq!(
             swap::resolve(&fixture.tree.current()).unwrap(),
             Some(fixture.tree.release(&previous))
@@ -1053,9 +1188,13 @@ mod tests {
         .await
         .expect_err("the rollback cannot reload");
 
-        assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
+        // Not wrapped in `RollbackFailed`: that wrapper's tail tells an
+        // operator to go and compare the three things `Split` has just
+        // finished telling them.
+        assert!(matches!(err, Error::Split { .. }), "{err:?}");
         let shown = err.to_string();
-        assert!(shown.contains("is left split"), "{shown}");
+        assert!(!shown.contains("rolling back after"), "{shown}");
+        assert!(shown.contains("would not reload onto it"), "{shown}");
         assert!(shown.contains(&previous), "{shown}");
         assert!(shown.contains(&second), "{shown}");
         assert!(shown.contains("shep reload web"), "{shown}");
@@ -1074,6 +1213,55 @@ mod tests {
                 .as_deref(),
             Some(previous.as_str())
         );
+    }
+
+    /// fails if the reason a rollback happened quotes the budget instead of
+    /// what elapsed. An `Alive` verdict takes its turnover wait PLUS the
+    /// dwell, so a release that comes up and then will not stay up is
+    /// rejected at a moment the budget never names - here ten seconds of
+    /// dwell against a sixteen-second budget. An operator reading the
+    /// budget back is being told how long the deploy was allowed to take,
+    /// not how long it took.
+    #[tokio::test(start_paused = true)]
+    async fn the_reason_quotes_what_elapsed_not_what_was_allowed() {
+        let mut fixture = fixture_with_previous_release();
+        fixture.state.verify = crate::state::Verify::Alive;
+        commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(&Shepherd::flapping(), &fixture.tree, &mut fixture.state)
+            .await
+            .expect("completes");
+
+        let Outcome::RolledBack { why, .. } = outcome else {
+            panic!("a release that will not stay up must roll back: {outcome:?}");
+        };
+        // The dwell alone: the turnover was immediate, and the budget for
+        // this app is 3 + 8 + 5 = 16s.
+        assert!(why.contains("10s"), "{why}");
+        assert!(!why.contains("16s"), "{why}");
+    }
+
+    /// fails if a reload the shepherd can never accept is retried anyway,
+    /// or dressed up as a split state. A `NotFound` means no sheep of that
+    /// name is registered: asking again cannot change it, so the retry
+    /// burned the whole budget, and the `Split` it then reported claimed a
+    /// running process there was none of and prescribed a `shep reload`
+    /// that fails identically.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_that_can_never_succeed_is_not_retried_or_called_a_split() {
+        let mut fixture = fixture_with_previous_release();
+        commit_on_origin(&fixture, "second.txt");
+        let daemon = Shepherd::unregistered();
+
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("the rollback cannot reload");
+
+        assert!(!matches!(err, Error::Split { .. }), "{err:?}");
+        assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
+        assert!(err.to_string().contains("NotFound"), "{err}");
+        // The deploy's own reload and exactly one rollback attempt.
+        assert_eq!(daemon.attempt_count(), 2);
     }
 
     /// fails if a `probed` target with no readiness probe is deployed
