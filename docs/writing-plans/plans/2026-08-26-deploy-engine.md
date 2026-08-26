@@ -989,9 +989,32 @@ Remove the swap-back on verify failure and confirm the rollback test goes red. R
 
 ```
 shep-deploy deploy <sheep>
+shep-deploy deploy <sheep> --watch auto|manual
 ```
 
 Supervised invocation still takes no argv, per the dog contract. This is the second invocation mode. **Depends on shep prerequisite 3** for `shep deploy <sheep>` to reach it, but the binary is directly runnable meanwhile.
+
+`--watch` sets `State::watch`, writes `deploy.toml`, prints what changed, and **returns without deploying**. Write a test that pins the not-deploying, because the whole point of `manual` is pausing a target during an incident and a deploy firing then is the worst possible behaviour:
+
+```rust
+/// fails if setting the watch mode also deploys. `--watch manual` is what an
+/// operator reaches for during an incident, and a deploy firing at that
+/// moment is the exact opposite of what they asked for. The verb says deploy,
+/// which is why this needs a test rather than a comment.
+#[tokio::test]
+async fn setting_the_watch_mode_does_not_deploy() {
+    let (tree, mut state) = fixture_tree_at_head("old-sha");
+    let daemon = RecordingDaemon::default();
+
+    set_watch(&tree, &mut state, Watch::Manual).expect("sets");
+
+    assert_eq!(state.watch, Watch::Manual);
+    assert!(daemon.calls().is_empty(), "no daemon traffic at all");
+    assert_eq!(state.deployed.as_deref(), Some("old-sha"));
+}
+```
+
+Mutation-check it by making `set_watch` fall through into `deploy`, confirming it goes red, and restoring.
 
 - [ ] **Step 7: Run the full gate**
 

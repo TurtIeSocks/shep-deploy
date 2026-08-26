@@ -213,6 +213,30 @@ the convenience without a deploy on every commit, which is the case she named.
 And pausing a target during an incident without rehoming the dog, which is the
 same switch and matters more when something is already going wrong.
 
+**The mode is set by flag, never by hand.** `deploy.toml` is the dog's file
+and an operator should not be editing it:
+
+```
+shep deploy koji --watch manual
+```
+
+**That form does NOT deploy.** It sets the mode, prints what changed, and
+exits. The temptation is to have it deploy as well, since the verb says
+deploy, and that would break the case above: pausing a target during an
+incident is exactly when a deploy must not fire. systemd split the same
+problem into `enable` and `start` for the same reason, adding `--now` as the
+opt-in for both. Two commands are the answer here if somebody wants both, and
+a `--now` flag can be added later if that proves annoying rather than
+theoretical.
+
+**The smit differs by mode**, so `shep flock` answers "which of these is
+actually being watched" without a second command:
+
+```
+▲ main@a1b2c3      watched
+⏸ main@a1b2c3      manual
+```
+
 **Deliberately not added: a `--branch` flag.** The branch comes from the
 user's own checkout, so `git checkout stable` retargets the deploy and nobody
 learns a new config key. That was the best idea in this design and a flag
