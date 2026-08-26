@@ -84,19 +84,40 @@ pub enum Error {
     /// Carries both halves because either alone leaves an operator unable
     /// to diagnose the machine: `why` is the failure that made a rollback
     /// necessary, and the source is what went wrong performing it.
-    Rollback {
+    RollbackFailed {
         /// Why the rollback was wanted.
         why: String,
         /// What went wrong rolling back.
         source: Box<Error>,
     },
+    /// A release was swapped in, something went wrong afterwards, and the
+    /// rollback that followed succeeded.
+    ///
+    /// The deploy still failed, so this is an error and not an
+    /// [`crate::deploy::Outcome`] - but the target is healthy on `to`, and
+    /// an operator reading only the original failure would have no way to
+    /// know a rollback was even attempted. The original stays reachable
+    /// through [`core::error::Error::source`].
+    RolledBack {
+        /// The sha that is live again.
+        to: String,
+        /// What went wrong before the rollback.
+        source: Box<Error>,
+    },
     /// A release was swapped in, never came up, and there was no previous
     /// release to fall back to.
+    ///
+    /// Not a failed rollback: no rollback was attempted, because there was
+    /// nothing to attempt one against. This is a target's first deploy, and
+    /// it is the failure a new user is most likely to meet, so it says the
+    /// whole thing in one sentence rather than being wrapped in another.
     Unverified {
         /// The sheep that did not come up.
         sheep: String,
         /// The release it was left on, because there is no other.
         sha: String,
+        /// What went wrong, as a clause that follows the sheep's name.
+        why: String,
     },
     /// A release's build command exited without succeeding.
     ///
@@ -139,15 +160,18 @@ impl fmt::Display for Error {
                  one was building - refusing to swap on top of it, because that release may be \
                  newer than this one"
             ),
-            Self::Rollback { why, source } => write!(
+            Self::RollbackFailed { why, source } => write!(
                 f,
                 "rolling back after {why} failed: {source} - current may still point at the \
                  release that was rejected"
             ),
-            Self::Unverified { sheep, sha } => write!(
+            Self::RolledBack { to, source } => {
+                write!(f, "rolled back to {to} after: {source}")
+            }
+            Self::Unverified { sheep, sha, why } => write!(
                 f,
-                "{sheep} did not come up on release {sha}, and there is no previous release to \
-                 roll back to - it is still pointed at {sha}"
+                "{sheep}: {why}, and this is its first deploy, so there is nothing to roll back \
+                 to - it is still pointed at {sha}"
             ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
@@ -163,7 +187,9 @@ impl core::error::Error for Error {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
             Self::Io { source, .. } => Some(source),
-            Self::Rollback { source, .. } => Some(&**source),
+            Self::RollbackFailed { source, .. } | Self::RolledBack { source, .. } => {
+                Some(&**source)
+            }
             Self::Protocol(_)
             | Self::Config(_)
             | Self::Git { .. }
@@ -189,6 +215,9 @@ impl From<RequestError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // For `Error::source` on the wrapping variants.
+    use core::error::Error as _;
 
     /// fails if an Io error stops naming the path it failed on. A deploy
     /// touches many paths and "permission denied" without one is unactionable.
@@ -221,7 +250,7 @@ mod tests {
     /// was trying to do, the second says what state it is in now.
     #[test]
     fn a_failed_rollback_names_both_failures() {
-        let err = Error::Rollback {
+        let err = Error::RollbackFailed {
             why: "it did not come up".to_owned(),
             source: Box::new(Error::Io {
                 path: PathBuf::from("/srv/x/current.tmp"),
@@ -248,18 +277,56 @@ mod tests {
         assert!(shown.contains("e4f5a6b"), "{shown}");
     }
 
-    /// fails if a first deploy that never came up stops naming both the
-    /// sheep and the release it is stuck on. This is the one failure with
-    /// no rollback available, so the message is all the operator gets.
+    /// fails if a deploy that was rolled back reports only the failure and
+    /// not the rollback. An operator reading "unexpected answer from the
+    /// shepherd" alone has no way to know a rollback was attempted, let
+    /// alone that it worked and what the target is on now.
     #[test]
-    fn an_unverified_first_release_names_the_sheep_and_the_sha() {
+    fn a_successful_rollback_names_what_is_live_again() {
+        let err = Error::RolledBack {
+            to: "a1b2c3d".to_owned(),
+            source: Box::new(Error::Protocol("a Flock in answer to Describe".to_owned())),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("rolled back to a1b2c3d"), "{shown}");
+        assert!(shown.contains("a Flock in answer to Describe"), "{shown}");
+        assert!(
+            err.source().is_some(),
+            "the original failure stays reachable"
+        );
+    }
+
+    /// fails if a first deploy that never came up stops naming the sheep,
+    /// the release it is stuck on, or what went wrong. This is the failure
+    /// a new user is most likely to meet, and the message is all they get.
+    #[test]
+    fn an_unverified_first_release_names_the_sheep_the_sha_and_the_reason() {
         let err = Error::Unverified {
             sheep: "web".to_owned(),
             sha: "a1b2c3d".to_owned(),
+            why: "it did not come up within 90s of the reload".to_owned(),
         };
         let shown = err.to_string();
-        assert!(shown.contains("web"));
-        assert!(shown.contains("a1b2c3d"));
+        assert!(shown.contains("web"), "{shown}");
+        assert!(shown.contains("a1b2c3d"), "{shown}");
+        assert!(shown.contains("did not come up within 90s"), "{shown}");
+    }
+
+    /// fails if the first-deploy failure starts saying the same thing
+    /// twice. It used to arrive wrapped in `RollbackFailed`, which framed a
+    /// rollback nobody attempted as one that failed, and then said "no
+    /// previous release" and "still pointed at" once each in both layers.
+    /// One sentence, each fact once.
+    #[test]
+    fn an_unverified_first_release_says_each_fact_once() {
+        let err = Error::Unverified {
+            sheep: "web".to_owned(),
+            sha: "a1b2c3d".to_owned(),
+            why: "it did not come up within 90s of the reload".to_owned(),
+        };
+        let shown = err.to_string();
+        assert_eq!(shown.matches("roll back").count(), 1, "{shown}");
+        assert!(!shown.contains("rolling back after"), "{shown}");
     }
 
     /// fails if a build's exit status stops being named. This is the only

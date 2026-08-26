@@ -126,13 +126,16 @@ const fn grace(mode: Verify) -> Duration {
 ///
 /// After the swap, an error from the reload or from verification is rolled
 /// back exactly as a failed verification is - swap, reload, correct the
-/// record - and then the original error is returned, because that is the
-/// one explaining why a rollback was wanted at all. A rollback that itself
-/// fails replaces it with [`Error::Rollback`], which carries both halves:
-/// discarding either leaves a machine an operator cannot diagnose. That
-/// wrapper is also where [`Error::Unverified`] surfaces, for a release that
-/// does not come up with no previous release to return to - a target's very
-/// first deploy.
+/// record - and then returned as [`Error::RolledBack`], which names what is
+/// live again and keeps the original reachable through
+/// [`core::error::Error::source`]. The deploy still failed, so it is still
+/// an error, but an operator reading it can tell a rollback happened.
+///
+/// A rollback that itself fails gives [`Error::RollbackFailed`] instead,
+/// carrying both halves, because discarding either leaves a machine an
+/// operator cannot diagnose. A release that does not come up with no
+/// previous release to return to - a target's very first deploy - gives
+/// [`Error::Unverified`], unwrapped, because no rollback was attempted.
 pub async fn deploy<D: Daemon>(
     daemon: &D,
     tree: &Tree,
@@ -162,6 +165,11 @@ pub async fn deploy<D: Daemon>(
     build::run(&release, &spec, app.user.as_deref()).await?;
 
     // Nothing above here has touched the running app. Everything below has.
+    //
+    // Both sides of this comparison are `read_link` of the same file by the
+    // same process, so they are the same spelling of any path that has not
+    // changed - unlike `roll_back`'s check, which sees text from two
+    // sources and compares shas for that reason.
     let previous = swap::resolve(&tree.current())?;
     if previous != started_at {
         return Err(Error::Raced {
@@ -183,7 +191,8 @@ pub async fn deploy<D: Daemon>(
                 "it did not come up within {}s of the reload",
                 grace(state.verify).as_secs()
             );
-            roll_back(daemon, tree, state, previous.as_deref(), &head, why).await
+            let to = roll_back(daemon, tree, state, previous.as_deref(), &head, &why).await?;
+            Ok(Outcome::RolledBack { to, why })
         }
         // The same rollback as above, not a lesser one. `settle` reloads
         // before it verifies, so an error here can arrive with the new
@@ -193,16 +202,19 @@ pub async fn deploy<D: Daemon>(
         // without a reload would leave the daemon on the new code while
         // `current` and `deploy.toml` both name the old one.
         Err(err) => {
-            roll_back(
+            let to = roll_back(
                 daemon,
                 tree,
                 state,
                 previous.as_deref(),
                 &head,
-                err.to_string(),
+                &err.to_string(),
             )
             .await?;
-            Err(err)
+            Err(Error::RolledBack {
+                to,
+                source: Box::new(err),
+            })
         }
     }
 }
@@ -264,47 +276,61 @@ async fn settle<D: Daemon>(daemon: &D, sheep: &str, mode: Verify) -> Result<bool
     verify::wait(daemon, sheep, mode, grace(mode)).await
 }
 
-/// Puts `previous` back after `attempted` was rejected, and reports what
-/// the target is left on.
+/// Puts `previous` back after `attempted` was rejected, and answers with
+/// the sha the target is live on again.
 ///
-/// Every failure this can meet is wrapped in [`Error::Rollback`] alongside
-/// `why`, at this one place, so a caller never has to choose between the
-/// failure that made a rollback necessary and the failure of the rollback
-/// itself. Both are what an operator needs.
+/// A failure while rolling back is wrapped in [`Error::RollbackFailed`]
+/// alongside `why`, at this one place, so a caller never has to choose
+/// between the failure that made a rollback necessary and the failure of
+/// the rollback itself. Both are what an operator needs.
+///
+/// "Nothing to roll back to" is not wrapped that way, because no rollback
+/// was attempted: there was nothing to attempt one against.
+/// [`Error::Unverified`] says the whole thing in one sentence instead. It
+/// is the failure a new user is most likely to meet, a first deploy that
+/// never comes up, and framing it as a rollback that failed described a
+/// machine nobody could recognise.
+///
+/// Whether there is anything to roll back to is decided by comparing shas,
+/// not paths. Both spellings name the same release when they agree, but
+/// `previous` is link text read off disk and `attempted` is a sha this
+/// process just resolved, and the two need not be written the same way:
+/// `$SHEP_HOME` reaches this crate through
+/// [`std::path::absolute`], which does not resolve symlinks, and the dog
+/// and the operator's own CLI can each arrive at a different literal path
+/// for one directory. A sha comparison has no such degree of freedom.
 ///
 /// # Errors
-/// [`Error::Rollback`] wrapping [`Error::Unverified`] if there is nothing
-/// to roll back to - `current` never pointed anywhere, or it already
-/// pointed at the release that just failed, which between them mean this
-/// was the target's first deploy. [`Error::Rollback`] wrapping whatever
-/// [`restore`] returned otherwise.
+/// [`Error::Unverified`] if there is nothing to roll back to - `current`
+/// never pointed anywhere, or it already points at the release that just
+/// failed, which between them mean this was the target's first deploy.
+/// [`Error::RollbackFailed`] wrapping whatever [`restore`] returned
+/// otherwise.
 async fn roll_back<D: Daemon>(
     daemon: &D,
     tree: &Tree,
     state: &mut State,
     previous: Option<&Path>,
     attempted: &str,
-    why: String,
-) -> Result<Outcome, Error> {
-    let attempted_release = tree.release(attempted);
-    let failed = |source: Error| Error::Rollback {
-        why: why.clone(),
-        source: Box::new(source),
-    };
-
-    let Some(previous) = previous.filter(|path| *path != attempted_release) else {
-        return Err(failed(Error::Unverified {
+    why: &str,
+) -> Result<String, Error> {
+    let Some(previous) = previous.filter(|path| sha_of(path) != attempted) else {
+        return Err(Error::Unverified {
             sheep: tree.sheep().to_owned(),
             sha: attempted.to_owned(),
-        }));
+            why: why.to_owned(),
+        });
     };
 
     let to = sha_of(previous);
     restore(daemon, tree, state, previous, &to)
         .await
-        .map_err(failed)?;
+        .map_err(|source| Error::RollbackFailed {
+            why: why.to_owned(),
+            source: Box::new(source),
+        })?;
 
-    Ok(Outcome::RolledBack { to, why })
+    Ok(to)
 }
 
 /// Points `current` back at `previous`, reloads onto it, and corrects the
@@ -367,6 +393,7 @@ fn sha_of(release: &Path) -> String {
 mod tests {
     use super::*;
 
+    use core::error::Error as _;
     use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -405,17 +432,20 @@ mod tests {
     /// A deploy target with a bare clone, an origin repo, and one release
     /// already live.
     struct Fixture {
-        /// Held only to keep the deploy tree alive for the test's duration.
-        _home: TempDir,
+        /// The `$SHEP_HOME` the tree is rooted in. Held to keep it alive
+        /// for the test's duration, and read by the one test that needs a
+        /// second spelling of the same directory.
+        home: TempDir,
         origin: TempDir,
         tree: Tree,
         state: State,
     }
 
-    /// An origin repo with a Flockfile declaring one app named `web`, a
-    /// bare clone fetched from it, and `current` pointing at a release
-    /// built from its first commit.
-    fn fixture_with_previous_release() -> Fixture {
+    /// An origin repo with a Flockfile declaring one app named `web`, and
+    /// a bare clone fetched from it - but no release built and no
+    /// `current` at all, which is a target the moment before its first
+    /// deploy.
+    fn fixture_before_any_release() -> Fixture {
         let home = tempfile::tempdir().expect("tempdir");
         let origin = tempfile::tempdir().expect("tempdir");
 
@@ -436,14 +466,11 @@ mod tests {
 
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
         crate::git::fetch(&tree.git(), &remote).expect("fetch");
-        let first = crate::git::remote_head(&tree.git(), "main").expect("head");
-        crate::git::worktree_add(&tree.git(), &tree.release(&first), &first).expect("worktree");
-        swap::point_at(&tree.current(), &tree.release(&first)).expect("first swap");
 
         let state = State {
             remote,
             branch: "main".to_owned(),
-            deployed: Some(first),
+            deployed: None,
             verify: crate::state::Verify::Probed,
             watch: crate::state::Watch::Auto,
             origin_cwd: None,
@@ -452,11 +479,31 @@ mod tests {
         };
 
         Fixture {
-            _home: home,
+            home,
             origin,
             tree,
             state,
         }
+    }
+
+    /// [`fixture_before_any_release`] with its first commit already built,
+    /// live under `current`, and recorded in the state.
+    fn fixture_with_previous_release() -> Fixture {
+        let mut fixture = fixture_before_any_release();
+        let first = crate::git::remote_head(&fixture.tree.git(), "main").expect("head");
+        install_release(&fixture, &first);
+        fixture.state.deployed = Some(first);
+        fixture
+    }
+
+    /// Builds `sha`'s worktree and points `current` at it, the way a
+    /// successful deploy would have.
+    fn install_release(fixture: &Fixture, sha: &str) {
+        let tree = &fixture.tree;
+        if !tree.release(sha).exists() {
+            crate::git::worktree_add(&tree.git(), &tree.release(sha), sha).expect("worktree");
+        }
+        swap::point_at(&tree.current(), &tree.release(sha)).expect("swap");
     }
 
     /// Adds a commit to the fixture's origin and returns its sha.
@@ -757,7 +804,21 @@ mod tests {
             .await
             .expect_err("describe fails");
 
-        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+        // The deploy still failed, so this is still an error - but it
+        // names the rollback, and the shepherd's own complaint is still
+        // reachable underneath it.
+        assert!(matches!(err, Error::RolledBack { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("the shepherd stopped answering"),
+            "{err}"
+        );
+        assert!(
+            matches!(
+                err.source().and_then(|s| s.downcast_ref()),
+                Some(Error::Protocol(_))
+            ),
+            "{err:?}"
+        );
         assert_eq!(
             daemon.reload_count(),
             2,
@@ -768,6 +829,66 @@ mod tests {
             Some(fixture.tree.release(&previous))
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a first deploy that never comes up is reported as a
+    /// rollback that failed. Nothing was rolled back, because there was
+    /// nothing to roll back to, and the wrapped form said "no previous
+    /// release" and "still pointed at" once each in both of its layers.
+    /// This is the failure a new user is most likely to meet, so it gets
+    /// one sentence that knows the case exists.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_deploy_that_never_comes_up_has_nothing_to_roll_back_to() {
+        let mut fixture = fixture_before_any_release();
+        let first = crate::git::remote_head(&fixture.tree.git(), "main").expect("head");
+
+        let err = deploy(&Counting::never_ready(), &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("nothing to roll back to");
+
+        assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
+        let shown = err.to_string();
+        assert!(shown.contains("web"), "{shown}");
+        assert!(shown.contains(&first), "{shown}");
+        assert!(shown.contains("did not come up within 90s"), "{shown}");
+        assert!(!shown.contains("rolling back after"), "{shown}");
+        assert_eq!(shown.matches("roll back").count(), 1, "{shown}");
+        // The record never advanced, because nothing verified.
+        assert_eq!(fixture.state.deployed, None);
+    }
+
+    /// fails if "is there anything to roll back to" is decided by comparing
+    /// path text. `previous` is link text read off disk and `attempted` is
+    /// a sha this process just resolved, and one directory can be spelled
+    /// two ways: `$SHEP_HOME` reaches this crate through
+    /// `std::path::absolute`, which does not resolve symlinks, and the
+    /// supervised dog and the operator's own CLI can each arrive at a
+    /// different literal path. With a `deploy.toml` that lags `current`,
+    /// which is the very case `restore` exists to repair, a path
+    /// comparison then reports rolling back to the release that just
+    /// failed - the same one, under its other name.
+    #[tokio::test(start_paused = true)]
+    async fn a_previous_release_under_another_path_is_not_a_rollback_target() {
+        let mut fixture = fixture_with_previous_release();
+        let second = commit_on_origin(&fixture, "second.txt");
+        crate::git::fetch(&fixture.tree.git(), &fixture.state.remote).expect("fetch");
+        install_release(&fixture, &second);
+        // What an interrupted deploy leaves: `current` is on `second` and
+        // the record has never heard of it.
+        fixture.state.deployed = None;
+
+        // The same directory, spelled through a symlink - one process's
+        // $SHEP_HOME, another process's.
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let link = elsewhere.path().join("home");
+        std::os::unix::fs::symlink(fixture.home.path(), &link).expect("symlink the home");
+        let same_tree = Tree::for_sheep(&link, "web");
+
+        let err = deploy(&Counting::never_ready(), &same_tree, &mut fixture.state)
+            .await
+            .expect_err("there is no other release to go back to");
+
+        assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
     }
 
     /// fails if a rollback repairs the filesystem and leaves the record
@@ -817,7 +938,7 @@ mod tests {
         .await
         .expect_err("the swap back collides with the stale tmp link");
 
-        assert!(matches!(err, Error::Rollback { .. }), "{err:?}");
+        assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
         let shown = err.to_string();
         assert!(shown.contains("did not come up"), "{shown}");
         assert!(shown.contains("current.tmp"), "{shown}");
