@@ -16,6 +16,8 @@
 
 mod daemon;
 mod error;
+mod paths;
+mod state;
 
 fn main() {
     println!("not yet implemented");
