@@ -265,8 +265,8 @@ fn head_of(tree: &Tree, branch: &str) -> Result<String, Error> {
             command,
             status,
             stderr: format!(
-                "the fetch succeeded but the remote has no branch named {branch:?} - it was \\
-                 deleted or renamed upstream, or never existed - so there is nothing to deploy: \\
+                "the fetch succeeded but the remote has no branch named {branch:?} - it was \
+                 deleted or renamed upstream, or never existed - so there is nothing to deploy: \
                  {stderr}"
             ),
         }),
@@ -760,6 +760,9 @@ mod tests {
             .await
             .expect("completes");
 
+        // Swapping the symlink is not deploying. Without this the whole
+        // reload can be deleted and the test still passes.
+        assert_eq!(daemon.reload_count(), 1, "the sheep must be reloaded once");
         assert_eq!(
             outcome,
             Outcome::Deployed {
@@ -905,6 +908,13 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("gone"), "{shown}");
         assert!(shown.contains("no branch named"), "{shown}");
+        // Every word of it, not just the words before the first line break
+        // in the source. A `\\` where a line continuation was meant puts a
+        // literal backslash and seventeen spaces in the middle of the one
+        // message a watched target hits unattended, and assertions that
+        // stop early never see it.
+        assert!(shown.contains("nothing to deploy"), "{shown}");
+        assert!(!shown.contains('\\'), "{shown}");
     }
 
     /// fails if a rollback moves the symlink and never reloads. Moving a

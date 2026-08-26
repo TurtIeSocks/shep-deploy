@@ -395,6 +395,26 @@ mod tests {
         assert!(!ok);
     }
 
+    /// fails if a new instance that already died and is backed off waiting
+    /// to be restarted counts as alive. This is the reject side of
+    /// `is_alive`, and it is the failure `Alive` exists to catch: the
+    /// process was spawned, so its pid is new, and it did not survive the
+    /// window.
+    #[tokio::test]
+    async fn alive_rejects_an_instance_waiting_to_be_restarted() {
+        let daemon = Listings::new(vec![vec![instance(2, ProcStatus::WaitingRestart, 13002)]]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &serving(12835),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert!(!ok);
+    }
+
     /// fails if an instance with no pid at all is treated as a new one.
     /// `WaitingRestart` covers the status side of the same case; this
     /// covers the pid side, which is what `Generation::is_new` actually
