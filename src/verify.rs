@@ -127,9 +127,9 @@ impl Generation {
 /// The spec's own wording for `alive` is "wait N seconds and confirm the
 /// process is still running", and this is that N. It is a dwell after the
 /// turnover rather than a window the turnover has to fit inside: how long a
-/// reload takes is the app's business (see [`budget`]'s caller in
-/// `crate::deploy`), while how long a new release has to survive before
-/// anyone believes in it is this crate's.
+/// reload takes is the app's business, and `crate::deploy` derives that from
+/// the app, while how long a new release has to survive before anyone
+/// believes in it is this crate's.
 const DWELL: Duration = Duration::from_secs(10);
 
 /// How often either mode asks the shepherd again.
