@@ -9,10 +9,10 @@
 //! exit status and stderr, because git's own message is the only useful
 //! thing when a fetch or a worktree operation fails.
 //!
-//! [`run_git`](crate::shared::run_git) does the launching and the error
-//! mapping; it was written for [`crate::shared`]'s own git calls first and
-//! is reused here rather than duplicated, since both modules need the exact
-//! same shape of error out of the exact same shape of subprocess call.
+//! [`run_git`] does the launching and the error mapping; it was written for
+//! [`crate::shared`]'s own git calls first and is reused here rather than
+//! duplicated, since both modules need the exact same shape of error out of
+//! the exact same shape of subprocess call.
 //!
 //! # Two kinds of directory
 //!
@@ -126,7 +126,8 @@ pub fn current_branch(checkout: &Path) -> Result<String, Error> {
 }
 
 /// Fetches every branch `remote` has into `git_dir`, mirroring them onto
-/// `git_dir`'s own `refs/heads/*`.
+/// `git_dir`'s own `refs/heads/*` and dropping any that `remote` no longer
+/// has.
 ///
 /// `remote` is a URL, not a configured remote's short name - see the module
 /// doc for why `git_dir` never gets a `git remote add` of its own and this
@@ -134,11 +135,31 @@ pub fn current_branch(checkout: &Path) -> Result<String, Error> {
 /// it updates every branch in place, including past a non-fast-forward
 /// (rebase, force-push), since the refspec is `+`-forced.
 ///
+/// `--prune` is not optional. A mirror refspec on its own only ever adds or
+/// moves refs forward (or sideways, given the `+`); it never removes one
+/// `remote` has stopped advertising, so a branch deleted or renamed upstream
+/// would otherwise leave `git_dir` holding a `refs/heads/<branch>` frozen at
+/// its last-known sha forever. That is the specific failure this project
+/// keeps designing against: [`remote_head`] would keep resolving the stale
+/// ref without error, the deploy sequence would keep reading "nothing new",
+/// and the target would stall permanently with nothing in the loop ever
+/// noticing - not a wrong deploy, just silence that looks exactly like
+/// "up to date". `--prune` makes the deletion visible instead: once it
+/// removes the local ref, [`remote_head`] fails loudly for that branch
+/// rather than succeeding on a sha that no longer means anything, which is
+/// the right shape of failure for "the branch you're tracking is gone" -
+/// an operator needs to be told that, not left to infer it from a target
+/// that silently never updates again.
+///
 /// # Errors
 /// [`Error::Git`] if `remote` cannot be reached or refuses the fetch.
 /// [`Error::Io`] if `git` itself cannot be launched.
 pub fn fetch(git_dir: &Path, remote: &str) -> Result<(), Error> {
-    run_git(git_dir, &["fetch", remote, "+refs/heads/*:refs/heads/*"]).map(|_| ())
+    run_git(
+        git_dir,
+        &["fetch", "--prune", remote, "+refs/heads/*:refs/heads/*"],
+    )
+    .map(|_| ())
 }
 
 /// The commit `branch` points at in `git_dir`, after a [`fetch`].
@@ -367,6 +388,32 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// fails if a branch deleted upstream keeps resolving to its
+    /// last-known sha instead of disappearing. This is the textbook failure
+    /// of an unpruned mirror fetch: without `--prune`, `git_dir` would keep
+    /// `refs/heads/feature` around forever once it existed, `remote_head`
+    /// would keep succeeding on a sha the remote no longer has any record
+    /// of, and a poll loop tracking `feature` would read "up to date"
+    /// permanently - the exact silent-stall failure `--prune` exists to
+    /// turn into a loud one.
+    #[test]
+    fn a_branch_deleted_upstream_stops_resolving_after_a_pruning_fetch() {
+        let origin = fixture_repo_with_commits(1);
+        run(origin.path(), &["branch", "feature"]);
+        let git_dir = bare_git_dir();
+        let url = origin.path().to_str().expect("utf-8 path");
+
+        fetch(git_dir.path(), url).expect("first fetch sees feature");
+        remote_head(git_dir.path(), "feature").expect("feature resolves before deletion");
+
+        run(origin.path(), &["branch", "-D", "feature"]);
+        fetch(git_dir.path(), url).expect("second fetch prunes feature");
+
+        let err =
+            remote_head(git_dir.path(), "feature").expect_err("a deleted branch must not resolve");
+        assert!(matches!(err, Error::Git { .. }));
+    }
+
     /// fails if `remote_head` stops refusing a branch `git_dir` has never
     /// heard of, instead of `rev-parse` resolving the string as something
     /// else entirely.
@@ -385,7 +432,7 @@ mod tests {
     #[test]
     fn worktree_add_checks_out_the_given_sha() {
         let repo = fixture_repo_with_commits(1);
-        let at = repo.path().join("../wt-checkout");
+        let at = repo.path().join("wt-checkout");
         let sha = String::from_utf8(
             Command::new("git")
                 .current_dir(repo.path())
@@ -399,9 +446,11 @@ mod tests {
         worktree_add(repo.path(), &at, sha.trim()).expect("adds");
         assert!(at.join("file-0.txt").exists());
 
-        // cleanup: this test's own worktree would otherwise leak into the
-        // fixture's parent directory once `repo` (and its registration in
-        // `repo`'s `.git/worktrees`) is dropped.
+        // `at` lives inside `repo`'s own tempdir, so `TempDir`'s drop would
+        // eventually reclaim the directory either way; removing it here
+        // through the real function keeps this test from also leaving a
+        // stale worktree registration behind in `repo/.git/worktrees` for
+        // whichever test runs against the same fixture next.
         worktree_remove(repo.path(), &at).expect("cleans up");
     }
 
@@ -411,7 +460,7 @@ mod tests {
     #[test]
     fn worktree_removal_forces_because_built_trees_are_dirty() {
         let repo = fixture_repo_with_commits(1);
-        let at = repo.path().join("../rel-abc");
+        let at = repo.path().join("rel-abc");
         worktree_add(repo.path(), &at, "HEAD").expect("adds");
         std::fs::write(at.join("build-output.txt"), "x").expect("writes");
         worktree_remove(repo.path(), &at).expect("removes a dirty tree");
@@ -426,7 +475,7 @@ mod tests {
     #[test]
     fn worktree_prune_clears_a_worktree_whose_directory_is_already_gone() {
         let repo = fixture_repo_with_commits(1);
-        let at = repo.path().join("../wt-vanished");
+        let at = repo.path().join("wt-vanished");
         worktree_add(repo.path(), &at, "HEAD").expect("adds");
         fs::remove_dir_all(&at).expect("simulate the directory vanishing on its own");
 
