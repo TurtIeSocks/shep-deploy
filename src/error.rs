@@ -65,6 +65,19 @@ pub enum Error {
         /// else.
         stderr: String,
     },
+    /// A release's build command exited without succeeding.
+    ///
+    /// Deliberately carries only the exit status, not captured output the
+    /// way [`Self::Git`] carries `stderr`: a build's own stdout/stderr are
+    /// inherited by the child rather than captured (see
+    /// [`crate::build::run`]), so an operator watching a deploy sees the
+    /// real build log as it happens rather than a blob replayed after the
+    /// fact, and there is nothing left here worth capturing a second time.
+    Build {
+        /// The process's exit status, or `None` if it was killed by a
+        /// signal instead of exiting.
+        status: Option<i32>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -83,6 +96,10 @@ impl fmt::Display for Error {
                 Some(code) => write!(f, "`{command}` exited with status {code}: {stderr}"),
                 None => write!(f, "`{command}` was killed by a signal: {stderr}"),
             },
+            Self::Build { status } => match status {
+                Some(code) => write!(f, "the build exited with status {code}"),
+                None => write!(f, "the build was killed by a signal"),
+            },
         }
     }
 }
@@ -93,7 +110,7 @@ impl core::error::Error for Error {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
             Self::Io { source, .. } => Some(source),
-            Self::Protocol(_) | Self::Config(_) | Self::Git { .. } => None,
+            Self::Protocol(_) | Self::Config(_) | Self::Git { .. } | Self::Build { .. } => None,
         }
     }
 }
@@ -137,5 +154,25 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("git fetch origin"));
         assert!(shown.contains("could not read Username"));
+    }
+
+    /// fails if a build's exit status stops being named. This is the only
+    /// diagnostic `Error::Build` carries at all - its own stdout/stderr are
+    /// inherited rather than captured - so losing the status here leaves an
+    /// operator with no information whatsoever about why a build failed.
+    #[test]
+    fn a_build_error_names_a_nonzero_exit_status() {
+        let err = Error::Build { status: Some(3) };
+        assert!(err.to_string().contains('3'));
+    }
+
+    /// fails if the signal-killed branch collapses into the exit-status
+    /// wording, or vice versa - the same `Option<i32>` match shape as
+    /// `Error::Git`'s, and both arms need their own test for the same
+    /// reason `Error::Git`'s two-status shape does.
+    #[test]
+    fn a_build_error_names_a_signal_kill_distinctly() {
+        let err = Error::Build { status: None };
+        assert!(err.to_string().contains("signal"));
     }
 }

@@ -1,0 +1,452 @@
+//! Running the release's own build, as the target sheep's user, and
+//! salvaging whatever it produced outside the release.
+//!
+//! **This is the dangerous step in the whole design.** Every other module
+//! here reads a repository or shells out to `git`; this one executes
+//! arbitrary code from it. `bun install`'s postinstall scripts are the
+//! single most common supply-chain vector in the Node ecosystem, and
+//! `make build` is arbitrary by construction - there is no way to make
+//! running someone else's build script safe, only ways to bound the damage
+//! when it turns out to be malicious. [`run`] is that bound: the build
+//! never runs as the shepherd's own user, and a failing build never reaches
+//! the swap.
+//!
+//! Three behaviours worth knowing before reading [`run`]'s body:
+//!
+//! - **An absent build command is a no-op, not an error.** `ReactMap` run
+//!   as `bun .` compiles its client with vite's own API at startup and
+//!   declares no build at all; the readiness probe already covers that
+//!   case, so this module does not need to know a compile happened.
+//! - **A failing build is an error that stops everything.** `current`
+//!   never moves and the running app is untouched, because it lives in a
+//!   directory the build never touches. This is the part that replaces a
+//!   hardcoded sleep between a build and a restart.
+//! - **`build.artifacts` exists because of `build.env`.** A shared
+//!   `CARGO_TARGET_DIR` keeps Rust compilation warm across releases, which
+//!   matters because a from-scratch Koji build per deploy is not
+//!   acceptable. It does this by moving cargo's entire output tree outside
+//!   the release, so a declared artifact has to be copied back in or
+//!   `script = ./target/release/koji` resolves to nothing and rollback has
+//!   no binary to roll back to.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use tokio::process::Command;
+
+use crate::error::Error;
+
+/// What to run to turn a freshly checked-out release into something its
+/// declared script can execute, and what to salvage from wherever that run
+/// actually left its output.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct BuildSpec {
+    /// The build command, run through `sh -c` inside the release. `None`
+    /// is a no-op, not an error - see [`run`] for why.
+    pub command: Option<String>,
+    /// Environment layered over the build's own on top of whatever it
+    /// inherits from the process running this dog. `CARGO_TARGET_DIR` is
+    /// the one entry this crate's design gives special meaning to - see
+    /// [`artifact_source`].
+    pub env: BTreeMap<String, String>,
+    /// Paths, relative to the release, to copy back in after a successful
+    /// build. See the module doc for why this exists at all.
+    pub artifacts: Vec<PathBuf>,
+}
+
+/// `Debug` does not print `env`'s values (IR-41).
+///
+/// `env` is exactly the kind of thing that carries secrets - a registry
+/// token for a private package feed is an entirely plausible thing to find
+/// in a real `build.env` - so this prints how many variables there are and
+/// nothing about what they hold. Mirrors `shep_core`'s own `AppConfig`,
+/// which redacts its `env` field the same way for the same reason, rather
+/// than inventing a second format for the same problem.
+impl fmt::Debug for BuildSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuildSpec")
+            .field("command", &self.command)
+            .field("env", &format_args!("<{} vars>", self.env.len()))
+            .field("artifacts", &self.artifacts)
+            .finish()
+    }
+}
+
+/// Resolves `user` to a uid by shelling out to `id -u`.
+///
+/// The crate forbids unsafe code outright, which rules out `getpwnam`
+/// directly; asking `id` instead needs none, and it is the same "ask the
+/// host rather than reimplement its answer" idiom [`crate::git`] already
+/// uses for git itself. It also answers correctly regardless of *how* this
+/// host resolves users - `/etc/passwd`, LDAP, anything else NSS is
+/// configured for - where a hand-rolled `/etc/passwd` parser would only
+/// ever cover the local case.
+///
+/// # Errors
+/// [`Error::Io`], naming `release`, if `id` itself cannot be launched.
+/// [`Error::Config`] if `id -u` exits non-zero - most likely because `user`
+/// does not exist on this host - or prints something that does not parse
+/// as a uid.
+async fn uid_for(release: &Path, user: &str) -> Result<u32, Error> {
+    let output = Command::new("id")
+        .arg("-u")
+        .arg(user)
+        .output()
+        .await
+        .map_err(|source| Error::Io {
+            path: release.to_owned(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(Error::Config(format!(
+            "as_user {user:?} does not resolve to a uid on this host (`id -u {user}` failed)"
+        )));
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .map_err(|_| Error::Config(format!("`id -u {user}` did not print a uid")))
+}
+
+/// Where `artifact` actually landed after the build, given the environment
+/// it ran with.
+///
+/// A path beginning `target/` is resolved against `CARGO_TARGET_DIR`
+/// instead, if the build set one: `build.env` exists for exactly this
+/// case, and a shared target dir works by moving cargo's entire output
+/// tree outside the release, so `target/release/koji` never actually
+/// exists at that path on disk - the real file sits at
+/// `$CARGO_TARGET_DIR/release/koji`. Every other artifact path is assumed
+/// to already sit inside `release` at the path it names, which is the
+/// ordinary case for a build with no such redirect.
+///
+/// Scoped to `CARGO_TARGET_DIR` specifically, not generalised to "any env
+/// var that looks like a directory": it is the one redirect this crate's
+/// design actually names, and guessing at others would invent behaviour
+/// nothing has asked for yet.
+fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Path) -> PathBuf {
+    if let Some(target_dir) = env.get("CARGO_TARGET_DIR")
+        && let Ok(rest) = artifact.strip_prefix("target")
+    {
+        return Path::new(target_dir).join(rest);
+    }
+    release.join(artifact)
+}
+
+/// Copies one declared artifact from wherever the build actually left it
+/// into its named path inside `release`.
+///
+/// A no-op when the source and destination are already the same path -
+/// the ordinary case when no `CARGO_TARGET_DIR` redirect is in play - and
+/// that check is not a cheap-exit nicety: verified empirically, `fs::copy`
+/// truncates a file to empty when its source and destination are the same
+/// path, because it opens the destination for writing before it reads the
+/// source. Skipping unconditionally would corrupt exactly the artifacts
+/// this function exists to preserve.
+///
+/// # Errors
+/// [`Error::Io`], naming the destination's parent, if that directory
+/// cannot be created. [`Error::Io`], naming the source, if it cannot be
+/// copied - most likely because the build never produced it at the path
+/// declared.
+fn copy_artifact(
+    release: &Path,
+    env: &BTreeMap<String, String>,
+    artifact: &Path,
+) -> Result<(), Error> {
+    let from = artifact_source(release, env, artifact);
+    let to = release.join(artifact);
+
+    if from == to {
+        return Ok(());
+    }
+
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|source| Error::Io {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
+
+    fs::copy(&from, &to).map_err(|source| Error::Io { path: from, source })?;
+
+    Ok(())
+}
+
+/// Runs `spec.command` inside `release`, as `as_user` if given, then copies
+/// every declared artifact back into the release.
+///
+/// An absent `command` is a no-op: `spec.artifacts` is never even
+/// consulted, so declaring artifacts alongside no command copies nothing
+/// rather than failing to find files a build that never ran could not have
+/// produced. See the module doc for why an absent command is the right
+/// reading rather than a misconfiguration.
+///
+/// The command runs through `sh -c`, with `release` as its working
+/// directory and `spec.env` layered on top of whatever this process itself
+/// inherited. Its stdout and stderr are inherited rather than captured, so
+/// an operator watching a deploy sees the build's real output as it
+/// happens instead of a blob replayed after the fact.
+///
+/// ## The one privilege boundary in this whole crate
+///
+/// When `as_user` is `Some`, the child drops to that user - resolved via
+/// [`uid_for`] - before it runs anything at all. The build executes code
+/// from somebody else's repository, so it must never run as the
+/// shepherd's own user: a compromised build then gets the target sheep's
+/// privileges and nothing more, which is the one control in this whole
+/// design that actually bounds damage rather than merely detecting it.
+///
+/// ## A failing build stops everything
+///
+/// A non-zero exit becomes [`Error::Build`]. This is the guard that keeps
+/// a broken build from ever reaching the swap: the caller never moves
+/// `current`, and the release being built lives in a directory the
+/// running app does not share, so nothing already serving traffic is
+/// touched. This is the part that replaces a hardcoded sleep between a
+/// build and a restart in the deploy scripts this dog exists to retire.
+///
+/// # Errors
+/// [`Error::Config`] if `as_user` names a user `id -u` cannot resolve.
+/// [`Error::Io`], naming `release`, if the shell (or `id`, for `as_user`)
+/// cannot even be launched, or if a declared artifact cannot be copied -
+/// see [`copy_artifact`]. [`Error::Build`] if the command launches and
+/// exits non-zero, or is killed by a signal, naming the exit status when
+/// there is one.
+pub async fn run(release: &Path, spec: &BuildSpec, as_user: Option<&str>) -> Result<(), Error> {
+    let Some(command) = spec.command.as_deref() else {
+        return Ok(());
+    };
+
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(command);
+    child.current_dir(release);
+    child.envs(&spec.env);
+
+    if let Some(user) = as_user {
+        child.uid(uid_for(release, user).await?);
+    }
+
+    let status = child.status().await.map_err(|source| Error::Io {
+        path: release.to_owned(),
+        source,
+    })?;
+
+    if !status.success() {
+        return Err(Error::Build {
+            status: status.code(),
+        });
+    }
+
+    for artifact in &spec.artifacts {
+        copy_artifact(release, &spec.env, artifact)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Builds a release directory containing the given files - mirrors
+    /// every other module's own `fixture_release`, e.g. `flockfile.rs`'s.
+    fn fixture_release(files: &[(&str, &str)]) -> TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, contents) in files {
+            fs::write(dir.path().join(name), contents).expect("write fixture file");
+        }
+        dir
+    }
+
+    /// A bare tempdir, for the tests below that need one standing in for a
+    /// build cache rather than a release.
+    fn tempdir() -> TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// The username running this test process, via `id -un` rather than
+    /// the `USER` environment variable - not every CI runner is guaranteed
+    /// to set it, and asking the host directly is the same idiom [`uid_for`]
+    /// itself uses.
+    fn current_username() -> String {
+        let output = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .expect("id -un runs");
+        assert!(output.status.success(), "id -un must succeed");
+        String::from_utf8(output.stdout)
+            .expect("id -un prints utf-8")
+            .trim()
+            .to_owned()
+    }
+
+    /// fails if a failing build is treated as success. This is the guard
+    /// that keeps a broken build from ever reaching the swap: current
+    /// never moves and the running app is untouched, because it lives in a
+    /// different directory.
+    #[tokio::test]
+    async fn a_failing_build_is_an_error() {
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("exit 3".into()),
+            ..Default::default()
+        };
+        assert!(run(rel.path(), &spec, None).await.is_err());
+    }
+
+    /// fails if an absent build command is an error rather than a no-op.
+    /// ReactMap run as `bun .` compiles its client at startup and declares
+    /// no build at all; the readiness probe covers it.
+    #[tokio::test]
+    async fn an_absent_build_command_is_not_an_error() {
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec::default();
+        assert!(run(rel.path(), &spec, None).await.is_ok());
+    }
+
+    /// fails if declared artifacts are not copied into the release. With
+    /// CARGO_TARGET_DIR pointed at a shared cache, the binary lands outside
+    /// the release, and `script = ./target/release/koji` would resolve to
+    /// nothing.
+    #[tokio::test]
+    async fn declared_artifacts_are_copied_into_the_release() {
+        let rel = fixture_release(&[]);
+        let cache = tempdir();
+        std::fs::create_dir_all(cache.path().join("release")).unwrap();
+        std::fs::write(cache.path().join("release/koji"), b"binary").unwrap();
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/release/koji")],
+        };
+        run(rel.path(), &spec, None).await.expect("builds");
+        assert!(rel.path().join("target/release/koji").exists());
+    }
+
+    /// fails if `Debug` stops redacting `env`'s values, or starts hiding a
+    /// field entirely instead of just its values. Exact string pinned so a
+    /// lazy `derive(Debug)` refactor fails here, the same way shep_core's
+    /// own `AppConfig` test is pinned.
+    #[test]
+    fn debug_redacts_env_values() {
+        let spec = BuildSpec {
+            command: Some("make build".into()),
+            env: [
+                ("REGISTRY_TOKEN".to_string(), "secret".to_string()),
+                ("RUST_LOG".to_string(), "info".to_string()),
+            ]
+            .into(),
+            artifacts: vec![],
+        };
+        assert_eq!(
+            format!("{spec:?}"),
+            "BuildSpec { command: Some(\"make build\"), env: <2 vars>, artifacts: [] }"
+        );
+    }
+
+    /// fails if an absent build command stops being a no-op the moment
+    /// artifacts are also declared. `run` must return before ever looking
+    /// at `spec.artifacts` when there is no command - a build that never
+    /// ran cannot have produced anything, so attempting the copy here would
+    /// fail on a file that was never going to exist, contradicting "an
+    /// absent build command is a no-op".
+    ///
+    /// `CARGO_TARGET_DIR` is set here specifically so the declared
+    /// artifact's source and destination are genuinely different paths -
+    /// with no override, both sides of `copy_artifact` collapse to the
+    /// same `release`-relative path and its self-copy guard would return
+    /// `Ok` for a reason that has nothing to do with the command being
+    /// absent, letting this test pass even if the early return above it
+    /// were deleted entirely.
+    #[tokio::test]
+    async fn an_absent_command_skips_artifacts_too() {
+        let rel = fixture_release(&[]);
+        let cache = tempdir();
+        let spec = BuildSpec {
+            command: None,
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
+        };
+        assert!(run(rel.path(), &spec, None).await.is_ok());
+    }
+
+    /// fails if `as_user` is silently ignored on the accept side of the
+    /// predicate. Dropping to the user already running the process must be
+    /// a permitted no-op (`setuid` to one's own uid never requires extra
+    /// privilege), so this exercises the real `uid_for` + `Command::uid`
+    /// path without needing root in CI.
+    #[tokio::test]
+    async fn running_as_the_current_user_succeeds() {
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            ..Default::default()
+        };
+        let user = current_username();
+        run(rel.path(), &spec, Some(&user))
+            .await
+            .expect("dropping to one's own user is always permitted");
+    }
+
+    /// fails if a nonexistent `as_user` is silently accepted instead of
+    /// refused. The reject side of the same predicate as the test above:
+    /// resolving a user that does not exist on this host must fail loudly
+    /// rather than, say, running as whatever uid `0` or an unparsed value
+    /// would mean.
+    ///
+    /// Asserts the specific message `uid_for`'s own status check produces,
+    /// not just `Error::Config(_)` in general: `id -u` prints nothing to
+    /// stdout on failure, so a mutated `uid_for` that skipped the status
+    /// check entirely would still fail (empty stdout does not parse as a
+    /// uid either) and still produce `Error::Config`, just from the parse
+    /// branch instead - a weaker assertion would pass either way and never
+    /// actually pin the status check this test's name is about.
+    #[tokio::test]
+    async fn an_unknown_as_user_is_a_config_error() {
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            ..Default::default()
+        };
+        let err = run(rel.path(), &spec, Some("shep-deploy-test-no-such-user"))
+            .await
+            .expect_err("no such user");
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("does not resolve to a uid"));
+    }
+
+    /// fails if the self-copy guard in `copy_artifact` is removed. Without
+    /// it, declaring an artifact that the build already placed directly
+    /// inside the release (the ordinary case with no `CARGO_TARGET_DIR`
+    /// redirect) would copy the file onto itself - verified empirically to
+    /// truncate it to zero bytes, since `fs::copy` opens its destination
+    /// for writing before it reads the source. This test would go red
+    /// immediately if that guard were deleted, since the content would come
+    /// back empty rather than what the build actually wrote.
+    #[tokio::test]
+    async fn an_artifact_already_in_the_release_is_left_intact() {
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("mkdir -p dist && printf hello > dist/app.js".into()),
+            artifacts: vec![PathBuf::from("dist/app.js")],
+            ..Default::default()
+        };
+        run(rel.path(), &spec, None).await.expect("builds");
+        let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
+        assert_eq!(contents, "hello");
+    }
+}
