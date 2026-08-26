@@ -106,9 +106,9 @@ mod tests {
     /// already-existing link, `current` resolves to the new release
     /// afterwards, and no `current.tmp` survives a successful swap. Replace
     /// `point_at`'s `rename(2)` with remove-then-create and every assertion
-    /// below still passes - proven, not assumed, see the mutation note this
-    /// module's report carries - which is exactly the point: none of them
-    /// were ever the atomicity guarantee. That guarantee rests on
+    /// below still passes. That was verified by mutation during review, not
+    /// assumed, and it is exactly the point: none of these assertions were
+    /// ever the atomicity guarantee. That guarantee rests on
     /// `point_at`'s implementation shape (rename over a temporary link,
     /// never remove-then-create) and on review, not on this assertion list.
     #[test]
