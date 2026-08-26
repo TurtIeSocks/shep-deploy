@@ -560,7 +560,11 @@ fn a_detached_head_is_refused_by_name() {
 #[test]
 fn worktree_removal_forces_because_built_trees_are_dirty() {
     let repo = fixture_repo_with_commits(1);
-    let at = repo.path().join("../rel-abc");
+    // Inside the fixture's own tempdir, never `../` out of it. A relative
+    // sibling of $TMPDIR is a fixed path, so a removal that fails (which is
+    // exactly what mutation-checking this test does) strands a directory that
+    // collides with the next run.
+    let at = repo.path().join("rel-abc");
     worktree_add(repo.path(), &at, "HEAD").expect("adds");
     std::fs::write(at.join("build-output.txt"), "x").expect("writes");
     worktree_remove(repo.path(), &at).expect("removes a dirty tree");
