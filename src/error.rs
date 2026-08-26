@@ -31,9 +31,23 @@ pub enum Error {
     /// A `[dog.deploy]` (or per-sheep override) section could not be
     /// understood.
     Config(String),
-    /// A filesystem operation failed, naming the path it failed on.
+    /// An operation failed with an I/O-shaped error, naming the path most
+    /// relevant to the failure.
+    ///
+    /// Most of the time that operation really is a filesystem call - a
+    /// read, write, rename, or symlink - and the path is the one it
+    /// touched. A few things that are not filesystem calls at all get
+    /// wrapped in here too, rather than inventing a second variant just for
+    /// the wrapping: `State::write` reports a TOML serialisation failure
+    /// this way, naming the file it was about to serialise into, and the
+    /// shared-file module reports a `git` invocation that could not even be
+    /// launched, or that answered with bytes that are not valid UTF-8,
+    /// against the checkout directory it ran in. What all of these share is
+    /// an [`std::io::Error`] as the underlying cause and a single path
+    /// worth naming back to whoever reads the message.
     Io {
-        /// The path being read, written, linked or removed.
+        /// The path most relevant to the failure - read, written, linked,
+        /// removed, or simply the directory an operation was attempted in.
         path: PathBuf,
         /// The underlying failure.
         source: std::io::Error,
