@@ -16,6 +16,7 @@
 
 mod daemon;
 mod error;
+mod git;
 mod paths;
 mod shared;
 mod state;

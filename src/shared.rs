@@ -20,22 +20,30 @@ use std::process::Command;
 
 use crate::error::Error;
 
-/// Runs `git <args>` in `checkout` and returns its stdout as a `String`.
+/// Runs `git <args>` in `dir` and returns its stdout as a `String`.
+///
+/// `pub(crate)` rather than private: [`crate::git`] shells out to git for a
+/// second directory this crate cares about - the bare clone under
+/// [`crate::paths::Tree::git`] - and needs the exact same error mapping this
+/// module already built, so it reuses this rather than growing a second
+/// copy. The parameter is named `dir`, not `checkout`, because it is called
+/// with both: this module's own functions always pass the operator's
+/// checkout, `crate::git`'s pass the deploy engine's own bare clone.
 ///
 /// Launching a subprocess and decoding what it printed are not filesystem
 /// calls, but they fail with the same shape of error - an
 /// [`std::io::Error`] and a path worth naming - and this crate has nowhere
 /// else for that shape to live, so both come back as [`Error::Io`] naming
-/// `checkout`. A `git` invocation that launches but exits non-zero is
+/// `dir`. A `git` invocation that launches but exits non-zero is
 /// [`Error::Git`] instead, since `git`'s own stderr is worth keeping
 /// separate from "could not even run it".
-fn run_git(checkout: &Path, args: &[&str]) -> Result<String, Error> {
+pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
     let output = Command::new("git")
-        .current_dir(checkout)
+        .current_dir(dir)
         .args(args)
         .output()
         .map_err(|source| Error::Io {
-            path: checkout.to_owned(),
+            path: dir.to_owned(),
             source,
         })?;
 
@@ -48,7 +56,7 @@ fn run_git(checkout: &Path, args: &[&str]) -> Result<String, Error> {
     }
 
     String::from_utf8(output.stdout).map_err(|err| Error::Io {
-        path: checkout.to_owned(),
+        path: dir.to_owned(),
         source: io::Error::other(err),
     })
 }
