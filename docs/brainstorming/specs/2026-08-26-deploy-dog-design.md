@@ -480,6 +480,57 @@ both of which came out of Rin asking what rehoming does:
      output tier, so `--quiet` governs it the same way it governs everything
      else, and the JSON envelope carries it regardless.
 
+## Documentation shep owes
+
+All five prerequisites change what an operator types or sees, which makes them
+a hard trigger under shep's own CLAUDE.md rule: the `web/` site is published
+and a change to the operator surface is not finished until the site says so.
+This work belongs to shep, not to this repository, and it is listed here
+because nothing else records it.
+
+**Regenerate the CLI reference.** It is produced from the real binary's
+`--help`, so it never needs writing by hand, but it does need running:
+
+```
+cargo build --release
+./web/scripts/generate-cli-reference.sh
+```
+
+A stale copy fails no build, which is exactly why it drifts. `git diff`
+afterwards is the check.
+
+**`smit` goes in README.md's lexicon table.** Usefully, that table is the
+source: `web/src/data/docsLexicon.ts` parses it at build time and
+`terminology.astro` renders it, so one edit updates the README and the site
+together. `docs/terminology.md` is the canonical lexicon and needs the same
+row, with `badge` recorded as the plain alias.
+
+**`output.astro` hard-codes the flock table**, currently
+`ID NAME STATUS PID RESTARTS EXIT CPU MEM UPTIME FOLD`, and states that "ID,
+NAME and STATUS never drop". A SMIT column lands in that sample, and the same
+page is where its position in the adaptive drop order has to be written down.
+That is the same open question listed below; the docs are where answering it
+becomes visible.
+
+**`dogs.astro`** carries the dog contract and needs three additions: the
+`shep <dogname> [args]` passthrough as a second invocation mode, the on-remove
+hook, and `rehome`'s changed semantics now that it forgets the adoption rather
+than the configuration.
+
+**Grep before assuming.** `cli.astro`, `from-pm2.astro`, `community-dogs.astro`
+and `terminology.astro` all mention `adopt` or `rehome` today, and the argument
+order is changing under them. Prose pages are hand-written and no generator
+touches them.
+
+**Build and check, both.** `astro build` does not typecheck, so a page passing
+a component a prop it does not have builds clean and renders wrong. `astro
+check` catches it. Both, every time.
+
+Separately, and this repository's own work rather than shep's: a README, and an
+entry in shep's community dog index once this publishes. The `cargo` source
+kind that entry needs was added to the index on 2026-08-26, so nothing blocks
+it.
+
 ## Open questions
 
 - **Poll interval default.** 30 seconds is adequate for a single host and needs
