@@ -23,6 +23,7 @@ mod paths;
 mod shared;
 mod state;
 mod swap;
+mod verify;
 
 fn main() {
     println!("not yet implemented");
