@@ -16,6 +16,7 @@
 
 mod daemon;
 mod error;
+mod flockfile;
 mod git;
 mod paths;
 mod shared;
