@@ -162,23 +162,57 @@ fn head_of(dir: &Path) -> String {
         .to_owned()
 }
 
+/// The `web` app as both Flockfiles here declare it: script, and a
+/// readiness probe that looks THROUGH the `current` symlink for a file a
+/// release either ships or does not.
+///
+/// `with_cwd` is the one difference between the two copies, and it is not
+/// cosmetic - see [`register_web`].
+///
+/// Every test in this file needs a probe, because `Verify::Probed` refuses
+/// a target without one and refuses it by reading the RELEASE's Flockfile,
+/// which is the only app definition the dog can see: `describe` reports
+/// status and pid, never the config shep registered. The two copies can
+/// therefore disagree, and this fixture keeps them honest by generating
+/// both from here.
+fn app_toml(home: &Path, with_cwd: bool) -> String {
+    let current = home.join("deploy/web/current");
+    let cwd = if with_cwd {
+        format!("cwd = {:?}\n", current.to_str().expect("utf-8 path"))
+    } else {
+        String::new()
+    };
+    format!(
+        "[[app]]\nname = \"web\"\nscript = \"./run.sh\"\n{cwd}\n[app.readiness_probe]\nkind = \
+         \"exec\"\ntarget = \"test -f {marker}\"\ninterval = \"1s\"\ntimeout = \
+         \"2s\"\nfailure_threshold = 1\n",
+        marker = current.join("ready-marker").display(),
+    )
+}
+
 /// A bare git origin with one committed app named `web`, whose script echoes
-/// `version` to stdout, touches a sentinel, and then sleeps.
+/// `version` to stdout and then sleeps, and which carries the marker file
+/// the readiness probe looks for.
 ///
 /// The version marker is how a test tells "the reload actually ran the new
 /// release" apart from "the old process is still running" - both look
 /// identical from `shep describe` alone, since `describe` only reports
 /// status and pid, not which release's code is executing.
-fn origin_with_app(version: &str) -> tempfile::TempDir {
+///
+/// `ready-marker` is the other half. The probe is `test -f
+/// <home>/deploy/web/current/ready-marker`, so it resolves through the
+/// symlink the deploy swaps: a release that ships the marker can become
+/// ready and one that does not never can. That is how a test makes a real
+/// shepherd's `AwaitReady` fail on purpose, which is the only way to
+/// exercise a rollback end to end.
+fn origin_with_app(home: &Path, version: &str) -> tempfile::TempDir {
     let origin = tempfile::tempdir().expect("tempdir");
     git(origin.path(), &["init", "-q", "-b", "main"]);
     git(origin.path(), &["config", "user.email", "test@example.com"]);
     git(origin.path(), &["config", "user.name", "test"]);
-    fs::write(
-        origin.path().join("Flockfile.toml"),
-        "[[app]]\nname = 'web'\nscript = './run.sh'\n",
-    )
-    .expect("write Flockfile");
+    fs::write(origin.path().join("Flockfile.toml"), app_toml(home, false))
+        .expect("write Flockfile");
+    fs::write(origin.path().join("ready-marker"), "").expect("write ready-marker");
     write_run_script(origin.path(), version);
     git(origin.path(), &["add", "."]);
     git(origin.path(), &["commit", "-q", "-m", version]);
@@ -221,22 +255,66 @@ fn build_tree(home: &Path, sheep: &str, origin: &Path) -> String {
     sha
 }
 
-/// Writes `deploy.toml` for `sheep`, tracking `origin`'s `main` branch and
-/// already deployed at `sha`.
+/// Writes `deploy.toml` for `sheep`, tracking `origin`'s `main` branch,
+/// already deployed at `sha`, and verifying the way `verify` says.
 ///
-/// Field order and shape matches `crate::state::State`'s own TOML - `verify`
-/// and `watch` are left unset so both take their documented defaults
-/// (`Probed`, `Auto`), the same round trip `src/state.rs`'s own tests pin.
-fn write_state(home: &Path, sheep: &str, origin: &Path, sha: &str) {
+/// Field order and shape matches `crate::state::State`'s own TOML. `watch`
+/// is left unset so it takes its documented default (`Auto`), the same
+/// round trip `src/state.rs`'s own tests pin.
+fn write_state(home: &Path, sheep: &str, origin: &Path, sha: &str, verify: &str) {
     let path = home.join("deploy").join(sheep).join("deploy.toml");
     fs::write(
         &path,
         format!(
-            "remote = {remote:?}\nbranch = \"main\"\ndeployed = {sha:?}\ncheckout = {remote:?}\n",
+            "remote = {remote:?}\nbranch = \"main\"\ndeployed = {sha:?}\nverify = \
+             {verify:?}\ncheckout = {remote:?}\n",
             remote = origin.to_str().expect("utf-8 origin path"),
         ),
     )
     .expect("write deploy.toml");
+}
+
+/// Registers `web` with the shepherd, from a Flockfile OUTSIDE any release,
+/// whose `cwd` is the `current` symlink.
+///
+/// **`cwd` is set explicitly, and to the symlink.** A Flockfile app whose
+/// `cwd` is left to default takes its own directory - and shep resolves
+/// that to a real path when it registers the app. Registering from
+/// `<home>/deploy/web/current/Flockfile.toml` therefore pins the sheep to
+/// the release that happened to be current at registration, and every later
+/// deploy swaps a symlink the running app no longer reaches. Measured on a
+/// real shepherd: the reload after a swap re-ran the OLD release's script.
+/// An explicit `cwd` is stored verbatim, symlink and all, which is what the
+/// design means by "the sheep's `cwd` is this path, permanently".
+///
+/// **The probe is registered, not deployed.** Nothing in this crate ever
+/// re-registers the app, so the probe a reload actually uses is this one
+/// and not whatever the new release's Flockfile says. A test that wants a
+/// reload to fail therefore cannot change the probe; it changes what the
+/// probe LOOKS at, which is why the probe points through `current` at a
+/// file a release either ships or does not.
+fn register_web(shepherd: &Shepherd) {
+    let path = shepherd.home().join("register.toml");
+    fs::write(&path, app_toml(shepherd.home(), true)).expect("write register.toml");
+    shepherd.ok(&[
+        "start",
+        path.to_str().expect("utf-8 path"),
+        "--style",
+        "bare",
+    ]);
+}
+
+/// The last non-empty line of `path`, or `None` if it cannot be read yet.
+///
+/// The app's stdout log is how these tests tell which RELEASE is executing,
+/// which `shep describe` cannot answer: it reports status and pid, not code.
+/// The last line specifically, because the log accumulates across reloads -
+/// including the short-lived instance of a release that failed to come up.
+fn last_line(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    text.lines()
+        .rfind(|line| !line.trim().is_empty())
+        .map(str::to_owned)
 }
 
 /// Poll `ready` until it answers true, or fail with `what`.
@@ -274,17 +352,11 @@ fn described_pid(shepherd: &Shepherd, sheep: &str) -> Option<u32> {
 #[test]
 fn a_real_deploy_swaps_reloads_and_verifies() {
     let shepherd = Shepherd::new();
-    let origin = origin_with_app("v1");
+    let origin = origin_with_app(shepherd.home(), "v1");
     let first = build_tree(shepherd.home(), "web", origin.path());
-    write_state(shepherd.home(), "web", origin.path(), &first);
+    write_state(shepherd.home(), "web", origin.path(), &first, "probed");
 
-    let script = shepherd
-        .home()
-        .join("deploy/web/current/run.sh")
-        .to_str()
-        .expect("utf-8 path")
-        .to_owned();
-    shepherd.ok(&["start", &script, "--name", "web", "--style", "bare"]);
+    register_web(&shepherd);
     wait_until("the first release to come online", || {
         described_pid(&shepherd, "web").is_some()
     });
@@ -341,17 +413,11 @@ fn a_real_deploy_swaps_reloads_and_verifies() {
 #[test]
 fn a_failing_build_leaves_the_previous_release_serving() {
     let shepherd = Shepherd::new();
-    let origin = origin_with_app("v1");
+    let origin = origin_with_app(shepherd.home(), "v1");
     let first = build_tree(shepherd.home(), "web", origin.path());
-    write_state(shepherd.home(), "web", origin.path(), &first);
+    write_state(shepherd.home(), "web", origin.path(), &first, "probed");
 
-    let script = shepherd
-        .home()
-        .join("deploy/web/current/run.sh")
-        .to_str()
-        .expect("utf-8 path")
-        .to_owned();
-    shepherd.ok(&["start", &script, "--name", "web", "--style", "bare"]);
+    register_web(&shepherd);
     wait_until("the first release to come online", || {
         described_pid(&shepherd, "web").is_some()
     });
@@ -359,7 +425,10 @@ fn a_failing_build_leaves_the_previous_release_serving() {
 
     fs::write(
         origin.path().join("Flockfile.toml"),
-        "[[app]]\nname = 'web'\nscript = './run.sh'\n\n[build]\ncommand = 'exit 3'\n",
+        format!(
+            "{}\n[build]\ncommand = 'exit 3'\n",
+            app_toml(shepherd.home(), false)
+        ),
     )
     .expect("write a failing build");
     git(origin.path(), &["add", "."]);
@@ -393,5 +462,86 @@ fn a_failing_build_leaves_the_previous_release_serving() {
     assert_eq!(
         live_pid, pid_after,
         "a failed build must never trigger a reload of the running sheep"
+    );
+}
+
+/// fails if a release that cannot come up is left serving. This is the
+/// property the whole crate exists for, and it is the one no mock can
+/// prove: `Request::Reload` is an ACCEPTANCE, not a completion, and when
+/// shep's own `AwaitReady` fails it keeps the old instance serving. A fake
+/// daemon answers `describe` however the test wants and so can never
+/// reproduce either fact. Verification that reads status alone passes here
+/// on its first poll, reports the broken release deployed, and leaves
+/// `current` pointing at it.
+///
+/// The release breaks by deleting `ready-marker`, which is what the
+/// registered readiness probe looks for through the `current` symlink - see
+/// [`register_web`]. Nothing about the app changes; the file its probe
+/// tests for stops being there.
+///
+/// `verify = "alive"` rather than the default `probed`, for wall clock
+/// alone: both modes demand the same generation turnover, and `alive`
+/// reaches its verdict after a ten-second window instead of `probed`'s
+/// ninety-second one. The `probed` timeout is covered in `src/verify.rs`
+/// against a paused clock.
+#[test]
+fn a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves() {
+    let shepherd = Shepherd::new();
+    let origin = origin_with_app(shepherd.home(), "v1");
+    let first = build_tree(shepherd.home(), "web", origin.path());
+    write_state(shepherd.home(), "web", origin.path(), &first, "alive");
+    register_web(&shepherd);
+
+    wait_until("the first release to come online", || {
+        described_pid(&shepherd, "web").is_some()
+    });
+    let out_log = shepherd.home().join("logs/web-0-out.log");
+    wait_until("v1 to have run", || {
+        last_line(&out_log).as_deref() == Some("v1")
+    });
+
+    // A release that can never become ready: the probe looks through
+    // `current` for a file this commit removes.
+    write_run_script(origin.path(), "v2");
+    git(origin.path(), &["rm", "-q", "ready-marker"]);
+    git(origin.path(), &["add", "-A"]);
+    git(origin.path(), &["commit", "-q", "-m", "v2, never ready"]);
+    let second = head_of(origin.path());
+
+    let output = shepherd.deploy("web");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("rolled back"),
+        "a release that never came up must be reported as rolled back: {stdout}{stderr}"
+    );
+    assert!(
+        !stdout.contains(&format!("deployed {second}")),
+        "the broken release must never be reported deployed: {stdout}"
+    );
+
+    // `current` points at the old release again...
+    let current = fs::read_link(shepherd.home().join("deploy/web/current")).expect("current");
+    assert_eq!(
+        current,
+        shepherd.home().join("deploy/web/releases").join(&first),
+        "current must be back on the release that works"
+    );
+
+    // ...deploy.toml still names it, never the release that failed...
+    let state = fs::read_to_string(shepherd.home().join("deploy/web/deploy.toml")).expect("state");
+    assert!(state.contains(&first), "{state}");
+    assert!(!state.contains(&second), "{state}");
+
+    // ...and the process the shepherd is supervising is running the old
+    // release's code. This is the assertion that fails before generation
+    // aware verification: the deploy reported success, `current` stayed on
+    // the broken release, and the last thing to run was v2.
+    wait_until("the old release to be serving again", || {
+        last_line(&out_log).as_deref() == Some("v1")
+    });
+    assert!(
+        described_pid(&shepherd, "web").is_some(),
+        "the sheep must still be running after a rollback"
     );
 }

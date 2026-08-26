@@ -56,10 +56,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+use shep_client::shep_core::config::AppConfig;
+
 use crate::daemon::Daemon;
 use crate::error::Error;
 use crate::paths::Tree;
 use crate::state::{State, Verify, Watch};
+use crate::verify::Generation;
 use crate::{build, flockfile, git, shared, swap, verify};
 
 /// What one deploy did.
@@ -161,6 +164,7 @@ pub async fn deploy<D: Daemon>(
     )?;
 
     let app = flockfile::app_config(&release, sheep)?;
+    refuse_probeless_verification(sheep, &app, state.verify)?;
     let spec = flockfile::build_spec(&release)?;
     build::run(&release, &spec, app.user.as_deref()).await?;
 
@@ -270,10 +274,46 @@ fn head_of(tree: &Tree, branch: &str) -> Result<String, Error> {
     }
 }
 
+/// Refuses a `Probed` deploy of a sheep that has no readiness probe.
+///
+/// `Probed` means "wait for the sheep to reach `Online`", and `Online` is
+/// only a health verdict when a probe is what gates it. Without one, shep
+/// waits out the app's `listen_timeout` and calls the process `Online`
+/// because it has not died yet, so a `Probed` deploy of a probeless sheep
+/// verifies nothing while claiming to verify the most.
+///
+/// Refused before the build and long before the swap, so a
+/// misconfigured target costs an operator a message rather than a
+/// deploy. The message names `verify = "alive"` because that is the
+/// deliberate, visible downgrade the design offers - the alternative to
+/// adding a probe, not a synonym for going without one.
+///
+/// # Errors
+/// [`Error::Config`] naming the sheep and both ways out.
+fn refuse_probeless_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Result<(), Error> {
+    if mode == Verify::Probed && app.readiness_probe.is_none() {
+        return Err(Error::Config(format!(
+            "{sheep} has verify = \"probed\" but no readiness_probe, so there is nothing for a \
+             deploy to wait on: shep reports a sheep with no probe Online as soon as it has not \
+             died, which would verify every release, including a broken one. Add a \
+             [readiness_probe] to its Flockfile, or set verify = \"alive\" in deploy.toml to \
+             accept the weaker check deliberately."
+        )));
+    }
+    Ok(())
+}
+
 /// Reloads `sheep` and waits for the verdict its `mode` asks for.
+///
+/// The generation serving before the reload is captured first, and the
+/// order is the whole point: `Request::Reload` is an acceptance rather than
+/// a completion, so a check made after it that does not know which process
+/// was already there reads the old one and passes. See
+/// [`crate::verify`]'s module doc.
 async fn settle<D: Daemon>(daemon: &D, sheep: &str, mode: Verify) -> Result<bool, Error> {
+    let before = Generation::of(daemon, sheep).await?;
     daemon.reload(sheep).await?;
-    verify::wait(daemon, sheep, mode, grace(mode)).await
+    verify::wait(daemon, sheep, mode, &before, grace(mode)).await
 }
 
 /// Puts `previous` back after `attempted` was rejected, and answers with
@@ -406,6 +446,16 @@ mod tests {
 
     use crate::swap;
 
+    /// The fixture app: one sheep named `web`, with a readiness probe,
+    /// because `Verify::Probed` refuses a sheep without one and `Probed` is
+    /// the default every test here runs under.
+    ///
+    /// The probe's own target is never executed by anything in this file -
+    /// no test here runs a real shepherd - so `true` is honest rather than
+    /// lazy: what these tests need is an app that HAS a probe.
+    const FLOCKFILE: &str = "[[app]]\nname = 'web'\nscript = './run.sh'\n\n\
+                             [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n";
+
     /// Runs a git subcommand for fixture setup, panicking if it fails.
     fn run(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -452,11 +502,7 @@ mod tests {
         run(origin.path(), &["init", "-q", "-b", "main"]);
         run(origin.path(), &["config", "user.email", "test@example.com"]);
         run(origin.path(), &["config", "user.name", "test"]);
-        fs::write(
-            origin.path().join("Flockfile.toml"),
-            "[[app]]\nname = 'web'\nscript = './run.sh'\n",
-        )
-        .expect("write Flockfile");
+        fs::write(origin.path().join("Flockfile.toml"), FLOCKFILE).expect("write Flockfile");
         run(origin.path(), &["add", "."]);
         run(origin.path(), &["commit", "-q", "-m", "first"]);
 
@@ -514,16 +560,36 @@ mod tests {
         head_of(fixture.origin.path())
     }
 
-    /// A [`Daemon`] that counts its reloads, for the tests that care how
-    /// many times a deploy reloaded rather than only where `current` ended
-    /// up. A rollback that swaps the symlink and never reloads leaves the
-    /// daemon running the rejected code, and no filesystem assertion can
-    /// see that.
-    struct Counting {
-        /// Whether `describe` fails outright instead of reporting a sheep
-        /// that has not come up. The two are different paths through
-        /// `deploy`: one is a verdict, the other is an error arriving after
-        /// the reload has already drained the old instance.
+    /// A [`Daemon`] that models what a reload actually does to the flock:
+    /// it replaces the running process with a different one, under a
+    /// different pid. Counts its reloads, because a rollback that moves the
+    /// symlink and never reloads is invisible to every filesystem
+    /// assertion.
+    ///
+    /// A fake that answered `describe` however a test wanted is how the
+    /// generation bug survived two review rounds: verification asked "is
+    /// anything Online" and a fake always had something Online to show it.
+    /// Every constructor below therefore describes a real shepherd
+    /// behaviour rather than a convenient answer, and
+    /// [`Self::keeps_the_old_instance`] is the one measured against a live
+    /// shepherd.
+    struct Shepherd {
+        /// What the flock settles to after a reload: `Online` is a release
+        /// that came up, `Starting` one that spawned and never became
+        /// ready.
+        settles_to: ProcStatus,
+        /// Whether a reload actually puts a new process in place. `false`
+        /// is shep's own behaviour when `AwaitReady` fails: it keeps the
+        /// old instance serving, so the listing settles back to one
+        /// `Online` entry under the pid that was already there.
+        replaces: bool,
+        /// Whether `describe` fails outright, once the reload has been
+        /// sent. That is a different path through `deploy` from a sheep
+        /// that will not come up: one is a verdict, the other an error
+        /// arriving after the reload has already drained the old instance.
+        /// It answers normally before the reload, because the generation
+        /// capture reads it too and a failure there would never reach the
+        /// path this models.
         describe_fails: bool,
         /// Created just before answering the first `describe`, standing in
         /// for another process leaving a stale `current.tmp` behind at the
@@ -532,13 +598,39 @@ mod tests {
         reloads: Cell<u32>,
     }
 
-    impl Counting {
-        /// Answers every `describe` with a sheep still `Starting`.
-        fn never_ready() -> Self {
+    /// The pid serving before any reload. Any other value would do; this
+    /// one is only recognisable in a failure message.
+    const FIRST_PID: u32 = 12835;
+
+    impl Shepherd {
+        /// A reload that replaces the process and brings it to `Online`.
+        fn ready() -> Self {
             Self {
+                settles_to: ProcStatus::Online,
+                replaces: true,
                 describe_fails: false,
                 plant: None,
                 reloads: Cell::new(0),
+            }
+        }
+
+        /// A reload that replaces the process with one that never becomes
+        /// ready.
+        fn never_ready() -> Self {
+            Self {
+                settles_to: ProcStatus::Starting,
+                ..Self::ready()
+            }
+        }
+
+        /// A reload shep accepted and then gave up on, keeping the old
+        /// instance serving: one `Online` entry, under the pid that was
+        /// already there. Measured against a real shepherd - see
+        /// `crate::verify`'s module doc for the transcript.
+        fn keeps_the_old_instance() -> Self {
+            Self {
+                replaces: false,
+                ..Self::ready()
             }
         }
 
@@ -547,7 +639,7 @@ mod tests {
         fn describe_fails() -> Self {
             Self {
                 describe_fails: true,
-                ..Self::never_ready()
+                ..Self::ready()
             }
         }
 
@@ -563,9 +655,30 @@ mod tests {
         fn reload_count(&self) -> u32 {
             self.reloads.get()
         }
+
+        /// The pid currently serving: a fresh one per reload, unless this
+        /// shepherd keeps the old instance.
+        fn pid(&self) -> u32 {
+            if self.replaces {
+                FIRST_PID + self.reloads.get()
+            } else {
+                FIRST_PID
+            }
+        }
+
+        /// The status currently serving: whatever this shepherd settles to
+        /// once it has reloaded at all, and `Online` before that, since the
+        /// process that was already there is up.
+        fn status(&self) -> ProcStatus {
+            if self.reloads.get() == 0 {
+                ProcStatus::Online
+            } else {
+                self.settles_to
+            }
+        }
     }
 
-    impl Daemon for Counting {
+    impl Daemon for Shepherd {
         async fn dog_config(&self, _name: &str) -> Result<String, Error> {
             unimplemented!()
         }
@@ -580,11 +693,13 @@ mod tests {
             {
                 std::os::unix::fs::symlink("somewhere", plant).expect("plant a stale tmp link");
             }
-            if self.describe_fails {
+            if self.describe_fails && self.reloads.get() > 0 {
                 return Err(Error::Protocol("the shepherd stopped answering".to_owned()));
             }
             Ok(vec![
-                ProcessInfo::builder(0, sheep, ProcStatus::Starting).build(),
+                ProcessInfo::builder(0, sheep, self.status())
+                    .pid(Some(self.pid()))
+                    .build(),
             ])
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
@@ -592,58 +707,6 @@ mod tests {
         }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             self.reloads.set(self.reloads.get() + 1);
-            Ok(())
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-    }
-
-    /// A [`Daemon`] whose sheep never reaches `Online`.
-    struct NeverReady;
-
-    impl Daemon for NeverReady {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            Ok(vec![
-                ProcessInfo::builder(0, sheep, ProcStatus::Starting).build(),
-            ])
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            Ok(())
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-    }
-
-    /// A [`Daemon`] whose sheep is always `Online`.
-    struct Ready;
-
-    impl Daemon for Ready {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            Ok(vec![
-                ProcessInfo::builder(0, sheep, ProcStatus::Online).build(),
-            ])
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             Ok(())
         }
         async fn restart(&self, _sheep: &str) -> Result<(), Error> {
@@ -660,7 +723,7 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         commit_on_origin(&fixture, "second.txt");
 
-        let outcome = deploy(&NeverReady, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
             .await
             .expect("completes");
 
@@ -677,7 +740,7 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_head_does_nothing() {
         let mut fixture = fixture_with_previous_release();
-        let outcome = deploy(&Ready, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
             .await
             .expect("completes");
         assert!(matches!(outcome, Outcome::UpToDate));
@@ -691,8 +754,9 @@ mod tests {
     async fn a_release_that_comes_up_is_deployed_and_recorded() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
+        let daemon = Shepherd::ready();
 
-        let outcome = deploy(&Ready, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
             .await
             .expect("completes");
 
@@ -712,6 +776,91 @@ mod tests {
         assert_eq!(written.deployed.as_deref(), Some(second.as_str()));
     }
 
+    /// fails if the process that was already serving passes for the
+    /// release this deploy installed. Measured against a real shepherd:
+    /// when its own `AwaitReady` fails, shep keeps the old instance, so
+    /// `describe` settles back to one `Online` entry under the pid that was
+    /// already there. A verification that reads status alone calls that
+    /// deploy healthy, and every rollback in this crate becomes
+    /// unreachable - which is what it was, for two review rounds.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_that_keeps_the_old_instance_is_rolled_back() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(
+            &Shepherd::keeps_the_old_instance(),
+            &fixture.tree,
+            &mut fixture.state,
+        )
+        .await
+        .expect("completes");
+
+        assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a `probed` target with no readiness probe is deployed
+    /// anyway. `Online` is only a health verdict when a probe is what gates
+    /// it; without one shep waits out `listen_timeout` and reports a
+    /// process `Online` for not having died, so this configuration
+    /// verifies every release including a broken one. The spec requires the
+    /// refusal by name.
+    #[tokio::test]
+    async fn a_probed_target_with_no_readiness_probe_is_refused() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        fs::write(
+            fixture.origin.path().join("Flockfile.toml"),
+            "[[app]]\nname = 'web'\nscript = './run.sh'\n",
+        )
+        .expect("write a probeless Flockfile");
+        commit_on_origin(&fixture, "second.txt");
+        let daemon = Shepherd::ready();
+
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("no probe to wait on");
+
+        let shown = err.to_string();
+        assert!(shown.contains("readiness_probe"), "{shown}");
+        assert!(shown.contains("alive"), "{shown}");
+        // Refused before anything was touched, which is why it is worth
+        // refusing at all rather than deploying and hoping.
+        assert_eq!(daemon.reload_count(), 0, "nothing may be reloaded");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+    }
+
+    /// fails if the refusal above catches `alive` too. `alive` is the
+    /// deliberate downgrade the refusal's own message points at, so a
+    /// target that has taken it must deploy without a probe - otherwise
+    /// the message names a way out that does not exist.
+    #[tokio::test(start_paused = true)]
+    async fn an_alive_target_needs_no_readiness_probe() {
+        let mut fixture = fixture_with_previous_release();
+        fixture.state.verify = crate::state::Verify::Alive;
+        fs::write(
+            fixture.origin.path().join("Flockfile.toml"),
+            "[[app]]\nname = 'web'\nscript = './run.sh'\n",
+        )
+        .expect("write a probeless Flockfile");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+            .await
+            .expect("completes");
+
+        assert_eq!(outcome, Outcome::Deployed { sha: second });
+    }
+
     /// fails if a failing build reaches the swap. Steps one through five
     /// must never touch the running app: the build happens in a directory
     /// the live release does not share, so a build that exits non-zero has
@@ -722,12 +871,12 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         fs::write(
             fixture.origin.path().join("Flockfile.toml"),
-            "[[app]]\nname = 'web'\nscript = './run.sh'\n\n[build]\ncommand = 'exit 3'\n",
+            format!("{FLOCKFILE}\n[build]\ncommand = 'exit 3'\n"),
         )
         .expect("write Flockfile");
         commit_on_origin(&fixture, "second.txt");
 
-        let err = deploy(&Ready, &fixture.tree, &mut fixture.state)
+        let err = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
             .await
             .expect_err("the build fails");
 
@@ -749,7 +898,7 @@ mod tests {
         let mut fixture = fixture_with_previous_release();
         fixture.state.branch = "gone".to_owned();
 
-        let err = deploy(&Ready, &fixture.tree, &mut fixture.state)
+        let err = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
             .await
             .expect_err("no such branch");
 
@@ -768,7 +917,7 @@ mod tests {
         let mut fixture = fixture_with_previous_release();
         let previous = fixture.state.deployed.clone().expect("a previous release");
         commit_on_origin(&fixture, "second.txt");
-        let daemon = Counting::never_ready();
+        let daemon = Shepherd::never_ready();
 
         let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
             .await
@@ -798,7 +947,7 @@ mod tests {
         let mut fixture = fixture_with_previous_release();
         let previous = fixture.state.deployed.clone().expect("a previous release");
         commit_on_origin(&fixture, "second.txt");
-        let daemon = Counting::describe_fails();
+        let daemon = Shepherd::describe_fails();
 
         let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
             .await
@@ -842,7 +991,7 @@ mod tests {
         let mut fixture = fixture_before_any_release();
         let first = crate::git::remote_head(&fixture.tree.git(), "main").expect("head");
 
-        let err = deploy(&Counting::never_ready(), &fixture.tree, &mut fixture.state)
+        let err = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
             .await
             .expect_err("nothing to roll back to");
 
@@ -884,7 +1033,7 @@ mod tests {
         std::os::unix::fs::symlink(fixture.home.path(), &link).expect("symlink the home");
         let same_tree = Tree::for_sheep(&link, "web");
 
-        let err = deploy(&Counting::never_ready(), &same_tree, &mut fixture.state)
+        let err = deploy(&Shepherd::never_ready(), &same_tree, &mut fixture.state)
             .await
             .expect_err("there is no other release to go back to");
 
@@ -905,7 +1054,7 @@ mod tests {
         fixture.state.deployed = None;
         commit_on_origin(&fixture, "second.txt");
 
-        deploy(&Counting::never_ready(), &fixture.tree, &mut fixture.state)
+        deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
             .await
             .expect("completes");
 
@@ -931,7 +1080,7 @@ mod tests {
         let stale = fixture.tree.current().with_file_name("current.tmp");
 
         let err = deploy(
-            &Counting::planting(stale),
+            &Shepherd::planting(stale),
             &fixture.tree,
             &mut fixture.state,
         )
@@ -960,12 +1109,11 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         fs::write(
             fixture.origin.path().join("Flockfile.toml"),
-            "[[app]]\nname = 'web'\nscript = './run.sh'\n\n[build]\ncommand = 'ln -sfn \"$PWD\" \
-             ../../current'\n",
+            format!("{FLOCKFILE}\n[build]\ncommand = 'ln -sfn \"$PWD\" ../../current'\n"),
         )
         .expect("write Flockfile");
         commit_on_origin(&fixture, "second.txt");
-        let daemon = Counting::never_ready();
+        let daemon = Shepherd::never_ready();
 
         let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
             .await
