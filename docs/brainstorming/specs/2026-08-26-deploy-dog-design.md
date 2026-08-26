@@ -282,10 +282,19 @@ generated masterfile, all ignored. Something must put them there.
 **The rule:** whatever is ignored-and-present **in the user's checkout**, minus
 `.shepignore`, gets symlinked from there into each new release.
 
-- **Enumerate with `git status --ignored --porcelain`, never by parsing
-  `.gitignore`.** Parsing gets negations (`!server/src/configs/.gitkeep`),
-  anchored globs (`/docker-compose.yml`) and nested ignore files wrong. Git
-  already answers this question correctly.
+- **Enumerate with `git status --ignored=matching --porcelain`, never by
+  parsing `.gitignore`.** Parsing gets negations
+  (`!server/src/configs/.gitkeep`), anchored globs (`/docker-compose.yml`) and
+  nested ignore files wrong. Git already answers this question correctly.
+
+  **The `=matching` is load-bearing**, and was found by running real git rather
+  than reading its documentation. Without it the mode is `traditional`, which
+  collapses an individually-ignored file such as `config/local.json` into its
+  containing directory when nothing else in that directory is tracked. That
+  loses exactly the file the release needs. `matching` names individually
+  matched files as themselves while still collapsing a wholly-ignored
+  directory like `node_modules/` to one entry, which is the split this design
+  wants: whole directories linked as a unit, individual files as themselves.
 - **`.shepignore`, committed in the repo, subtracts from that set.** Same
   idiom as `.dockerignore`, narrower syntax than `.gitignore`: a bare name
   matches at any depth (`node_modules` excludes every nested
