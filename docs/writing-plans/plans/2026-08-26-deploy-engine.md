@@ -329,10 +329,14 @@ fn state_round_trips_through_toml() {
         branch: "main".into(),
         deployed: Some("a1b2c3d".into()),
         verify: Verify::Probed,
+        watch: Watch::Manual,
         origin_cwd: Some(PathBuf::from("/srv/reactmap")),
         origin_script: Some("bun .".into()),
         checkout: PathBuf::from("/srv/reactmap"),
     };
+    // `watch` is deliberately the NON-default here. `verify` above is already
+    // its default, so without this the round-trip never exercises a non-default
+    // enum in either direction.
     let text = toml::to_string(&original).expect("serialises");
     let back: State = toml::from_str(&text).expect("parses");
     assert_eq!(back, original);
