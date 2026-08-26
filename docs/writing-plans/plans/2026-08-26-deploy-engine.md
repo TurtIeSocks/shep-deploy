@@ -293,6 +293,7 @@ EOF
       pub branch: String,
       pub deployed: Option<String>,          // sha
       pub verify: Verify,
+      pub watch: Watch,                      // auto = poll it, manual = only on request
       pub origin_cwd: Option<PathBuf>,       // pre-adoption, for restore
       pub origin_script: Option<String>,     // pre-adoption, for restore
       pub checkout: PathBuf,                 // the user's own checkout
@@ -301,8 +302,18 @@ EOF
   #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
   #[serde(rename_all = "lowercase")]
   pub enum Verify { Probed, Alive }
+
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+  #[serde(rename_all = "lowercase")]
+  pub enum Watch { Auto, Manual }
   ```
-  `Verify::default()` is `Probed`.
+  `Verify::default()` is `Probed`. `Watch::default()` is `Auto`.
+
+  `Watch` is carried here rather than added in plan two because `State` is
+  defined in this task: adding the field later would be a schema migration on
+  a file that is the only record of how to restore a sheep. Plan one never
+  reads it (there is no poll loop yet); it exists so plan two does not have to
+  change the format.
 
 - [ ] **Step 1: Write the failing round-trip test**
 
@@ -325,6 +336,20 @@ fn state_round_trips_through_toml() {
     let text = toml::to_string(&original).expect("serialises");
     let back: State = toml::from_str(&text).expect("parses");
     assert_eq!(back, original);
+}
+
+/// fails if `watch` stops defaulting to auto. A target written before this
+/// field existed, or by hand without it, must keep being watched rather than
+/// silently stop deploying.
+#[test]
+fn an_absent_watch_defaults_to_auto() {
+    let text = r#"
+        remote = "https://example.com/x"
+        branch = "main"
+        checkout = "/srv/x"
+    "#;
+    let state: State = toml::from_str(text).expect("parses");
+    assert_eq!(state.watch, Watch::Auto);
 }
 
 /// fails if `verify` stops defaulting to the safe value. An absent verify key

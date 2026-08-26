@@ -193,8 +193,36 @@ lives beside the thing it describes, not in the dog's config section:
 $SHEP_HOME/deploy/bpm/deploy.toml
 ```
 
-It records the remote and branch, the last deployed sha, the verify mode, and
-the sheep's `cwd` and `script` **as they were before the dog took over**.
+It records the remote and branch, the last deployed sha, the verify mode,
+whether the target is watched, and the sheep's `cwd` and `script` **as they
+were before the dog took over**.
+
+**`watch` is an enum, `auto` or `manual`, defaulting to `auto`.** A `manual`
+target is skipped by the poll loop entirely and deploys only when asked:
+
+```
+shep deploy koji
+```
+
+Everything else still applies to it. Releases, shared linking, the atomic
+swap, probe verification, auto-rollback and retention all work identically;
+the only thing that changes is that nothing happens until somebody says so.
+
+Rin asked for this and it was missing. Two cases it serves. Somebody who wants
+the convenience without a deploy on every commit, which is the case she named.
+And pausing a target during an incident without rehoming the dog, which is the
+same switch and matters more when something is already going wrong.
+
+**Deliberately not added: a `--branch` flag.** The branch comes from the
+user's own checkout, so `git checkout stable` retargets the deploy and nobody
+learns a new config key. That was the best idea in this design and a flag
+would give the same fact two sources of truth. Somebody wanting a different
+branch checks one out.
+
+**Deferred, not rejected: `--commit <sha>`.** Deploying a named commit asks a
+question this design has no clean answer for, which is whether the target is
+now pinned there or whether the next poll moves it off. Worth answering
+deliberately later rather than guessing now.
 
 Rin found the reason this matters by asking what happens when somebody rehomes
 the dog. Keying per-target state to the dog's *name* means renaming or
