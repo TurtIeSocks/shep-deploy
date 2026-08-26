@@ -1,5 +1,5 @@
-//! Running the release's own build, as the target sheep's user, and
-//! salvaging whatever it produced outside the release.
+//! Running the release's own build, as the target sheep's user and primary
+//! group, and salvaging whatever it produced outside the release.
 //!
 //! **This is the dangerous step in the whole design.** Every other module
 //! here reads a repository or shells out to `git`; this one executes
@@ -8,8 +8,12 @@
 //! `make build` is arbitrary by construction - there is no way to make
 //! running someone else's build script safe, only ways to bound the damage
 //! when it turns out to be malicious. [`run`] is that bound: the build
-//! never runs as the shepherd's own user, and a failing build never reaches
-//! the swap.
+//! never runs with the shepherd's own uid, gid, or supplementary groups,
+//! and a failing build never reaches the swap. Uid alone would not be
+//! enough - the design spec recommends running the shepherd as root
+//! specifically so it can drop privileges, and a child that only dropped
+//! uid would keep root's own gid for the whole build - see [`run`]'s own
+//! doc for the detail.
 //!
 //! Three behaviours worth knowing before reading [`run`]'s body:
 //!
@@ -74,7 +78,9 @@ impl fmt::Debug for BuildSpec {
     }
 }
 
-/// Resolves `user` to a uid by shelling out to `id -u`.
+/// Resolves `user` to an id by shelling out to `id <flag> user`, for
+/// whichever of `-u` (uid) or `-g` (primary gid) `flag` names. `kind` is
+/// only for the error message ("uid" or "gid").
 ///
 /// The crate forbids unsafe code outright, which rules out `getpwnam`
 /// directly; asking `id` instead needs none, and it is the same "ask the
@@ -84,14 +90,19 @@ impl fmt::Debug for BuildSpec {
 /// configured for - where a hand-rolled `/etc/passwd` parser would only
 /// ever cover the local case.
 ///
+/// Shared by [`uid_for`] and [`gid_for`] rather than duplicated: both need
+/// the exact same shape of subprocess call and the exact same two failure
+/// modes, and the only thing that differs between them is which flag to
+/// pass `id` and which word to use in the message.
+///
 /// # Errors
 /// [`Error::Io`], naming `release`, if `id` itself cannot be launched.
-/// [`Error::Config`] if `id -u` exits non-zero - most likely because `user`
-/// does not exist on this host - or prints something that does not parse
-/// as a uid.
-async fn uid_for(release: &Path, user: &str) -> Result<u32, Error> {
+/// [`Error::Config`] if `id <flag>` exits non-zero - most likely because
+/// `user` does not exist on this host - or prints something that does not
+/// parse as an id.
+async fn resolve_id(release: &Path, user: &str, flag: &str, kind: &str) -> Result<u32, Error> {
     let output = Command::new("id")
-        .arg("-u")
+        .arg(flag)
         .arg(user)
         .output()
         .await
@@ -102,14 +113,33 @@ async fn uid_for(release: &Path, user: &str) -> Result<u32, Error> {
 
     if !output.status.success() {
         return Err(Error::Config(format!(
-            "as_user {user:?} does not resolve to a uid on this host (`id -u {user}` failed)"
+            "as_user {user:?} does not resolve to a {kind} on this host (`id {flag} {user}` \
+             failed)"
         )));
     }
 
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse()
-        .map_err(|_| Error::Config(format!("`id -u {user}` did not print a uid")))
+        .map_err(|_| Error::Config(format!("`id {flag} {user}` did not print a {kind}")))
+}
+
+/// Resolves `user` to a uid. See [`resolve_id`].
+async fn uid_for(release: &Path, user: &str) -> Result<u32, Error> {
+    resolve_id(release, user, "-u", "uid").await
+}
+
+/// Resolves `user` to their *primary* gid. See [`resolve_id`].
+///
+/// Primary only, deliberately: [`run`]'s `as_user` is a single string, not
+/// a user/group pair, so the primary gid `id -g` reports is the only group
+/// identity there is anything to derive from here without changing that
+/// interface. `shep_core::AppConfig` does carry its own separate `group`
+/// field, so an explicit group is available upstream if a later task wants
+/// to thread one through - this just doesn't guess at it from `as_user`
+/// alone.
+async fn gid_for(release: &Path, user: &str) -> Result<u32, Error> {
+    resolve_id(release, user, "-g", "gid").await
 }
 
 /// Where `artifact` actually landed after the build, given the environment
@@ -194,12 +224,51 @@ fn copy_artifact(
 ///
 /// ## The one privilege boundary in this whole crate
 ///
-/// When `as_user` is `Some`, the child drops to that user - resolved via
-/// [`uid_for`] - before it runs anything at all. The build executes code
-/// from somebody else's repository, so it must never run as the
-/// shepherd's own user: a compromised build then gets the target sheep's
-/// privileges and nothing more, which is the one control in this whole
+/// When `as_user` is `Some`, the child drops to that user's uid **and**
+/// primary gid - resolved via [`uid_for`]/[`gid_for`] - before it runs
+/// anything at all. Uid alone is not enough: the design spec recommends
+/// running the shepherd as root specifically so it can drop privileges, and
+/// a child that only drops uid keeps whatever gid the shepherd itself was
+/// running as - root's group, if the shepherd is root - for the entire
+/// build. Dropping the gid too closes that gap, and doing both together
+/// also clears supplementary groups for free: `std`'s own process-spawn
+/// implementation runs `setgroups(0, ...)` whenever a uid and a gid are
+/// both set and no explicit group list is given, which is exactly this
+/// call shape (verified against the standard library's own source for the
+/// unix `Command` spawn path, since this crate calls no `setgroups` or raw
+/// libc itself).
+///
+/// The build executes code from somebody else's repository, so none of the
+/// shepherd's own privilege - uid, primary gid, or supplementary groups -
+/// may survive into it: a compromised build then gets the target sheep's
+/// uid and gid and nothing more, which is the one control in this whole
 /// design that actually bounds damage rather than merely detecting it.
+///
+/// `child.gid(...)` is called before `child.uid(...)` below, matching the
+/// general Unix rule that a process must set its group *before* dropping
+/// the uid that lets it change groups at all - reversing the two would
+/// leave the gid drop silently ineffective once implemented with raw
+/// syscalls. For this specific pair of `tokio::process::Command` builder
+/// calls that ordering is not actually load-bearing: verified against the
+/// standard library's own unix spawn path, `Command::spawn` performs
+/// `setgid` before `setuid` internally whenever either is set, regardless
+/// of which order the builder methods were called in. The source-level
+/// order below is kept anyway because it reads as the intent it has, and
+/// because a future change to how this crate drops privilege - raw
+/// `libc::setuid`/`setgid`, or a different process API - would need to
+/// preserve the real ordering rule this comment states, not just this
+/// call's incidental one.
+///
+/// A different ordering effect *is* real here, and easy to mistake for the
+/// syscall one above: `gid_for(...).await` runs before `uid_for(...).await`
+/// textually, so for a user that resolves to neither, `gid_for` is the one
+/// that fails and its message is the one `run` returns - not because the
+/// privilege drop itself works any differently, but because whichever `id`
+/// lookup is awaited first is also the one whose error surfaces first. This
+/// is why the reject-side test below pins the specific "gid" wording rather
+/// than only `Error::Config(_)`, and why `uid_for`/`gid_for` also each have
+/// their own direct test - a `run`-level test alone can only ever observe
+/// whichever of the two lookups happens to run first.
 ///
 /// ## A failing build stops everything
 ///
@@ -211,12 +280,12 @@ fn copy_artifact(
 /// build and a restart in the deploy scripts this dog exists to retire.
 ///
 /// # Errors
-/// [`Error::Config`] if `as_user` names a user `id -u` cannot resolve.
-/// [`Error::Io`], naming `release`, if the shell (or `id`, for `as_user`)
-/// cannot even be launched, or if a declared artifact cannot be copied -
-/// see [`copy_artifact`]. [`Error::Build`] if the command launches and
-/// exits non-zero, or is killed by a signal, naming the exit status when
-/// there is one.
+/// [`Error::Config`] if `as_user` names a user `id -u`/`id -g` cannot
+/// resolve. [`Error::Io`], naming `release`, if the shell (or `id`, for
+/// `as_user`) cannot even be launched, or if a declared artifact cannot be
+/// copied - see [`copy_artifact`]. [`Error::Build`] if the command launches
+/// and exits non-zero, or is killed by a signal, naming the exit status
+/// when there is one.
 pub async fn run(release: &Path, spec: &BuildSpec, as_user: Option<&str>) -> Result<(), Error> {
     let Some(command) = spec.command.as_deref() else {
         return Ok(());
@@ -228,6 +297,7 @@ pub async fn run(release: &Path, spec: &BuildSpec, as_user: Option<&str>) -> Res
     child.envs(&spec.env);
 
     if let Some(user) = as_user {
+        child.gid(gid_for(release, user).await?);
         child.uid(uid_for(release, user).await?);
     }
 
@@ -284,6 +354,35 @@ mod tests {
             .expect("id -un prints utf-8")
             .trim()
             .to_owned()
+    }
+
+    /// This test process's own uid, via bare `id -u` (no username - `id`
+    /// defaults to the caller).
+    fn current_uid() -> u32 {
+        let output = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u runs");
+        assert!(output.status.success(), "id -u must succeed");
+        String::from_utf8(output.stdout)
+            .expect("id -u prints utf-8")
+            .trim()
+            .parse()
+            .expect("id -u prints a number")
+    }
+
+    /// As [`current_uid`], for this test process's primary gid.
+    fn current_gid() -> u32 {
+        let output = std::process::Command::new("id")
+            .arg("-g")
+            .output()
+            .expect("id -g runs");
+        assert!(output.status.success(), "id -g must succeed");
+        String::from_utf8(output.stdout)
+            .expect("id -g prints utf-8")
+            .trim()
+            .parse()
+            .expect("id -g prints a number")
     }
 
     /// fails if a failing build is treated as success. This is the guard
@@ -386,9 +485,11 @@ mod tests {
 
     /// fails if `as_user` is silently ignored on the accept side of the
     /// predicate. Dropping to the user already running the process must be
-    /// a permitted no-op (`setuid` to one's own uid never requires extra
-    /// privilege), so this exercises the real `uid_for` + `Command::uid`
-    /// path without needing root in CI.
+    /// a permitted no-op (`setuid`/`setgid` to one's own ids never require
+    /// extra privilege), so this exercises the real
+    /// `uid_for`/`gid_for` + `Command::uid`/`gid` path without needing root
+    /// in CI - both ids drop together here, since the current user's own
+    /// primary gid is, definitionally, whatever `gid_for` will resolve.
     #[tokio::test]
     async fn running_as_the_current_user_succeeds() {
         let rel = fixture_release(&[]);
@@ -399,22 +500,26 @@ mod tests {
         let user = current_username();
         run(rel.path(), &spec, Some(&user))
             .await
-            .expect("dropping to one's own user is always permitted");
+            .expect("dropping to one's own user and group is always permitted");
     }
 
     /// fails if a nonexistent `as_user` is silently accepted instead of
     /// refused. The reject side of the same predicate as the test above:
     /// resolving a user that does not exist on this host must fail loudly
-    /// rather than, say, running as whatever uid `0` or an unparsed value
-    /// would mean.
+    /// rather than, say, running as whatever uid/gid `0` or an unparsed
+    /// value would mean.
     ///
-    /// Asserts the specific message `uid_for`'s own status check produces,
-    /// not just `Error::Config(_)` in general: `id -u` prints nothing to
-    /// stdout on failure, so a mutated `uid_for` that skipped the status
-    /// check entirely would still fail (empty stdout does not parse as a
-    /// uid either) and still produce `Error::Config`, just from the parse
-    /// branch instead - a weaker assertion would pass either way and never
-    /// actually pin the status check this test's name is about.
+    /// Asserts the *gid* wording specifically, not just `Error::Config(_)`
+    /// in general: `run` resolves the gid before the uid (see `run`'s own
+    /// doc comment for why), so for the same unknown user it is `gid_for`
+    /// that fails first. A weaker assertion - `Error::Config(_)` alone -
+    /// would keep passing even if the `child.gid(...)` call were deleted
+    /// from `run` entirely, since `uid_for` would then fail instead and
+    /// still produce *some* `Error::Config`; the specific wording is what
+    /// proves the gid step actually ran. `uid_for_reports_a_config_error_
+    /// for_an_unknown_user` below covers the uid half of the same shared
+    /// `resolve_id` logic directly, independent of which one `run` happens
+    /// to call first.
     #[tokio::test]
     async fn an_unknown_as_user_is_a_config_error() {
         let rel = fixture_release(&[]);
@@ -426,7 +531,56 @@ mod tests {
             .await
             .expect_err("no such user");
         assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("does not resolve to a gid"));
+    }
+
+    /// fails if `uid_for` stops resolving to a known user's real uid.
+    /// Exercised directly rather than through `run`, so it is not
+    /// entangled with whichever of `uid_for`/`gid_for` `run` happens to
+    /// call first.
+    #[tokio::test]
+    async fn uid_for_resolves_the_current_users_own_uid() {
+        let user = current_username();
+        let uid = uid_for(Path::new("."), &user).await.expect("resolves");
+        assert_eq!(uid, current_uid());
+    }
+
+    /// fails if `gid_for` stops resolving to a known user's *primary* gid.
+    /// This is the exact resolution the fix round added: `run` originally
+    /// dropped only uid, which left a build's effective gid at whatever the
+    /// shepherd's own process gid was - root's, if the shepherd runs as
+    /// root specifically to be able to drop privileges at all, which the
+    /// design spec recommends.
+    #[tokio::test]
+    async fn gid_for_resolves_the_current_users_primary_gid() {
+        let user = current_username();
+        let gid = gid_for(Path::new("."), &user).await.expect("resolves");
+        assert_eq!(gid, current_gid());
+    }
+
+    /// fails if `uid_for`'s reject side stops naming its own specific
+    /// wording. The `uid_for` half of `resolve_id`'s two call sites -
+    /// `an_unknown_as_user_is_a_config_error` above only exercises the
+    /// `gid_for` half, since that is the one `run` reaches first for the
+    /// same bad username.
+    #[tokio::test]
+    async fn uid_for_reports_a_config_error_for_an_unknown_user() {
+        let err = uid_for(Path::new("."), "shep-deploy-test-no-such-user")
+            .await
+            .expect_err("no such user");
+        assert!(matches!(err, Error::Config(_)));
         assert!(err.to_string().contains("does not resolve to a uid"));
+    }
+
+    /// The `gid_for` counterpart of the test above, exercised directly for
+    /// the same reason.
+    #[tokio::test]
+    async fn gid_for_reports_a_config_error_for_an_unknown_user() {
+        let err = gid_for(Path::new("."), "shep-deploy-test-no-such-user")
+            .await
+            .expect_err("no such user");
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("does not resolve to a gid"));
     }
 
     /// fails if the self-copy guard in `copy_artifact` is removed. Without

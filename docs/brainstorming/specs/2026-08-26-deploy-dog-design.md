@@ -432,10 +432,28 @@ plain `remove` always refuses — followed by `git worktree prune`.
 postinstall scripts are the most common supply-chain vector in the Node
 ecosystem.
 
-**Builds run as the target sheep's `user`, never as the shepherd's.** shep
-already resolves `user`/`group` per app, so the machinery exists. A compromised
-ReactMap build gets ReactMap's privileges and nothing more. This is the single
-requirement in this section that is not optional.
+**Builds run as the target sheep's `user` and primary group, never as the
+shepherd's.** shep already resolves `user`/`group` per app, so the machinery
+exists. A compromised ReactMap build gets ReactMap's privileges and nothing
+more. This is the single requirement in this section that is not optional.
+
+Both halves matter, not just the user. The shepherd is commonly run as root
+specifically so it can drop privileges (see the recommendation below); a build
+that drops only the uid keeps whatever gid the shepherd itself runs as - root's
+group, if the shepherd is root - for the entire build, which is most of this
+control's value given away for free. Group has to be dropped **before** uid:
+an unprivileged process cannot change its own group at all, so uid must still
+be the privileged one when the group is set, and setting them in the reverse
+order leaves the group change silently ineffective rather than failing loudly.
+Anyone implementing this against raw `setuid(2)`/`setgid(2)` needs to preserve
+that ordering by hand. Note for whoever implements this in a language whose
+process-spawn API takes a uid and a gid together, such as Rust's
+`std::process::Command`/`tokio::process::Command`: the platform library may
+already guarantee the correct internal order regardless of which order the two
+setters are called in application code - shep-deploy verified this against the
+standard library's own source before relying on it - but the ordering
+requirement above is the actual Unix rule underneath, and it is what a
+lower-level implementation still has to get right by hand.
 
 Recommended beyond that, in increasing order of effort: a system user per app,
 so a compromise in one cannot read another's config; running the shepherd as
