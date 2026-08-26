@@ -1,0 +1,80 @@
+name: test
+# Mirrors shep-log-rotate's workflow in shape, one dog crate to another. shep
+# itself runs twelve jobs across five platforms because it ships a daemon;
+# this ships one binary that talks to one, so most of that matrix would be
+# spending minutes to learn nothing.
+#
+# The `integration` job is the exception and the reason this file exists at
+# all. Every other job here would pass on a dog that cannot actually talk to
+# a shepherd.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      # `--all-targets` reaches the integration tier's own source, which is
+      # feature-gated off by default and would otherwise go unlinted until
+      # somebody enabled it.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo doc --no-deps --all-features
+    env:
+      RUSTDOCFLAGS: -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo test --locked
+      # Both platforms, because this dog is filesystem code (worktrees,
+      # atomic swaps, shared-file links) and the two disagree about things it
+      # depends on.
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Matches `rust-version` in Cargo.toml, which matches shep's. A dog
+      # that needs a newer compiler than the daemon it serves is a bad
+      # example.
+      - run: rustup toolchain install 1.88 --profile minimal
+      - run: cargo +1.88 check --all-targets --all-features --locked
+
+  integration:
+    # The tier that drives a real shepherd, and the only job that tests what
+    # this project is for. It is feature-gated off by default because a
+    # fresh clone has no `shep` binary; here we install one.
+    #
+    # shep publishes to crates.io as of its 0.1.0 release, so this installs
+    # from the registry rather than from a git branch. That means a red job
+    # here is a real signal against shep's current published surface, not
+    # against whatever `main` happens to look like on a given day.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - name: Build a real shep
+        run: cargo install shep --locked
+      - name: Run the integration tier against it
+        run: SHEP_BIN="$(command -v shep)" cargo test --features integration --locked
