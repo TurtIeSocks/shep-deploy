@@ -56,6 +56,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use tokio::time::{Instant, sleep};
+
 use shep_client::shep_core::config::AppConfig;
 
 use crate::daemon::Daemon;
@@ -85,24 +87,60 @@ pub enum Outcome {
     },
 }
 
-/// How long a freshly reloaded sheep has to come up.
+/// The least time a `Probed` reload gets, however small the app says it is.
 ///
-/// Two windows, because the two [`Verify`] modes spend them differently.
-/// `Probed` returns the moment the sheep reports `Online`, so its window is
-/// only a give-up point and can afford to be generous - an app that
-/// compiles its client at startup takes a while, and giving up on it early
-/// would roll back a release that was about to be fine. `Alive` sleeps the
-/// whole window every single time before it looks, so the same number there
-/// would add a minute and a half to every healthy deploy.
+/// Generous, because a probed release's readiness is unbounded in a way
+/// nothing here can compute: the app this design was built against compiles
+/// its client at startup, and the probe is precisely the thing that will
+/// eventually say whether that finished. A give-up point rather than a
+/// wait - both modes poll and return as soon as the flock turns over - so a
+/// wide floor costs a healthy deploy nothing.
+const PROBED_FLOOR: Duration = Duration::from_secs(90);
+
+/// The least time an `Alive` reload gets.
 ///
-/// Neither is configurable yet. The `[dog.<name>]` section that would carry
-/// them is read by [`crate::daemon::Daemon::dog_config`], which belongs to
-/// the poll loop and is not built.
-const fn grace(mode: Verify) -> Duration {
-    match mode {
-        Verify::Probed => Duration::from_secs(90),
-        Verify::Alive => Duration::from_secs(10),
-    }
+/// Much smaller than [`PROBED_FLOOR`], and it can be: an ungated sheep's
+/// reload cost is not a mystery, it is `listen_timeout` per instance and
+/// shep's own bookkeeping around it, which [`budget`] computes. The floor is
+/// only headroom for a fast app on a slow machine. Keeping it small is what
+/// makes a release that genuinely cannot come up get rolled back in
+/// seconds rather than in a minute and a half.
+const ALIVE_FLOOR: Duration = Duration::from_secs(15);
+
+/// How much of the app's own readiness budget to allow for, per instance.
+///
+/// shep's heuristic readiness path sleeps `listen_timeout` per instance, and
+/// spawning, draining and reaping happen around that rather than inside it.
+/// Doubling is headroom for the parts nothing here can measure, not a claim
+/// that a reload takes exactly twice as long.
+const HEADROOM: u32 = 2;
+
+/// How long this app's reload gets before verification gives up on it.
+///
+/// Derived from the app rather than fixed, because a reload's cost is the
+/// app's to decide: `advance_reload` replaces one instance at a time, and a
+/// sheep with no readiness gate takes shep's heuristic path, which sleeps
+/// the whole of `listen_timeout` for each one. A four-instance probeless app
+/// with a fifteen-second `listen_timeout` therefore spends around a minute
+/// reloading while being entirely healthy. A fixed window smaller than that
+/// does not report a slow deploy - it rolls back a good one, and then cannot
+/// even do that, because the shepherd refuses a reload while the first is
+/// still running.
+///
+/// The number is the app's own arithmetic with [`HEADROOM`] on top, floored
+/// by mode: [`PROBED_FLOOR`] where readiness is unbounded, [`ALIVE_FLOOR`]
+/// where it is only what shep is going to sleep for anyway.
+fn budget(app: &AppConfig, mode: Verify) -> Duration {
+    let floor = match mode {
+        Verify::Probed => PROBED_FLOOR,
+        Verify::Alive => ALIVE_FLOOR,
+    };
+
+    app.listen_timeout
+        .as_duration()
+        .saturating_mul(app.instances.max(1))
+        .saturating_mul(HEADROOM)
+        .max(floor)
 }
 
 /// Deploys the head of `state.branch` to the tree's sheep, rolling back if
@@ -165,6 +203,7 @@ pub async fn deploy<D: Daemon>(
 
     let app = flockfile::app_config(&release, sheep)?;
     refuse_probeless_verification(sheep, &app, state.verify)?;
+    let budget = budget(&app, state.verify);
     let spec = flockfile::build_spec(&release)?;
     build::run(&release, &spec, app.user.as_deref()).await?;
 
@@ -184,7 +223,7 @@ pub async fn deploy<D: Daemon>(
     }
     swap::point_at(&tree.current(), &release)?;
 
-    match settle(daemon, sheep, state.verify).await {
+    match settle(daemon, sheep, state.verify, budget).await {
         Ok(true) => {
             state.deployed = Some(head.clone());
             state.write(&tree.state_file())?;
@@ -192,10 +231,19 @@ pub async fn deploy<D: Daemon>(
         }
         Ok(false) => {
             let why = format!(
-                "it did not come up within {}s of the reload",
-                grace(state.verify).as_secs()
+                "it did not come up and stay up within {}s of the reload",
+                budget.as_secs()
             );
-            let to = roll_back(daemon, tree, state, previous.as_deref(), &head, &why).await?;
+            let to = roll_back(
+                daemon,
+                tree,
+                state,
+                previous.as_deref(),
+                &head,
+                &why,
+                budget,
+            )
+            .await?;
             Ok(Outcome::RolledBack { to, why })
         }
         // The same rollback as above, not a lesser one. `settle` reloads
@@ -213,6 +261,7 @@ pub async fn deploy<D: Daemon>(
                 previous.as_deref(),
                 &head,
                 &err.to_string(),
+                budget,
             )
             .await?;
             Err(Error::RolledBack {
@@ -310,10 +359,15 @@ fn refuse_probeless_verification(sheep: &str, app: &AppConfig, mode: Verify) -> 
 /// a completion, so a check made after it that does not know which process
 /// was already there reads the old one and passes. See
 /// [`crate::verify`]'s module doc.
-async fn settle<D: Daemon>(daemon: &D, sheep: &str, mode: Verify) -> Result<bool, Error> {
+async fn settle<D: Daemon>(
+    daemon: &D,
+    sheep: &str,
+    mode: Verify,
+    budget: Duration,
+) -> Result<bool, Error> {
     let before = Generation::of(daemon, sheep).await?;
     daemon.reload(sheep).await?;
-    verify::wait(daemon, sheep, mode, &before, grace(mode)).await
+    verify::wait(daemon, sheep, mode, &before, budget).await
 }
 
 /// Puts `previous` back after `attempted` was rejected, and answers with
@@ -353,6 +407,7 @@ async fn roll_back<D: Daemon>(
     previous: Option<&Path>,
     attempted: &str,
     why: &str,
+    patience: Duration,
 ) -> Result<String, Error> {
     let Some(previous) = previous.filter(|path| sha_of(path) != attempted) else {
         return Err(Error::Unverified {
@@ -363,7 +418,7 @@ async fn roll_back<D: Daemon>(
     };
 
     let to = sha_of(previous);
-    restore(daemon, tree, state, previous, &to)
+    restore(daemon, tree, state, previous, attempted, patience)
         .await
         .map_err(|source| Error::RollbackFailed {
             why: why.to_owned(),
@@ -373,10 +428,20 @@ async fn roll_back<D: Daemon>(
     Ok(to)
 }
 
-/// Points `current` back at `previous`, reloads onto it, and corrects the
-/// record to match.
+/// Points `current` back at `previous`, corrects the record to match, and
+/// reloads onto it.
 ///
 /// The three steps are in that order and none of them is optional.
+///
+/// The record is written BEFORE the reload rather than after it, which is
+/// the one ordering choice here worth arguing. Written after, a reload the
+/// shepherd would not accept leaves `current` naming the old release and
+/// `deploy.toml` naming whatever it named before - two disagreements to
+/// explain instead of one. Written first, the filesystem and the record
+/// always agree with each other, and the only thing that can be out of step
+/// is the running process, which is exactly what [`Error::Split`] says. It
+/// also leaves the record naming a release the next poll will see as behind
+/// the branch head, so an unattended target retries rather than settling.
 ///
 /// The reload is not best-effort: a swap back that is never reloaded leaves
 /// the old code on disk and the new, unhealthy instance still running, and
@@ -392,24 +457,72 @@ async fn roll_back<D: Daemon>(
 /// ordinary rollback costs no write at all.
 ///
 /// # Errors
-/// [`Error::Io`] if `current` cannot be repointed or `deploy.toml` cannot
-/// be written, or whatever [`Daemon::reload`] returns.
+/// [`Error::Io`] if `current` cannot be repointed or `deploy.toml` cannot be
+/// written. [`Error::Split`] if the reload cannot be issued within
+/// `patience` - see [`reload_until`] for why that is retried at all, and
+/// [`Error::Split`] for what an operator is told when it still fails.
 async fn restore<D: Daemon>(
     daemon: &D,
     tree: &Tree,
     state: &mut State,
     previous: &Path,
-    to: &str,
+    attempted: &str,
+    patience: Duration,
 ) -> Result<(), Error> {
-    swap::point_at(&tree.current(), previous)?;
-    daemon.reload(tree.sheep()).await?;
+    let sheep = tree.sheep();
+    let to = sha_of(previous);
 
-    if state.deployed.as_deref() != Some(to) {
-        state.deployed = Some(to.to_owned());
+    swap::point_at(&tree.current(), previous)?;
+
+    if state.deployed.as_deref() != Some(to.as_str()) {
+        state.deployed = Some(to.clone());
         state.write(&tree.state_file())?;
     }
 
-    Ok(())
+    reload_until(daemon, sheep, patience)
+        .await
+        .map_err(|err| Error::Split {
+            sheep: sheep.to_owned(),
+            on: to,
+            running: attempted.to_owned(),
+            why: err.to_string(),
+        })
+}
+
+/// How long to leave between attempts at a reload the shepherd would not
+/// take.
+const RETRY_EVERY: Duration = Duration::from_millis(500);
+
+/// Reloads `sheep`, retrying until `patience` runs out.
+///
+/// The refusal this exists for is transient and self-clearing: the shepherd
+/// will not start a reload while another is in flight, and the one in flight
+/// is precisely what verification just gave up waiting for. Retrying is
+/// therefore the difference between a rollback that lands a few seconds late
+/// and one that cannot happen at all.
+///
+/// Every error is retried, not only that one. The refusal arrives as a
+/// message rather than as anything this crate can match on, and the
+/// alternative - matching the shepherd's own wording - would break silently
+/// the first time it is reworded, in the one path where being wrong leaves a
+/// sheep split. The cost of retrying an error that was never going to clear
+/// is a bounded delay on a deploy that has already failed.
+///
+/// # Errors
+/// The last failure, once `patience` has run out.
+async fn reload_until<D: Daemon>(daemon: &D, sheep: &str, patience: Duration) -> Result<(), Error> {
+    let deadline = Instant::now() + patience;
+    loop {
+        match daemon.reload(sheep).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(err);
+                }
+                sleep(RETRY_EVERY).await;
+            }
+        }
+    }
 }
 
 /// A release path as it reads in a message, or "nothing" when `current`
@@ -524,6 +637,11 @@ mod tests {
             checkout: origin.path().to_owned(),
         };
 
+        // A real target always has one on disk, because that is where its
+        // `State` was read from. Writing it here keeps assertions about
+        // what `deploy.toml` says meaningful rather than vacuous.
+        state.write(&tree.state_file()).expect("write deploy.toml");
+
         Fixture {
             home,
             origin,
@@ -539,6 +657,10 @@ mod tests {
         let first = crate::git::remote_head(&fixture.tree.git(), "main").expect("head");
         install_release(&fixture, &first);
         fixture.state.deployed = Some(first);
+        fixture
+            .state
+            .write(&fixture.tree.state_file())
+            .expect("write deploy.toml");
         fixture
     }
 
@@ -595,6 +717,11 @@ mod tests {
         /// for another process leaving a stale `current.tmp` behind at the
         /// worst possible moment - after the swap, before the rollback.
         plant: Option<PathBuf>,
+        /// How many reloads after the first to refuse, standing in for the
+        /// shepherd's own refusal to start a reload while one is in flight.
+        /// The first is never refused, because that is the deploy's own and
+        /// the case being modelled is a ROLLBACK arriving while it runs.
+        refusals: Cell<u32>,
         reloads: Cell<u32>,
     }
 
@@ -610,6 +737,7 @@ mod tests {
                 replaces: true,
                 describe_fails: false,
                 plant: None,
+                refusals: Cell::new(0),
                 reloads: Cell::new(0),
             }
         }
@@ -650,6 +778,15 @@ mod tests {
                 plant: Some(plant),
                 ..Self::never_ready()
             }
+        }
+
+        /// A shepherd that is busy with the deploy's own reload when the
+        /// rollback's arrives, and refuses the next `times` of them.
+        /// `u32::MAX` never stops refusing.
+        fn busy_for(times: u32) -> Self {
+            let shepherd = Self::never_ready();
+            shepherd.refusals.set(times);
+            shepherd
         }
 
         fn reload_count(&self) -> u32 {
@@ -705,7 +842,16 @@ mod tests {
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
             unimplemented!()
         }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
+        async fn reload(&self, sheep: &str) -> Result<(), Error> {
+            let refusals = self.refusals.get();
+            if self.reloads.get() > 0 && refusals > 0 {
+                if refusals != u32::MAX {
+                    self.refusals.set(refusals - 1);
+                }
+                return Err(Error::Protocol(format!(
+                    "the daemon reported Internal: {sheep} is already being reloaded"
+                )));
+            }
             self.reloads.set(self.reloads.get() + 1);
             Ok(())
         }
@@ -806,6 +952,96 @@ mod tests {
             Some(fixture.tree.release(&previous))
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if the verification window stops following the app. A
+    /// probeless sheep takes shep's heuristic readiness path, which sleeps
+    /// `listen_timeout` per instance, and `advance_reload` replaces one
+    /// instance at a time - so a four-instance app with a fifteen-second
+    /// timeout spends around a minute reloading while being perfectly
+    /// healthy. A window fixed below that rolls a good release back and
+    /// then cannot, because the shepherd will not take a second reload.
+    #[test]
+    fn the_verification_window_follows_the_app() {
+        let mut app: AppConfig =
+            toml::from_str("name = 'web'\nscript = './run.sh'").expect("parses");
+
+        // A small app gets its mode's floor. Probed's is generous because a
+        // probed release's readiness is unbounded; Alive's is not, because
+        // an ungated reload costs exactly what shep is going to sleep for.
+        assert_eq!(budget(&app, Verify::Probed), PROBED_FLOOR);
+        assert_eq!(budget(&app, Verify::Alive), ALIVE_FLOOR);
+
+        app.instances = 4;
+        app.listen_timeout = shep_client::shep_core::values::UpDuration::from_millis(15_000);
+        assert_eq!(budget(&app, Verify::Probed), Duration::from_secs(120));
+        assert_eq!(budget(&app, Verify::Alive), Duration::from_secs(120));
+    }
+
+    /// fails if a rollback gives up the first time the shepherd says it is
+    /// busy. That refusal is transient and self-clearing - it means the
+    /// reload verification just gave up on is still running - so retrying
+    /// is the difference between a rollback that lands a few seconds late
+    /// and one that cannot happen at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_retries_a_reload_the_shepherd_is_too_busy_for() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(&Shepherd::busy_for(3), &fixture.tree, &mut fixture.state)
+            .await
+            .expect("completes");
+
+        assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a rollback the shepherd never accepts is reported as
+    /// anything vaguer than the state it leaves. This is the one situation
+    /// this crate cannot repair on its own, and the operator gets three
+    /// things to compare and one command to run: `current` and deploy.toml
+    /// agree on the old release, and the process may still be on the new
+    /// one.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_the_shepherd_never_accepts_is_reported_as_a_split_state() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let err = deploy(
+            &Shepherd::busy_for(u32::MAX),
+            &fixture.tree,
+            &mut fixture.state,
+        )
+        .await
+        .expect_err("the rollback cannot reload");
+
+        assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
+        let shown = err.to_string();
+        assert!(shown.contains("is left split"), "{shown}");
+        assert!(shown.contains(&previous), "{shown}");
+        assert!(shown.contains(&second), "{shown}");
+        assert!(shown.contains("shep reload web"), "{shown}");
+
+        // The two things this crate does control agree with each other, so
+        // the message has exactly one disagreement to explain.
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("deploy.toml was written")
+                .deployed
+                .as_deref(),
+            Some(previous.as_str())
+        );
     }
 
     /// fails if a `probed` target with no readiness probe is deployed
@@ -1009,7 +1245,10 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("web"), "{shown}");
         assert!(shown.contains(&first), "{shown}");
-        assert!(shown.contains("did not come up within 90s"), "{shown}");
+        assert!(
+            shown.contains("did not come up and stay up within 90s"),
+            "{shown}"
+        );
         assert!(!shown.contains("rolling back after"), "{shown}");
         assert_eq!(shown.matches("roll back").count(), 1, "{shown}");
         // The record never advanced, because nothing verified.

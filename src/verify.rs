@@ -103,6 +103,15 @@ impl Generation {
         info.pid.is_some_and(|pid| !self.pids.contains(&pid))
     }
 
+    /// Whether `info` is one of this generation's own instances.
+    ///
+    /// The mirror of [`Self::is_new`], for the dwell: after a turnover the
+    /// question stops being "is this different" and becomes "is this still
+    /// the same one".
+    fn holds(&self, info: &ProcessInfo) -> bool {
+        info.pid.is_some_and(|pid| self.pids.contains(&pid))
+    }
+
     /// Whether `flock` is entirely made of instances this generation never
     /// had, in a state `accept` is happy with.
     ///
@@ -113,54 +122,110 @@ impl Generation {
     }
 }
 
-/// Watch `sheep` for up to `timeout`, judging health the way `mode` says to,
+/// How long `Alive` watches a turned-over flock before believing it.
+///
+/// The spec's own wording for `alive` is "wait N seconds and confirm the
+/// process is still running", and this is that N. It is a dwell after the
+/// turnover rather than a window the turnover has to fit inside: how long a
+/// reload takes is the app's business (see [`budget`]'s caller in
+/// `crate::deploy`), while how long a new release has to survive before
+/// anyone believes in it is this crate's.
+const DWELL: Duration = Duration::from_secs(10);
+
+/// How often either mode asks the shepherd again.
+const POLL: Duration = Duration::from_millis(100);
+
+/// Watch `sheep` for up to `budget`, judging health the way `mode` says to,
 /// against the generation that was serving before the reload.
 ///
-/// `Probed` polls `describe` every 100ms (and once immediately) and returns
-/// as soon as the flock has turned over into instances that are all
-/// [`ProcStatus::Online`]. It can only mean anything for a sheep with a
-/// readiness probe configured, since that is what makes shep withhold
-/// `Online` from a process that is running but not ready; `deploy` refuses a
-/// `Probed` target with no probe before it touches anything.
+/// Both modes poll, and both wait for the same turnover: every instance the
+/// shepherd reports running under a pid `before` never had. They differ only
+/// in what they then accept, and in what they do afterwards.
 ///
-/// `Alive` has a different shape on purpose: it sleeps the whole window once
-/// and then checks a single time. It still demands a turnover - a deploy
-/// that reloaded nothing is not verified in either mode - but it accepts
-/// `Starting` as well as `Online`, because a sheep with no probe is exactly
-/// the case `Alive` exists for and there is nothing to wait for beyond the
-/// process still being there. `WaitingRestart` in particular is a fail: it
-/// means the process already died and is backed off waiting to be restarted,
-/// which is the failure a deploy is trying to catch.
+/// `Probed` returns as soon as the turned-over flock is all
+/// [`ProcStatus::Online`]. That can only mean anything for a sheep whose
+/// readiness is gated - a probe, or `wait_ready` on the channel - since
+/// otherwise shep reports `Online` for a process that merely has not died;
+/// `deploy` refuses a `Probed` target with neither before it touches
+/// anything.
+///
+/// `Alive` accepts `Starting` as well, because a sheep with no gate is
+/// exactly what it exists for, and then dwells: it sleeps [`DWELL`] and
+/// looks once more, requiring the same pids to still be there. A process
+/// that came up and died inside the dwell has a different pid by then (shep
+/// restarts it) or none at all, either of which fails. `WaitingRestart` is a
+/// fail throughout for the same reason.
+///
+/// # Why `Alive` polls at all
+///
+/// It used to sleep one fixed window and sample once. That shape cannot tell
+/// "the reload is still in flight" from "the release failed", and the
+/// difference matters as soon as a wrong answer rolls back: a probeless app
+/// takes shep's heuristic readiness path, which sleeps the app's whole
+/// `listen_timeout` per instance, so a reload can legitimately outlive any
+/// fixed window. Measured, a one-instance probeless app with
+/// `listen_timeout = "15s"` had a perfectly good release given up on at 10
+/// seconds, rolled back, and the rollback's own reload refused because the
+/// first one was still running.
 ///
 /// # Errors
-/// Whatever [`Daemon::describe`] returns - a `Probed` wait can surface a
+/// Whatever [`Daemon::describe`] returns - either mode can surface a
 /// transient error mid-poll rather than only at the deadline.
 pub async fn wait<D: Daemon>(
     daemon: &D,
     sheep: &str,
     mode: Verify,
     before: &Generation,
-    timeout: Duration,
+    budget: Duration,
 ) -> Result<bool, Error> {
-    match mode {
-        Verify::Probed => {
-            let deadline = Instant::now() + timeout;
-            loop {
-                let flock = daemon.describe(sheep).await?;
-                if before.has_turned_over(&flock, is_online) {
-                    return Ok(true);
-                }
-                if Instant::now() >= deadline {
-                    return Ok(false);
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
+    let accept = match mode {
+        Verify::Probed => is_online,
+        Verify::Alive => is_alive,
+    };
+
+    let Some(settled) = turnover(daemon, sheep, before, accept, budget).await? else {
+        return Ok(false);
+    };
+
+    if mode == Verify::Probed {
+        return Ok(true);
+    }
+
+    sleep(DWELL).await;
+    let flock = daemon.describe(sheep).await?;
+    Ok(!flock.is_empty()
+        && flock
+            .iter()
+            .all(|info| settled.holds(info) && is_alive(info)))
+}
+
+/// Polls until `before` has been replaced by instances `accept` is happy
+/// with, and answers with the generation that replaced it.
+///
+/// `None` is the deadline passing with no such turnover, which is the
+/// failure both modes report.
+///
+/// # Errors
+/// Whatever [`Daemon::describe`] returns.
+async fn turnover<D: Daemon>(
+    daemon: &D,
+    sheep: &str,
+    before: &Generation,
+    accept: fn(&ProcessInfo) -> bool,
+    budget: Duration,
+) -> Result<Option<Generation>, Error> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let flock = daemon.describe(sheep).await?;
+        if before.has_turned_over(&flock, accept) {
+            return Ok(Some(Generation {
+                pids: flock.iter().filter_map(|info| info.pid).collect(),
+            }));
         }
-        Verify::Alive => {
-            sleep(timeout).await;
-            let flock = daemon.describe(sheep).await?;
-            Ok(before.has_turned_over(&flock, is_alive))
+        if Instant::now() >= deadline {
+            return Ok(None);
         }
+        sleep(POLL).await;
     }
 }
 
@@ -252,7 +317,7 @@ mod tests {
     /// listing is one `Online` entry under the old pid, forever. A check
     /// that asks only about status reports that deploy healthy and every
     /// rollback in this crate becomes unreachable.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_old_instance_still_online_is_not_a_new_release() {
         let daemon = Listings::new(vec![vec![instance(1, ProcStatus::Online, 12835)]]);
         let ok = wait(
@@ -272,7 +337,7 @@ mod tests {
     /// the first poll of a perfectly healthy deploy sees exactly this: the
     /// old instance, alone and Online, because the replacement has not been
     /// spawned yet.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reload_that_has_not_happened_yet_is_not_success() {
         let daemon = Listings::new(vec![
             vec![instance(1, ProcStatus::Online, 12835)],
@@ -293,7 +358,7 @@ mod tests {
     /// fails if a replacement that reaches Online is not treated as success.
     /// The listing walks the real sequence: the old instance alone, then the
     /// two overlapping while the old drains, then the new one alone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_new_instance_reaching_online_is_success() {
         let daemon = Listings::new(vec![
             vec![instance(1, ProcStatus::Online, 12835)],
@@ -320,7 +385,7 @@ mod tests {
     /// During a reload the listing carries both, and the new one can be
     /// Online while the old one is still Stopping - a turnover is not
     /// finished until the old process is gone.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_draining_old_instance_is_not_a_finished_turnover() {
         let daemon = Listings::new(vec![vec![
             instance(1, ProcStatus::Stopping, 12835),
@@ -342,7 +407,7 @@ mod tests {
     /// `ProcStatus::Starting` means "spawned, not yet ready" and `Online`
     /// means "running and, if configured, ready", so `Online` is the only
     /// status that means the probe passed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_new_instance_that_never_leaves_starting_is_not_success() {
         let daemon = Listings::new(vec![vec![instance(2, ProcStatus::Starting, 13002)]]);
         let ok = wait(
@@ -360,7 +425,7 @@ mod tests {
     /// fails if `Verify::Alive` starts demanding a probe. Alive is the
     /// deliberate, visible downgrade for a sheep with no probe: a new
     /// process, still running after the window, is enough.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn alive_accepts_a_new_process_that_is_still_running() {
         let daemon = Listings::new(vec![vec![instance(2, ProcStatus::Starting, 13002)]]);
         assert!(
@@ -380,7 +445,7 @@ mod tests {
     /// Alive is a downgrade on what "healthy" means, not on whether a
     /// deploy happened at all: a reload that put nothing new in place has
     /// not been verified by either mode.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn alive_rejects_the_old_process_still_running() {
         let daemon = Listings::new(vec![vec![instance(1, ProcStatus::Online, 12835)]]);
         let ok = wait(
@@ -400,7 +465,7 @@ mod tests {
     /// `is_alive`, and it is the failure `Alive` exists to catch: the
     /// process was spawned, so its pid is new, and it did not survive the
     /// window.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn alive_rejects_an_instance_waiting_to_be_restarted() {
         let daemon = Listings::new(vec![vec![instance(2, ProcStatus::WaitingRestart, 13002)]]);
         let ok = wait(
@@ -415,12 +480,85 @@ mod tests {
         assert!(!ok);
     }
 
+    /// fails if `Alive` gives up on a reload that is still in flight. A
+    /// probeless app takes shep's heuristic readiness path, which sleeps
+    /// the app's whole `listen_timeout` per instance, so the old instance
+    /// is all there is to see for as long as that takes. Sampling once at a
+    /// fixed ten seconds called a perfectly good release dead, rolled it
+    /// back, and then could not reload because the first reload was still
+    /// running.
+    #[tokio::test(start_paused = true)]
+    async fn alive_waits_out_a_reload_that_is_still_in_flight() {
+        let daemon = Listings::new(vec![
+            vec![instance(1, ProcStatus::Online, 12835)],
+            vec![instance(1, ProcStatus::Online, 12835)],
+            vec![instance(1, ProcStatus::Online, 12835)],
+            vec![instance(2, ProcStatus::Starting, 13002)],
+        ]);
+        assert!(
+            wait(
+                &daemon,
+                "web",
+                Verify::Alive,
+                &serving(12835),
+                Duration::from_secs(120)
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    /// fails if `Alive` believes a release that came up and then died. The
+    /// dwell is the whole of what `alive` promises - "wait N seconds and
+    /// confirm the process is still running" - and a single sample taken at
+    /// the moment of turnover confirms nothing. shep restarts the corpse,
+    /// so what the dwell sees is a pid that is new again.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_a_process_that_dies_during_the_dwell() {
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Starting, 13002)],
+            vec![instance(2, ProcStatus::Starting, 13456)],
+        ]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &serving(12835),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+        assert!(!ok);
+    }
+
+    /// fails if the dwell stops noticing a process that is gone entirely by
+    /// the end of it - the other half of
+    /// `alive_rejects_a_process_that_dies_during_the_dwell`, where shep has
+    /// not restarted it yet and there is nothing left to describe.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_a_flock_that_empties_during_the_dwell() {
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Starting, 13002)],
+            Vec::new(),
+        ]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &serving(12835),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+        assert!(!ok);
+    }
+
     /// fails if an instance with no pid at all is treated as a new one.
     /// `WaitingRestart` covers the status side of the same case; this
     /// covers the pid side, which is what `Generation::is_new` actually
     /// asks. A deploy verified against an instance with no process has been
     /// verified against nothing.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_instance_with_no_pid_is_not_a_new_generation() {
         let daemon = Listings::new(vec![vec![
             ProcessInfo::builder(2, "web", ProcStatus::Online).build(),
@@ -440,7 +578,7 @@ mod tests {
     /// fails if a sheep the shepherd cannot find (an empty `describe`
     /// result) is ever treated as verified. Both modes must fail closed
     /// here: there is nothing to have come up healthy.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_empty_describe_is_failure_in_both_modes() {
         let empty = Listings::new(Vec::new());
         assert!(
@@ -474,7 +612,7 @@ mod tests {
     /// two-element sequence outlives it several times over; every one of
     /// those extra polls must keep reading the last listing rather than
     /// running off the end.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_fixture_repeats_its_last_listing_past_exhaustion() {
         let daemon = Listings::new(vec![
             vec![instance(1, ProcStatus::Online, 12835)],
@@ -495,7 +633,7 @@ mod tests {
     /// fails if capturing the pre-reload generation loses a pid, or invents
     /// one for an instance that has none. Everything above rests on this
     /// set being what was actually serving.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_generation_is_the_pids_that_are_serving() {
         let daemon = Listings::new(vec![vec![
             instance(1, ProcStatus::Online, 12835),

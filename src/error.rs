@@ -90,6 +90,25 @@ pub enum Error {
         /// What went wrong rolling back.
         source: Box<Error>,
     },
+    /// A rollback put `current` and `deploy.toml` back, and then could not
+    /// get the shepherd to reload onto them.
+    ///
+    /// The one state this crate cannot repair on its own, and it is named
+    /// rather than glossed: the filesystem and the record agree with each
+    /// other, and the process may still be running the release that was
+    /// rejected. The shepherd refuses a reload while another is in flight,
+    /// so the ordinary cause is a reload that outlived verification, and the
+    /// ordinary fix is one command once it settles.
+    Split {
+        /// The sheep left in this state.
+        sheep: String,
+        /// The release `current` and `deploy.toml` both name now.
+        on: String,
+        /// The release the running process may still be executing.
+        running: String,
+        /// Why the reload could not be issued.
+        why: String,
+    },
     /// A release was swapped in, something went wrong afterwards, and the
     /// rollback that followed succeeded.
     ///
@@ -165,6 +184,18 @@ impl fmt::Display for Error {
                 "rolling back after {why} failed: {source} - current may still point at the \
                  release that was rejected"
             ),
+            Self::Split {
+                sheep,
+                on,
+                running,
+                why,
+            } => write!(
+                f,
+                "{sheep} is left split: current and deploy.toml both name {on}, but the shepherd \
+                 would not reload onto it ({why}), so the running process may still be {running}. \
+                 Once `shep flock` shows no reload in flight, `shep reload {sheep}` puts it back \
+                 on {on}."
+            ),
             Self::RolledBack { to, source } => {
                 write!(f, "rolled back to {to} after: {source}")
             }
@@ -194,6 +225,7 @@ impl core::error::Error for Error {
             | Self::Config(_)
             | Self::Git { .. }
             | Self::Raced { .. }
+            | Self::Split { .. }
             | Self::Unverified { .. }
             | Self::Build { .. } => None,
         }
@@ -275,6 +307,26 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("a1b2c3d"), "{shown}");
         assert!(shown.contains("e4f5a6b"), "{shown}");
+    }
+
+    /// fails if the one state this crate cannot repair stops naming all
+    /// three of the things an operator has to compare, or stops saying what
+    /// to run. A message that says "something went wrong" here leaves a
+    /// half-deployed sheep and no way to reason about it.
+    #[test]
+    fn a_split_state_names_all_three_and_the_way_out() {
+        let err = Error::Split {
+            sheep: "web".to_owned(),
+            on: "a1b2c3d".to_owned(),
+            running: "e4f5a6b".to_owned(),
+            why: "web is already being reloaded".to_owned(),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("current"), "{shown}");
+        assert!(shown.contains("deploy.toml"), "{shown}");
+        assert!(shown.contains("a1b2c3d"), "{shown}");
+        assert!(shown.contains("e4f5a6b"), "{shown}");
+        assert!(shown.contains("shep reload web"), "{shown}");
     }
 
     /// fails if a deploy that was rolled back reports only the failure and

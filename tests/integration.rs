@@ -175,20 +175,42 @@ fn head_of(dir: &Path) -> String {
 /// status and pid, never the config shep registered. The two copies can
 /// therefore disagree, and this fixture keeps them honest by generating
 /// both from here.
-fn app_toml(home: &Path, with_cwd: bool) -> String {
+fn app_toml(home: &Path, with_cwd: bool, readiness: Readiness) -> String {
     let current = home.join("deploy/web/current");
     let cwd = if with_cwd {
         format!("cwd = {:?}\n", current.to_str().expect("utf-8 path"))
     } else {
         String::new()
     };
-    format!(
-        "[[app]]\nname = \"web\"\nscript = \"./run.sh\"\n{cwd}\n[app.readiness_probe]\nkind = \
-         \"exec\"\ntarget = \"test -f {marker}\"\ninterval = \"1s\"\ntimeout = \
-         \"2s\"\nfailure_threshold = 1\n",
-        marker = current.join("ready-marker").display(),
-    )
+    let gate = match readiness {
+        Readiness::Probe => format!(
+            "\n[app.readiness_probe]\nkind = \"exec\"\ntarget = \"test -f \
+             {marker}\"\ninterval = \"1s\"\ntimeout = \"2s\"\nfailure_threshold = 1\n",
+            marker = current.join("ready-marker").display(),
+        ),
+        Readiness::Heuristic => format!("listen_timeout = \"{HEURISTIC_LISTEN}s\"\n"),
+    };
+    format!("[[app]]\nname = \"web\"\nscript = \"./run.sh\"\n{cwd}{gate}")
 }
+
+/// How a test's app reports itself ready.
+#[derive(Clone, Copy)]
+enum Readiness {
+    /// An exec probe through `current`, which is what the deploy sequence
+    /// wants and what `verify = "probed"` requires.
+    Probe,
+    /// Nothing at all, which is what most real apps have. shep falls back to
+    /// sleeping the app's whole `listen_timeout` per instance, and that is
+    /// the case the verification window has to be derived for.
+    Heuristic,
+}
+
+/// The `listen_timeout` a probeless fixture app declares, in seconds.
+///
+/// Longer than the ten-second window `Verify::Alive` used to be fixed at, on
+/// purpose: shorter and the reload fits inside the old window, and the test
+/// below cannot fail against the code it exists to pin.
+const HEURISTIC_LISTEN: u64 = 12;
 
 /// A bare git origin with one committed app named `web`, whose script echoes
 /// `version` to stdout and then sleeps, and which carries the marker file
@@ -205,13 +227,16 @@ fn app_toml(home: &Path, with_cwd: bool) -> String {
 /// ready and one that does not never can. That is how a test makes a real
 /// shepherd's `AwaitReady` fail on purpose, which is the only way to
 /// exercise a rollback end to end.
-fn origin_with_app(home: &Path, version: &str) -> tempfile::TempDir {
+fn origin_with_app(home: &Path, version: &str, readiness: Readiness) -> tempfile::TempDir {
     let origin = tempfile::tempdir().expect("tempdir");
     git(origin.path(), &["init", "-q", "-b", "main"]);
     git(origin.path(), &["config", "user.email", "test@example.com"]);
     git(origin.path(), &["config", "user.name", "test"]);
-    fs::write(origin.path().join("Flockfile.toml"), app_toml(home, false))
-        .expect("write Flockfile");
+    fs::write(
+        origin.path().join("Flockfile.toml"),
+        app_toml(home, false, readiness),
+    )
+    .expect("write Flockfile");
     fs::write(origin.path().join("ready-marker"), "").expect("write ready-marker");
     write_run_script(origin.path(), version);
     git(origin.path(), &["add", "."]);
@@ -293,9 +318,9 @@ fn write_state(home: &Path, sheep: &str, origin: &Path, sha: &str, verify: &str)
 /// reload to fail therefore cannot change the probe; it changes what the
 /// probe LOOKS at, which is why the probe points through `current` at a
 /// file a release either ships or does not.
-fn register_web(shepherd: &Shepherd) {
+fn register_web(shepherd: &Shepherd, readiness: Readiness) {
     let path = shepherd.home().join("register.toml");
-    fs::write(&path, app_toml(shepherd.home(), true)).expect("write register.toml");
+    fs::write(&path, app_toml(shepherd.home(), true, readiness)).expect("write register.toml");
     shepherd.ok(&[
         "start",
         path.to_str().expect("utf-8 path"),
@@ -329,6 +354,17 @@ fn wait_until(what: &str, ready: impl Fn() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// Whether `shep describe` reports `sheep` as `online`.
+///
+/// A pid alone is not enough for the probeless tests: shep hands out a pid
+/// the moment it spawns and only calls the sheep `online` once its readiness
+/// path is satisfied, which for those is a whole `listen_timeout` later.
+fn described_online(shepherd: &Shepherd, sheep: &str) -> bool {
+    shepherd
+        .ok(&["describe", sheep, "--format", "json"])
+        .contains("\"status\":\"online\"")
+}
+
 /// The pid `shep describe` reports for `sheep`, or `None` if it has none or
 /// cannot be found at all.
 fn described_pid(shepherd: &Shepherd, sheep: &str) -> Option<u32> {
@@ -352,11 +388,11 @@ fn described_pid(shepherd: &Shepherd, sheep: &str) -> Option<u32> {
 #[test]
 fn a_real_deploy_swaps_reloads_and_verifies() {
     let shepherd = Shepherd::new();
-    let origin = origin_with_app(shepherd.home(), "v1");
+    let origin = origin_with_app(shepherd.home(), "v1", Readiness::Probe);
     let first = build_tree(shepherd.home(), "web", origin.path());
     write_state(shepherd.home(), "web", origin.path(), &first, "probed");
 
-    register_web(&shepherd);
+    register_web(&shepherd, Readiness::Probe);
     wait_until("the first release to come online", || {
         described_pid(&shepherd, "web").is_some()
     });
@@ -413,11 +449,11 @@ fn a_real_deploy_swaps_reloads_and_verifies() {
 #[test]
 fn a_failing_build_leaves_the_previous_release_serving() {
     let shepherd = Shepherd::new();
-    let origin = origin_with_app(shepherd.home(), "v1");
+    let origin = origin_with_app(shepherd.home(), "v1", Readiness::Probe);
     let first = build_tree(shepherd.home(), "web", origin.path());
     write_state(shepherd.home(), "web", origin.path(), &first, "probed");
 
-    register_web(&shepherd);
+    register_web(&shepherd, Readiness::Probe);
     wait_until("the first release to come online", || {
         described_pid(&shepherd, "web").is_some()
     });
@@ -427,7 +463,7 @@ fn a_failing_build_leaves_the_previous_release_serving() {
         origin.path().join("Flockfile.toml"),
         format!(
             "{}\n[build]\ncommand = 'exit 3'\n",
-            app_toml(shepherd.home(), false)
+            app_toml(shepherd.home(), false, Readiness::Probe)
         ),
     )
     .expect("write a failing build");
@@ -487,10 +523,10 @@ fn a_failing_build_leaves_the_previous_release_serving() {
 #[test]
 fn a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves() {
     let shepherd = Shepherd::new();
-    let origin = origin_with_app(shepherd.home(), "v1");
+    let origin = origin_with_app(shepherd.home(), "v1", Readiness::Probe);
     let first = build_tree(shepherd.home(), "web", origin.path());
     write_state(shepherd.home(), "web", origin.path(), &first, "alive");
-    register_web(&shepherd);
+    register_web(&shepherd, Readiness::Probe);
 
     wait_until("the first release to come online", || {
         described_pid(&shepherd, "web").is_some()
@@ -543,5 +579,83 @@ fn a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves() {
     assert!(
         described_pid(&shepherd, "web").is_some(),
         "the sheep must still be running after a rollback"
+    );
+}
+
+/// fails if a reload that takes longer than the verification window is
+/// treated as a release that failed. This is the case that made `Alive`
+/// destructive rather than merely wrong: an app with no readiness gate takes
+/// shep's heuristic path, which sleeps its whole `listen_timeout` per
+/// instance, so a reload legitimately outlives any window fixed in advance.
+///
+/// What happened with the window fixed at ten seconds and `listen_timeout`
+/// at twelve, measured, deploying a release that was fine:
+///
+/// ```text
+/// shep-deploy: rolling back after it did not come up within 10s ... failed:
+/// the daemon reported Internal: web is already being reloaded
+/// current   -> releases/<v1>      deployed = "<v1>"      log -> v1 v2
+/// ```
+///
+/// Three failures in sequence: verification gave up on a healthy reload, the
+/// rollback's own reload was refused because the first was still running,
+/// and what was left was the split state the rollback exists to prevent.
+/// Nothing repaired it, and the next poll tried again.
+///
+/// No mock can reproduce this. It needs a real shepherd's readiness
+/// heuristic, a real reload that takes real time, and a real refusal of the
+/// second reload.
+#[test]
+fn a_reload_slower_than_the_old_window_still_deploys() {
+    let shepherd = Shepherd::new();
+    let origin = origin_with_app(shepherd.home(), "v1", Readiness::Heuristic);
+    let first = build_tree(shepherd.home(), "web", origin.path());
+    write_state(shepherd.home(), "web", origin.path(), &first, "alive");
+    register_web(&shepherd, Readiness::Heuristic);
+
+    wait_until("the first release to come online", || {
+        described_online(&shepherd, "web")
+    });
+    let out_log = shepherd.home().join("logs/web-0-out.log");
+    wait_until("v1 to have run", || {
+        last_line(&out_log).as_deref() == Some("v1")
+    });
+
+    write_run_script(origin.path(), "v2");
+    git(origin.path(), &["add", "-A"]);
+    git(origin.path(), &["commit", "-q", "-m", "v2"]);
+    let second = head_of(origin.path());
+
+    let output = shepherd.deploy("web");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a good release must not fail its own deploy: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("deployed {second}")),
+        "the new release must be reported deployed: {stdout}{stderr}"
+    );
+    assert!(
+        !stdout.contains("rolled back") && !stderr.contains("split"),
+        "nothing here should roll back: {stdout}{stderr}"
+    );
+
+    let current = fs::read_link(shepherd.home().join("deploy/web/current")).expect("current");
+    assert_eq!(
+        current,
+        shepherd.home().join("deploy/web/releases").join(&second)
+    );
+
+    let state = fs::read_to_string(shepherd.home().join("deploy/web/deploy.toml")).expect("state");
+    assert!(state.contains(&second), "{state}");
+
+    // And the process really is on the new release, which is the half of
+    // "deployed" that a symlink cannot prove.
+    assert_eq!(
+        last_line(&out_log).as_deref(),
+        Some("v2"),
+        "the running process must be executing the new release"
     );
 }
