@@ -24,9 +24,17 @@
 //! lift this into a library and it starts firing, at which point the
 //! trade-off wants deciding rather than silencing.
 //!
-//! Do not add trait methods speculatively. Each of the six here exists
-//! because a later task in the plan calls it; a method nothing calls is
-//! dead surface with no test to justify it.
+//! Do not add trait methods speculatively. These six are the surface plan
+//! one (this plan) and plan two need between them, not six with a proven
+//! caller today: `list_flock`, `describe` and `reload` are already
+//! exercised inside plan one (`adopted_name` below, probe-based
+//! verification, and the deploy sequence). `dog_config` reads the
+//! `[dog.<name>]` section that names the poll loop's interval and
+//! retention, and that poll loop is deferred to plan two - see the plan's
+//! "What this plan does NOT cover" - so it has no caller until then.
+//! `restart` has no caller in plan one either; Task 10 chose `Reload` for
+//! the whole deploy sequence. Both stay because this task's own brief named
+//! all six up front, not because a caller can be pointed at today.
 //!
 //! # Self-identification
 //!
@@ -99,6 +107,10 @@ pub trait Daemon {
 
 /// A [`Client`] behind the [`Daemon`] trait - the only implementation this
 /// crate ships that speaks to a real shepherd.
+///
+/// `Debug` is derived: the only thing in here is a [`Client`], whose own
+/// `Debug` prints its socket path and handshake ack and nothing else.
+#[derive(Debug)]
 pub struct Live(Client);
 
 impl Live {
@@ -257,6 +269,32 @@ mod tests {
         }
     }
 
+    /// A [`Daemon`] that cannot be reached at all - every method answers
+    /// the same connection-shaped error, matching what a dropped socket
+    /// looks like from the caller's side.
+    struct Unreachable;
+
+    impl Daemon for Unreachable {
+        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+    }
+
     /// fails if the dog cannot work out the name it was adopted under.
     /// A dog is spawned with no argv and one env entry, so the ONLY way it
     /// learns its own `[dog.<name>]` key is to find its own pid in the flock.
@@ -278,5 +316,24 @@ mod tests {
         let me = std::process::id();
         let flock = Flock(vec![sheep_named("web", Some(me))]);
         assert_eq!(adopted_name(&flock).await, None);
+    }
+
+    /// fails if a dog at some OTHER pid is mistaken for this one. This is
+    /// the case that guards the filter's pid half: a fixture with a dog
+    /// entry but no matching pid, where the two tests above cannot tell a
+    /// correct filter from `dog.is_some()` alone, because neither of them
+    /// puts a dog at the wrong pid.
+    #[tokio::test]
+    async fn a_dog_at_another_pid_is_not_this_dog() {
+        let flock = Flock(vec![dog_named("metrics", Some(std::process::id() + 1))]);
+        assert_eq!(adopted_name(&flock).await, None);
+    }
+
+    /// fails if a shepherd that will not answer at all yields anything
+    /// other than "no name". `adopted_name` folds every error into `None`
+    /// through `.ok()?`; this is the case that exercises that fold.
+    #[tokio::test]
+    async fn a_shepherd_that_will_not_answer_yields_no_name() {
+        assert_eq!(adopted_name(&Unreachable).await, None);
     }
 }
