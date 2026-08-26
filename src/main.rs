@@ -14,6 +14,7 @@
 // gap in its own Task 1 and carried the same allow to its Task 7.
 #![allow(dead_code)]
 
+mod daemon;
 mod error;
 
 fn main() {
