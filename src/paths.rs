@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree {
     root: PathBuf,
+    sheep: String,
 }
 
 impl Tree {
@@ -35,7 +36,19 @@ impl Tree {
     pub fn for_sheep(shep_home: &Path, sheep: &str) -> Self {
         Self {
             root: shep_home.join("deploy").join(sheep),
+            sheep: sheep.to_owned(),
         }
+    }
+
+    /// The sheep this tree belongs to.
+    ///
+    /// Kept as its own field rather than read back out of the last
+    /// component of `root`: the deploy sequence passes this name to the
+    /// shepherd, and a name that has been through a `Path` round trip is a
+    /// name that can come back lossy.
+    #[must_use]
+    pub fn sheep(&self) -> &str {
+        &self.sheep
     }
 
     /// The bare clone and its object store, shared by every release's
@@ -92,6 +105,17 @@ mod tests {
         assert_eq!(
             tree.state_file(),
             Path::new("/srv/shep/deploy/bpm/deploy.toml")
+        );
+    }
+
+    /// fails if a tree stops knowing which sheep it belongs to. The
+    /// deploy sequence sends this name to the shepherd, so a tree that
+    /// answered with the wrong one would reload somebody else's app.
+    #[test]
+    fn a_tree_knows_its_own_sheep() {
+        assert_eq!(
+            Tree::for_sheep(Path::new("/srv/shep"), "bpm").sheep(),
+            "bpm"
         );
     }
 

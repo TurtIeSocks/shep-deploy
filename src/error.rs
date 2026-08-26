@@ -65,6 +65,14 @@ pub enum Error {
         /// else.
         stderr: String,
     },
+    /// A release was swapped in, never came up, and there was no previous
+    /// release to fall back to.
+    Unverified {
+        /// The sheep that did not come up.
+        sheep: String,
+        /// The release it was left on, because there is no other.
+        sha: String,
+    },
     /// A release's build command exited without succeeding.
     ///
     /// Deliberately carries only the exit status, not captured output the
@@ -96,6 +104,11 @@ impl fmt::Display for Error {
                 Some(code) => write!(f, "`{command}` exited with status {code}: {stderr}"),
                 None => write!(f, "`{command}` was killed by a signal: {stderr}"),
             },
+            Self::Unverified { sheep, sha } => write!(
+                f,
+                "{sheep} did not come up on release {sha}, and there is no previous release to \
+                 roll back to - it is still pointed at {sha}"
+            ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
@@ -110,7 +123,11 @@ impl core::error::Error for Error {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
             Self::Io { source, .. } => Some(source),
-            Self::Protocol(_) | Self::Config(_) | Self::Git { .. } | Self::Build { .. } => None,
+            Self::Protocol(_)
+            | Self::Config(_)
+            | Self::Git { .. }
+            | Self::Unverified { .. }
+            | Self::Build { .. } => None,
         }
     }
 }
@@ -154,6 +171,20 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("git fetch origin"));
         assert!(shown.contains("could not read Username"));
+    }
+
+    /// fails if a first deploy that never came up stops naming both the
+    /// sheep and the release it is stuck on. This is the one failure with
+    /// no rollback available, so the message is all the operator gets.
+    #[test]
+    fn an_unverified_first_release_names_the_sheep_and_the_sha() {
+        let err = Error::Unverified {
+            sheep: "web".to_owned(),
+            sha: "a1b2c3d".to_owned(),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("web"));
+        assert!(shown.contains("a1b2c3d"));
     }
 
     /// fails if a build's exit status stops being named. This is the only

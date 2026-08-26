@@ -71,12 +71,18 @@ pub trait Daemon {
     /// [`Error::Connect`] or [`Error::Request`] if the shepherd cannot be
     /// reached or refuses, and [`Error::Protocol`] if it answers with
     /// something other than a dog section.
+    // No caller until the poll loop reads its own `[dog.<name>]` section;
+    // see this module's own doc for why all six methods stay anyway.
+    #[allow(dead_code)]
     async fn dog_config(&self, name: &str) -> Result<String, Error>;
 
     /// Every supervised entry, dogs included.
     ///
     /// # Errors
     /// As [`Self::dog_config`].
+    // Called only by `adopted_name`, which the supervised mode needs and
+    // nothing else does yet.
+    #[allow(dead_code)]
     async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error>;
 
     /// Detailed info for one sheep, by exact name.
@@ -89,6 +95,8 @@ pub trait Daemon {
     ///
     /// # Errors
     /// As [`Self::dog_config`].
+    // Opt-in registers the sheep it is taking over; opt-in is plan two.
+    #[allow(dead_code)]
     async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error>;
 
     /// Replace one sheep, by exact name, with a fresh instance of the same
@@ -102,6 +110,9 @@ pub trait Daemon {
     ///
     /// # Errors
     /// As [`Self::dog_config`].
+    // The deploy sequence reloads rather than restarts, so this has no
+    // caller at all - see `crate::deploy`'s own doc for the reasoning.
+    #[allow(dead_code)]
     async fn restart(&self, sheep: &str) -> Result<(), Error>;
 }
 
@@ -214,6 +225,8 @@ fn named(response: &Response) -> String {
 /// because the shepherd would not answer is in the same position as one
 /// adopted under a name the listing does not carry, and has nothing more
 /// useful to do with the distinction.
+// The supervised mode is the only caller, and its poll loop is plan two.
+#[allow(dead_code)]
 pub async fn adopted_name<D: Daemon>(daemon: &D) -> Option<String> {
     let me = std::process::id();
     daemon

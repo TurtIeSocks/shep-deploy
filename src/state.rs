@@ -98,6 +98,22 @@ pub struct State {
 }
 
 impl State {
+    /// Read and parse the `deploy.toml` at `path`.
+    ///
+    /// # Errors
+    /// [`Error::Io`], naming `path`, if the file cannot be read - most
+    /// often because this sheep is not a deploy target at all.
+    /// [`Error::Config`] if it is not valid TOML, or is missing a field
+    /// that has no default.
+    pub fn read(path: &Path) -> Result<Self, Error> {
+        let text = fs::read_to_string(path).map_err(|source| Error::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        toml::from_str(&text)
+            .map_err(|source| Error::Config(format!("{}: {source}", path.display())))
+    }
+
     /// Serialise to TOML and write to `path` atomically.
     ///
     /// The write lands at `<path>.tmp` in the same directory first, then
@@ -168,6 +184,18 @@ mod tests {
         let text = toml::to_string(&original).expect("serialises");
         let back: State = toml::from_str(&text).expect("parses");
         assert_eq!(back, original);
+    }
+
+    /// fails if reading a `deploy.toml` that is not there produces
+    /// anything other than a named I/O failure. An operator asking to
+    /// deploy a sheep that was never set up as a target meets this path,
+    /// and the path it names is the only clue about what is missing.
+    #[test]
+    fn reading_a_missing_state_file_names_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        let err = State::read(&path).expect_err("nothing to read");
+        assert!(err.to_string().contains("deploy.toml"));
     }
 
     /// fails if `watch` stops defaulting to auto. A target written before
@@ -242,8 +270,6 @@ mod tests {
             "a second, overwriting write must also leave no .tmp file"
         );
 
-        let read_back: State =
-            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("parses");
-        assert_eq!(read_back, second);
+        assert_eq!(State::read(&path).expect("reads"), second);
     }
 }
