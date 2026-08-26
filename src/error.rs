@@ -181,8 +181,9 @@ impl fmt::Display for Error {
             ),
             Self::RollbackFailed { why, source } => write!(
                 f,
-                "rolling back after {why} failed: {source} - current may still point at the \
-                 release that was rejected"
+                "rolling back after {why} failed: {source} - the rollback can stop at any of its \
+                 three steps, so check `current`, deploy.toml and what the shepherd is actually \
+                 running against each other before retrying"
             ),
             Self::Split {
                 sheep,
@@ -307,6 +308,22 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("a1b2c3d"), "{shown}");
         assert!(shown.contains("e4f5a6b"), "{shown}");
+    }
+
+    /// fails if the failed-rollback message keeps blaming the swap. The
+    /// rollback has three steps and any of them can be the one that broke;
+    /// the measured case had the swap succeed and the reload refused, where
+    /// "current may still point at the release that was rejected" sends an
+    /// operator to look at the one part that was fine.
+    #[test]
+    fn a_failed_rollback_does_not_blame_one_step() {
+        let err = Error::RollbackFailed {
+            why: "it did not come up".to_owned(),
+            source: Box::new(Error::Protocol("web is already being reloaded".to_owned())),
+        };
+        let shown = err.to_string();
+        assert!(!shown.contains("current may still point"), "{shown}");
+        assert!(shown.contains("deploy.toml"), "{shown}");
     }
 
     /// fails if the one state this crate cannot repair stops naming all

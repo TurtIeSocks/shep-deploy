@@ -202,7 +202,7 @@ pub async fn deploy<D: Daemon>(
     )?;
 
     let app = flockfile::app_config(&release, sheep)?;
-    refuse_probeless_verification(sheep, &app, state.verify)?;
+    refuse_ungated_verification(sheep, &app, state.verify)?;
     let budget = budget(&app, state.verify);
     let spec = flockfile::build_spec(&release)?;
     build::run(&release, &spec, app.user.as_deref()).await?;
@@ -323,30 +323,51 @@ fn head_of(tree: &Tree, branch: &str) -> Result<String, Error> {
     }
 }
 
-/// Refuses a `Probed` deploy of a sheep that has no readiness probe.
+/// Refuses a `Probed` deploy of a sheep whose readiness is not gated by
+/// anything.
 ///
 /// `Probed` means "wait for the sheep to reach `Online`", and `Online` is
-/// only a health verdict when a probe is what gates it. Without one, shep
+/// only a health verdict when something gates it. shep has two such gates
+/// and either will do: a `readiness_probe`, or `wait_ready`, which makes it
+/// wait for the app to say so on the shepherd channel. With neither, shep
 /// waits out the app's `listen_timeout` and calls the process `Online`
-/// because it has not died yet, so a `Probed` deploy of a probeless sheep
-/// verifies nothing while claiming to verify the most.
+/// because it has not died yet, so a `Probed` deploy verifies nothing while
+/// claiming to verify the most.
 ///
-/// Refused before the build and long before the swap, so a
-/// misconfigured target costs an operator a message rather than a
-/// deploy. The message names `verify = "alive"` because that is the
-/// deliberate, visible downgrade the design offers - the alternative to
-/// adding a probe, not a synonym for going without one.
+/// Refused before the build and long before the swap, so a misconfigured
+/// target costs an operator a message rather than a deploy. The message
+/// names all three ways out, `verify = "alive"` among them, because that is
+/// the deliberate, visible downgrade the design offers rather than a synonym
+/// for going without a check.
+///
+/// # This is a heuristic, and it cannot be more
+///
+/// It reads the app definition from the release's own Flockfile, which is
+/// not necessarily the config the shepherd is running. Nothing in this crate
+/// re-registers a sheep, so the readiness gate a reload actually uses is
+/// whatever was registered when the sheep was started, and
+/// [`Daemon::describe`] reports status, pid and uptime - never config. There
+/// is no request that would answer the real question.
+///
+/// So the check catches the case worth catching, a target whose Flockfile
+/// declares no gate at all, and misses the asymmetric one: a sheep
+/// REGISTERED without a gate whose release Flockfile has since added one
+/// passes here and then gets `listen_timeout`-elapsed verification under the
+/// `probed` label. The turnover requirement in [`crate::verify`] still
+/// applies to it, so what it loses is the readiness half of the check, not
+/// the whole of it.
 ///
 /// # Errors
-/// [`Error::Config`] naming the sheep and both ways out.
-fn refuse_probeless_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Result<(), Error> {
-    if mode == Verify::Probed && app.readiness_probe.is_none() {
+/// [`Error::Config`] naming the sheep and every way out.
+fn refuse_ungated_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Result<(), Error> {
+    if mode == Verify::Probed && app.readiness_probe.is_none() && !app.wait_ready {
         return Err(Error::Config(format!(
-            "{sheep} has verify = \"probed\" but no readiness_probe, so there is nothing for a \
-             deploy to wait on: shep reports a sheep with no probe Online as soon as it has not \
-             died, which would verify every release, including a broken one. Add a \
-             [readiness_probe] to its Flockfile, or set verify = \"alive\" in deploy.toml to \
-             accept the weaker check deliberately."
+            "{sheep} has verify = \"probed\" but neither a readiness_probe nor wait_ready, so \
+             there is nothing for a deploy to wait on: shep reports a sheep with no readiness \
+             gate Online as soon as it has not died, which would verify every release, including \
+             a broken one. Add a [readiness_probe] to its Flockfile, or set wait_ready if the app \
+             announces itself on the channel, or set verify = \"alive\" in deploy.toml to accept \
+             the weaker check deliberately."
         )));
     }
     Ok(())
@@ -1076,6 +1097,28 @@ mod tests {
             swap::resolve(&fixture.tree.current()).unwrap(),
             Some(fixture.tree.release(&previous))
         );
+    }
+
+    /// fails if the refusal catches a sheep that waits on its channel.
+    /// `wait_ready` is shep's other readiness gate and the stronger of the
+    /// two: it reports `Online` only once the app says so itself, which is
+    /// exactly as meaningful as a probe. Refusing it would name three ways
+    /// out of a problem the operator had already solved.
+    #[tokio::test(start_paused = true)]
+    async fn a_probed_target_that_waits_on_its_channel_is_not_refused() {
+        let mut fixture = fixture_with_previous_release();
+        fs::write(
+            fixture.origin.path().join("Flockfile.toml"),
+            "[[app]]\nname = 'web'\nscript = './run.sh'\nwait_ready = true\n",
+        )
+        .expect("write a channel-gated Flockfile");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+            .await
+            .expect("completes");
+
+        assert_eq!(outcome, Outcome::Deployed { sha: second });
     }
 
     /// fails if the refusal above catches `alive` too. `alive` is the
