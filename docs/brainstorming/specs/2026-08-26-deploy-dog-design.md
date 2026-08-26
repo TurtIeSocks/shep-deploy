@@ -67,7 +67,7 @@ Named explicitly, because "mini Vercel" invites scope creep:
 - **Static-site targets.** Long-running processes only. A static site has no
   process to restart and wants a different design; revisit separately if ever.
 
-Note that [shep-v1.md](../../specs/shep-v1.md) §1 lists "deployment tooling"
+Note that [shep-v1.md](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md) §1 lists "deployment tooling"
 as a v1 non-goal, meaning `pm2 deploy`: host lists, revision directories, `ref`
 and `repo` per environment, remote execution over SSH. This design is much
 smaller and lives outside the shep binary. Reconsidering the cut is not
@@ -373,7 +373,7 @@ unprivileged with a reverse proxy for ports below 1024.
 
 **A dog holds full socket authority.** It can issue `Delete` as easily as
 `Restart`. Nothing here changes that, and it is why the confinement work
-recorded under `shep install` in [deferred.md](../../specs/deferred.md) matters
+recorded under `shep install` in [deferred.md](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/deferred.md) matters
 more once this exists.
 
 **Private repositories inherit the build user's git auth.** If git cannot reach
