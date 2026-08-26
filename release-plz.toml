@@ -1,0 +1,40 @@
+# release-plz owns the changelog, the version bump, the tag, the GitHub
+# release and the upload. Merging the release pull request is the whole
+# release; there is no tag to push by hand.
+#
+# ## Why this is not split
+#
+# shep and shep-log-rotate both started with release-plz opening the pull
+# request and a hand-written release.yml publishing behind a `v*` tag. The
+# argument was that publishing cannot be undone, and that a push to main is an
+# easier bar to clear by accident than a tag.
+#
+# That has the risk backwards. Publishing under the standard setup means
+# merging a pull request TITLED "chore: release vX.Y.Z", a reviewed, named,
+# visible artifact. Pushing a tag is a command someone types.
+#
+# shep paid for it on 2026-08-26: its release pull request was merged, nothing
+# published, and main sat a version ahead of crates.io waiting on a step
+# nobody knew was missing. Both repositories were changed to this shape the
+# same day. This one is written that way from the start.
+#
+# The `crates-io` environment exists so a required reviewer can be added there
+# if this ever wants a human gate between merging and spending a version.
+#
+# ## Before the first release
+#
+# This repository needs two secrets set, and neither exists until somebody
+# creates them: CARGO_REGISTRY_TOKEN, and optionally RELEASE_PLZ_TOKEN. The
+# workflow falls back to GITHUB_TOKEN without the second, which works only if
+# "Allow GitHub Actions to create and approve pull requests" is enabled for
+# the repository. shep-log-rotate's first release-plz run failed on exactly
+# that, with a 403 saying "GitHub Actions is not permitted to create or
+# approve pull requests".
+
+[workspace]
+# Marks a GitHub release as a pre-release when the version carries a SemVer
+# pre-release tag. Inert for an ordinary version, and kept for the next one
+# that is not.
+git_release_type = "auto"
+
+# No `[[package]]` sections: one crate, nothing to group or exclude.
