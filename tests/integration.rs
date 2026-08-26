@@ -556,11 +556,12 @@ fn a_failing_build_leaves_the_previous_release_serving() {
 /// [`register_web`]. Nothing about the app changes; the file its probe
 /// tests for stops being there.
 ///
-/// `verify = "alive"` rather than the default `probed`, for wall clock
-/// alone: both modes demand the same generation turnover, and `alive`
-/// reaches its verdict after a ten-second window instead of `probed`'s
-/// ninety-second one. The `probed` timeout is covered in `src/verify.rs`
-/// against a paused clock.
+/// `verify = "alive"` rather than the default `probed`, and NOT for speed:
+/// the two modes get the same budget now that both floors are gone, and
+/// `alive` is the slower of the two by its ten-second dwell. What it buys
+/// is coverage. `probed` is what every other test at this tier runs, so
+/// this is the only place a real shepherd exercises the `alive` path -
+/// including the dwell, which no other test reaches at all.
 #[test]
 fn a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves() {
     let shepherd = Shepherd::new();

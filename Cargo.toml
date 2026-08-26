@@ -18,7 +18,8 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 tempfile = "3"
 # `test-util` only: `#[tokio::test(start_paused = true)]` lets the deploy
-# tests run a real 90-second verification grace period in no wall-clock time.
+# tests run out a real verification budget - a minute or more, for an app
+# with several instances - in no wall-clock time.
 tokio = { version = "1", features = ["test-util"] }
 
 [features]

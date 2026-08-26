@@ -197,8 +197,11 @@ impl fmt::Display for Error {
                 f,
                 "{sheep}: {why}, so it was rolled back to {on} - but the shepherd would not \
                  reload onto it ({source}). current and deploy.toml both name {on}; one or more \
-                 instances may still be running {running}. Once `shep flock` shows no {sheep} \
-                 row in `stopping`, `shep reload {sheep}` finishes the rollback."
+                 instances may still be running {running}. The reload that blocked this one has \
+                 to finish first: a `stopping` row in `shep flock` means it is still draining, \
+                 but the earlier part of a swap shows no row of its own, so wait for the pids in \
+                 `shep describe {sheep}` to hold still. Then `shep reload {sheep}` finishes the \
+                 rollback."
             ),
             Self::RolledBack { to, source } => {
                 write!(f, "rolled back to {to} after: {source}")
@@ -253,6 +256,8 @@ mod tests {
 
     // For `Error::source` on the wrapping variants.
     use core::error::Error as _;
+
+    use shep_client::shep_core::protocol::{RpcError, RpcErrorCode};
 
     /// fails if an Io error stops naming the path it failed on. A deploy
     /// touches many paths and "permission denied" without one is unactionable.
@@ -328,16 +333,23 @@ mod tests {
         assert!(shown.contains("deploy.toml"), "{shown}");
     }
 
-    /// A `Split` with the shape the deploy sequence builds.
+    /// A `Split` with the shape the deploy sequence really builds.
+    ///
+    /// The source is an `Rpc` carrying `Internal`, which is what
+    /// `ReloadInFlight` arrives as and the only shape `crate::deploy`'s own
+    /// `is_retryable` will let through to a `Split`. A `Protocol` here
+    /// would be a state this crate cannot produce, which is how a fixture
+    /// stops testing the thing it names.
     fn split() -> Error {
         Error::Split {
             sheep: "web".to_owned(),
             on: "a1b2c3d".to_owned(),
             running: "e4f5a6b".to_owned(),
             why: "it did not come up and stay up, 32s after the reload".to_owned(),
-            source: Box::new(Error::Protocol(
-                "the daemon reported Internal: web is already being reloaded".to_owned(),
-            )),
+            source: Box::new(Error::Request(RequestError::Rpc(RpcError {
+                code: RpcErrorCode::Internal,
+                message: "web is already being reloaded".to_owned(),
+            }))),
         }
     }
 
@@ -358,14 +370,17 @@ mod tests {
         assert!(shown.contains("did not come up and stay up"), "{shown}");
     }
 
-    /// fails if `Split` stops naming an observable an operator can act on.
-    /// "Once no reload is in flight" is not something `shep flock` reports:
-    /// what it shows is a row in `stopping`, and a message that names a
-    /// state with no display is a message that cannot be followed.
+    /// fails if `Split` stops naming an observable an operator can act on,
+    /// or starts claiming one is sufficient. "Once no reload is in flight"
+    /// is not something shep reports at all. A `stopping` row is real but
+    /// only covers the drain: a swap waiting on readiness shows no row of
+    /// its own, so the message has to send the operator somewhere that
+    /// covers both, and pids holding still in `describe` does.
     #[test]
     fn a_split_state_names_something_an_operator_can_see() {
         let shown = split().to_string();
         assert!(shown.contains("stopping"), "{shown}");
+        assert!(shown.contains("shep describe"), "{shown}");
         assert!(!shown.contains("no reload in flight"), "{shown}");
     }
 

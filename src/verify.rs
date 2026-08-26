@@ -93,6 +93,21 @@ impl Generation {
         })
     }
 
+    /// How many instances this generation has.
+    ///
+    /// Measured, which is the point: `AppConfig::instances` is the count the
+    /// release's Flockfile ASKS for, and `shep stock <sheep> <n>` changes
+    /// what is actually running without touching that file. A reload costs
+    /// one swap per RUNNING instance, so this is the number
+    /// `crate::deploy`'s budget has to multiply by.
+    #[must_use]
+    pub fn instances(&self) -> u32 {
+        // A flock of more than u32::MAX processes is not a thing this host
+        // could be running, but saturating says so without a cast that
+        // could wrap.
+        u32::try_from(self.pids.len()).unwrap_or(u32::MAX)
+    }
+
     /// Whether `info` is running under a pid this generation never had.
     ///
     /// An instance with no pid at all is never new. That is the honest

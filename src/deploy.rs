@@ -97,14 +97,36 @@ pub enum Outcome {
 /// [`budget`]'s arithmetic so a reader can put the two files side by side.
 const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 
-/// How long this app's reload gets before verification gives up on it.
+/// How long a reload of `instances` instances of this app gets before
+/// verification gives up on it.
 ///
 /// This is shep's own formula, not an estimate of it. `Actor::arm_reload_
 /// deadline` (`supervisor.rs:3581`) bounds each swap at
 /// `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK` and ends the
 /// swap when that expires, and `advance_reload` walks the instance queue
 /// with `pop_front`, one swap at a time, so a whole reload is that per
-/// instance. Nothing here is left to infer.
+/// instance.
+///
+/// # What is measured and what is still read from a file
+///
+/// `instances` is measured. It comes from [`Generation::instances`], the
+/// live pid count, and NOT from `AppConfig::instances`, which is the count
+/// the release's Flockfile asks for. Those differ the moment anyone runs
+/// `shep stock <sheep> <n>`, a first-class verb that changes what is running
+/// without touching any file this crate reads - and the failure that
+/// produced is the one this whole window exists to stop: a file saying one
+/// instance against two really running gave a budget of 14s for a reload
+/// that took about 17, and a healthy release was rolled back.
+///
+/// The two timeouts are still read from the release's Flockfile, and that
+/// IS an inference, for the same reason
+/// [`refuse_ungated_verification`] documents about its own read: nothing
+/// re-registers a sheep, and `describe` reports status, pid and uptime but
+/// never config, so there is no live source to read them from. The exposure
+/// is narrower than the instance count's, because changing either one means
+/// editing the Flockfile and redeploying, which is the path that brings the
+/// new value here anyway - where `shep stock` is a single command that
+/// bypasses it.
 ///
 /// # Why it is copied rather than inferred
 ///
@@ -132,12 +154,15 @@ const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 /// unbounded, as an earlier version of this comment claimed - it is bounded
 /// by the same field, and an app that needs a minute to compile its client
 /// says so by setting `listen_timeout`, which this reads.
-fn budget(app: &AppConfig) -> Duration {
+fn budget(app: &AppConfig, instances: u32) -> Duration {
     let per_instance = app.listen_timeout.as_duration()
         + app.graceful_timeout.as_duration()
         + RELOAD_DEADLINE_SLACK;
 
-    per_instance.saturating_mul(app.instances.max(1))
+    // A flock with nothing running still gets one instance's worth. Such a
+    // reload replaces nothing and can never turn over, so what this buys is
+    // a clean failure at a sensible moment rather than an instant one.
+    per_instance.saturating_mul(instances.max(1))
 }
 
 /// Deploys the head of `state.branch` to the tree's sheep, rolling back if
@@ -169,11 +194,19 @@ fn budget(app: &AppConfig) -> Duration {
 /// [`core::error::Error::source`]. The deploy still failed, so it is still
 /// an error, but an operator reading it can tell a rollback happened.
 ///
-/// A rollback that itself fails gives [`Error::RollbackFailed`] instead,
-/// carrying both halves, because discarding either leaves a machine an
-/// operator cannot diagnose. A release that does not come up with no
-/// previous release to return to - a target's very first deploy - gives
-/// [`Error::Unverified`], unwrapped, because no rollback was attempted.
+/// A rollback that itself fails gives one of three errors, and a caller
+/// that wants to detect "the rollback did not work" has to accept all of
+/// them rather than matching [`Error::RollbackFailed`] alone:
+///
+/// - [`Error::Split`], bare, when the reload could not be issued and the
+///   failure was one that might yet clear. It carries both halves itself,
+///   which is why it is not wrapped.
+/// - [`Error::RollbackFailed`], wrapping anything else the rollback met -
+///   a swap that could not be made, a record that could not be written, a
+///   reload refused for a reason that can never clear.
+/// - [`Error::Unverified`], bare, when there was no previous release to
+///   return to at all - a target's very first deploy. No rollback was
+///   attempted, so nothing frames it as one that failed.
 pub async fn deploy<D: Daemon>(
     daemon: &D,
     tree: &Tree,
@@ -200,7 +233,6 @@ pub async fn deploy<D: Daemon>(
 
     let app = flockfile::app_config(&release, sheep)?;
     refuse_ungated_verification(sheep, &app, state.verify)?;
-    let budget = budget(&app);
     let spec = flockfile::build_spec(&release)?;
     build::run(&release, &spec, app.user.as_deref()).await?;
 
@@ -220,8 +252,20 @@ pub async fn deploy<D: Daemon>(
     }
     swap::point_at(&tree.current(), &release)?;
 
+    // Captured here, before the reload, for two reasons at once: `wait`
+    // needs to know which processes were already serving, and `budget`
+    // needs to know how many of them there are. See
+    // [`crate::verify::Generation`] for the first and [`budget`] for the
+    // second.
+    let before = Generation::of(daemon, sheep).await?;
+    let budget = budget(&app, before.instances());
+
+    // Named for the reload because that is what the operator's message
+    // talks about, and taken a round trip early: `settle`'s first act is
+    // the reload RPC, so this leads it by one request rather than by any
+    // of the work the deploy did before it.
     let reloaded_at = Instant::now();
-    match settle(daemon, sheep, state.verify, budget).await {
+    match settle(daemon, sheep, state.verify, &before, budget).await {
         Ok(true) => {
             state.deployed = Some(head.clone());
             state.write(&tree.state_file())?;
@@ -374,22 +418,23 @@ fn refuse_ungated_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Re
     Ok(())
 }
 
-/// Reloads `sheep` and waits for the verdict its `mode` asks for.
+/// Reloads `sheep` and waits for the verdict its `mode` asks for, against
+/// the generation that was serving before it.
 ///
-/// The generation serving before the reload is captured first, and the
-/// order is the whole point: `Request::Reload` is an acceptance rather than
-/// a completion, so a check made after it that does not know which process
-/// was already there reads the old one and passes. See
-/// [`crate::verify`]'s module doc.
+/// `before` is the caller's to capture, and it has to have been captured
+/// before this is called: `Request::Reload` is an acceptance rather than a
+/// completion, so a check made after it that does not know which process
+/// was already there reads the old one and passes. See [`crate::verify`]'s
+/// module doc.
 async fn settle<D: Daemon>(
     daemon: &D,
     sheep: &str,
     mode: Verify,
+    before: &Generation,
     budget: Duration,
 ) -> Result<bool, Error> {
-    let before = Generation::of(daemon, sheep).await?;
     daemon.reload(sheep).await?;
-    verify::wait(daemon, sheep, mode, &before, budget).await
+    verify::wait(daemon, sheep, mode, before, budget).await
 }
 
 /// Puts `previous` back after `attempted` was rejected, and answers with
@@ -399,6 +444,11 @@ async fn settle<D: Daemon>(
 /// alongside `why`, at this one place, so a caller never has to choose
 /// between the failure that made a rollback necessary and the failure of
 /// the rollback itself. Both are what an operator needs.
+///
+/// [`Error::Split`] is the exception and passes through untouched. It
+/// already carries `why`, and wrapping it produced a message that ended by
+/// telling an operator to go and compare the three things its inner half
+/// had just finished telling them.
 ///
 /// "Nothing to roll back to" is not wrapped that way, because no rollback
 /// was attempted: there was nothing to attempt one against.
@@ -420,8 +470,8 @@ async fn settle<D: Daemon>(
 /// [`Error::Unverified`] if there is nothing to roll back to - `current`
 /// never pointed anywhere, or it already points at the release that just
 /// failed, which between them mean this was the target's first deploy.
-/// [`Error::RollbackFailed`] wrapping whatever [`restore`] returned
-/// otherwise.
+/// [`Error::Split`], unwrapped, if that is what [`restore`] returned.
+/// [`Error::RollbackFailed`] wrapping anything else it returned.
 async fn roll_back<D: Daemon>(
     daemon: &D,
     tree: &Tree,
@@ -487,9 +537,12 @@ async fn roll_back<D: Daemon>(
 ///
 /// # Errors
 /// [`Error::Io`] if `current` cannot be repointed or `deploy.toml` cannot be
-/// written. [`Error::Split`] if the reload cannot be issued within
-/// `patience` - see [`reload_until`] for why that is retried at all, and
-/// [`Error::Split`] for what an operator is told when it still fails.
+/// written. [`Error::Split`] if the reload could not be issued within
+/// `patience` and the failure was one that might yet have cleared - see
+/// [`reload_until`] for which those are, and [`Error::Split`] for what an
+/// operator is told. The reload's own error, unchanged and unwrapped, if it
+/// was one that never could have cleared: a `NotFound` is that failure and
+/// not a split, since there is no sheep for a process to be running.
 async fn restore<D: Daemon>(
     daemon: &D,
     tree: &Tree,
@@ -798,6 +851,14 @@ mod tests {
         /// Whether the pid moves on every `describe`, standing in for a
         /// release that comes up and then keeps dying and being restarted.
         flapping: bool,
+        /// How many instances the flock is running. The whole point of the
+        /// number: a reload costs one swap per RUNNING instance, whatever
+        /// the Flockfile happens to ask for.
+        instances: u32,
+        /// How many `describe` calls the replacement takes to appear,
+        /// standing in for a reload that is genuinely still in flight. `0`
+        /// is the instantaneous swap every other test wants.
+        turnover_after: u32,
         /// Counted only so [`Self::flapping`] has something to move with.
         describes: Cell<u32>,
         reloads: Cell<u32>,
@@ -819,6 +880,8 @@ mod tests {
                 refusal_code: RpcErrorCode::Internal,
                 attempts: Cell::new(0),
                 flapping: false,
+                instances: 1,
+                turnover_after: 0,
                 describes: Cell::new(0),
                 reloads: Cell::new(0),
             }
@@ -881,6 +944,22 @@ mod tests {
             }
         }
 
+        /// A reload that succeeds, but only once `describes` more looks
+        /// have gone by - a swap that is genuinely still in flight rather
+        /// than one that failed. At `verify`'s 100ms poll, `describes` is
+        /// tenths of a second of budget.
+        fn ready_after(describes: u32) -> Self {
+            Self {
+                turnover_after: describes,
+                ..Self::ready()
+            }
+        }
+
+        /// The same shepherd, running `instances` instances.
+        fn running(self, instances: u32) -> Self {
+            Self { instances, ..self }
+        }
+
         /// A shepherd that has never heard of this sheep: every reload
         /// after the first is `NotFound`, which no amount of asking again
         /// can change.
@@ -899,25 +978,37 @@ mod tests {
             self.reloads.get()
         }
 
-        /// The pid currently serving: a fresh one per reload, unless this
-        /// shepherd keeps the old instance.
-        fn pid(&self) -> u32 {
+        /// How many reloads have actually landed. A reload that has been
+        /// accepted but whose replacement has not appeared yet counts for
+        /// nothing, which is what an in-flight swap looks like from
+        /// `describe`: the old generation, still serving.
+        fn landed(&self) -> u32 {
+            if self.describes.get() > self.turnover_after {
+                self.reloads.get()
+            } else {
+                0
+            }
+        }
+
+        /// The pid of instance `index`: a fresh generation per landed
+        /// reload, unless this shepherd keeps the old instance.
+        fn pid(&self, index: u32) -> u32 {
             if !self.replaces {
-                return FIRST_PID;
+                return FIRST_PID + index;
             }
             let churn = if self.flapping {
                 self.describes.get()
             } else {
                 0
             };
-            FIRST_PID + self.reloads.get() + churn
+            FIRST_PID + (self.landed() + churn) * 100 + index
         }
 
         /// The status currently serving: whatever this shepherd settles to
-        /// once it has reloaded at all, and `Online` before that, since the
+        /// once a reload has landed, and `Online` before that, since the
         /// process that was already there is up.
         fn status(&self) -> ProcStatus {
-            if self.reloads.get() == 0 {
+            if self.landed() == 0 {
                 ProcStatus::Online
             } else {
                 self.settles_to
@@ -944,11 +1035,13 @@ mod tests {
             if self.describe_fails && self.reloads.get() > 0 {
                 return Err(Error::Protocol("the shepherd stopped answering".to_owned()));
             }
-            Ok(vec![
-                ProcessInfo::builder(0, sheep, self.status())
-                    .pid(Some(self.pid()))
-                    .build(),
-            ])
+            Ok((0..self.instances)
+                .map(|index| {
+                    ProcessInfo::builder(index, sheep, self.status())
+                        .pid(Some(self.pid(index)))
+                        .build()
+                })
+                .collect())
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
             unimplemented!()
@@ -1095,24 +1188,59 @@ mod tests {
         let mut app: AppConfig =
             toml::from_str("name = 'web'\nscript = './run.sh'").expect("parses");
 
-        // shep's shipping defaults: listen 3s, graceful 8s, one instance.
-        // 3 + 8 + 5 = 16.
+        // shep's shipping defaults: listen 3s, graceful 8s. 3 + 8 + 5 = 16
+        // per instance.
         assert_eq!(app.listen_timeout.as_duration(), Duration::from_secs(3));
         assert_eq!(app.graceful_timeout.as_duration(), Duration::from_secs(8));
-        assert_eq!(budget(&app), Duration::from_secs(16));
+        assert_eq!(budget(&app, 1), Duration::from_secs(16));
 
-        // The term the previous derivation dropped. Doubling
+        // The term round four's derivation dropped. Doubling
         // `listen_timeout` supplied 3s of headroom against an 8s drain, and
         // `verify` needs the whole drain to fit because it waits for every
         // old instance to be gone.
-        app.instances = 2;
-        assert_eq!(budget(&app), Duration::from_secs(32));
+        assert_eq!(budget(&app, 2), Duration::from_secs(32));
 
-        // And it follows both fields, not just the one.
-        app.instances = 3;
+        // The instance count is the caller's, measured off the running
+        // flock. `AppConfig::instances` is what the file asks for, and
+        // `shep stock` moves the two apart - see `budget`'s own doc.
+        app.instances = 1;
+        assert_eq!(budget(&app, 4), Duration::from_secs(64));
+
+        // And it follows both timeouts, not just the one.
         app.graceful_timeout = UpDuration::from_millis(20_000);
         app.listen_timeout = UpDuration::from_millis(1_000);
-        assert_eq!(budget(&app), Duration::from_secs(78));
+        assert_eq!(budget(&app, 3), Duration::from_secs(78));
+
+        // A flock with nothing running gets one instance's worth, so a
+        // reload that can replace nothing fails at a sensible moment
+        // instead of instantly.
+        assert_eq!(budget(&app, 0), budget(&app, 1));
+    }
+
+    /// fails if the reload window is sized from the Flockfile's instance
+    /// count rather than the flock's. `AppConfig::instances` is what the
+    /// file ASKS for; `shep stock <sheep> <n>` changes what is running
+    /// without touching any file this crate reads, and a reload costs one
+    /// swap per running instance.
+    ///
+    /// The numbers here are the reviewer's reproduction, scaled to the
+    /// fixture: one instance in the file, two actually running, and a
+    /// replacement that takes about twenty seconds to appear. Sized off the
+    /// file that is a sixteen-second budget and a healthy release is rolled
+    /// back; sized off the flock it is thirty-two and the deploy stands.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_follows_the_running_flock_not_the_flockfile() {
+        let mut fixture = fixture_with_previous_release();
+        let second = commit_on_origin(&fixture, "second.txt");
+        // 200 polls at 100ms apart, so the turnover lands near 20s: inside
+        // two instances' budget and outside one's.
+        let daemon = Shepherd::ready_after(200).running(2);
+
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect("completes");
+
+        assert_eq!(outcome, Outcome::Deployed { sha: second });
     }
 
     /// fails if a request that can never succeed is retried anyway. The
