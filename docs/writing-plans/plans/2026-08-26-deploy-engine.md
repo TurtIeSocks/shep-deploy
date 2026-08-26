@@ -434,7 +434,8 @@ EOF
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-/// fails if enumeration stops using git's own answer. Parsing .gitignore by
+/// fails if enumeration stops using git's own answer, or drops `=matching`.
+/// Parsing .gitignore by
 /// hand gets negations (!server/src/configs/.gitkeep), anchored globs
 /// (/docker-compose.yml) and nested ignore files wrong; `git status --ignored`
 /// gets all three right because it is git deciding.
@@ -476,7 +477,7 @@ Expected: FAIL, `to_link` not defined.
 
 - [ ] **Step 3: Implement**
 
-`ignored_present` runs `git status --ignored --porcelain` in the checkout and keeps lines beginning `!! `. `shepignore_patterns` reads `.shepignore` if present, ignoring blank lines and `#` comments. `to_link` subtracts the second from the first. `link_into` creates parent directories in the release then `symlink`s each path back to the checkout.
+`ignored_present` runs `git status --ignored=matching --porcelain` in the checkout and keeps lines beginning `!! `. The `=matching` is load-bearing and was verified against real git: the default (`traditional`) mode collapses an individually-ignored file like `config/local.json` into its containing directory when nothing else in that directory is tracked, which makes the second test below impossible to pass. `matching` reports individually-matched files as themselves while still collapsing a wholly-ignored directory such as `node_modules/` to one entry, which is exactly the split this design wants: whole directories linked as a unit, individual files as themselves. `shepignore_patterns` reads `.shepignore` if present, ignoring blank lines and `#` comments. `to_link` subtracts the second from the first. `link_into` creates parent directories in the release then `symlink`s each path back to the checkout.
 
 - [ ] **Step 4: Run the tests**
 
