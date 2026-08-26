@@ -287,8 +287,18 @@ generated masterfile, all ignored. Something must put them there.
   anchored globs (`/docker-compose.yml`) and nested ignore files wrong. Git
   already answers this question correctly.
 - **`.shepignore`, committed in the repo, subtracts from that set.** Same
-  syntax as `.gitignore`, same idiom as `.dockerignore`. Its entries start
-  empty in every release instead of being shared.
+  idiom as `.dockerignore`, narrower syntax than `.gitignore`: a bare name
+  matches at any depth (`node_modules` excludes every nested
+  `packages/*/node_modules` along with the top-level directory) and a
+  pattern containing `/` is anchored to the checkout root. Wildcards (`*`,
+  `?`, `[`) are refused outright rather than silently matching nothing -
+  deliberate, not an oversight: every real `.shepignore` this design has
+  needed is one bare directory name, and a refused pattern fails loudly at
+  parse time instead of an operator's build output quietly staying shared
+  forever because their glob never matched. Widening this to full glob
+  syntax later costs nothing - a pattern refused today would simply start
+  working. Its entries start empty in every release instead of being
+  shared.
 
 ReactMap's is one line, `dist`. Koji's is one line, `target`.
 

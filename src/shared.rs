@@ -99,26 +99,46 @@ pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 ///
 /// An absent file is not an error: it returns an empty list, which is the
 /// zero-configuration case - no `.shepignore` means share everything
-/// [`ignored_present`] finds. Patterns are returned as plain strings and
-/// are not validated as any particular glob syntax here; [`to_link`] is the
-/// only caller and the matching rule lives there.
+/// [`ignored_present`] finds.
+///
+/// A pattern containing a glob metacharacter (`*`, `?`, `[`) is refused
+/// with [`Error::Config`] rather than accepted and silently matched
+/// against nothing. `.shepignore`'s syntax is narrower than `.gitignore`'s,
+/// see [`to_link`] for what it does support, and an operator who writes
+/// `*.log` believing otherwise deserves a failure they see immediately,
+/// naming the pattern, rather than an artifact this subtraction was built
+/// to keep out quietly staying shared forever because the glob never
+/// matched anything.
 ///
 /// # Errors
 /// [`Error::Io`], naming `checkout/.shepignore`, if the file exists but
 /// cannot be read for any reason other than simply not being there.
+/// [`Error::Config`] if any pattern contains a glob metacharacter.
 pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<String>, Error> {
     let path = checkout.join(".shepignore");
 
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(str::to_owned)
-            .collect()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(source) => Err(Error::Io { path, source }),
-    }
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(Error::Io { path, source }),
+    };
+
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|pattern| {
+            if pattern.contains(['*', '?', '[']) {
+                Err(Error::Config(format!(
+                    ".shepignore pattern {pattern:?} uses glob syntax (`*`, `?`, `[`), which \
+                     is not supported - a .shepignore pattern is a bare name (matches at any \
+                     depth) or a path containing `/` (anchored to the checkout root), nothing \
+                     else"
+                )))
+            } else {
+                Ok(pattern.to_owned())
+            }
+        })
+        .collect()
 }
 
 /// Whether `path` (relative to the checkout) is named by `.shepignore`
@@ -130,9 +150,9 @@ pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<String>, Error> {
 /// `packages/*/node_modules` beneath it. A pattern containing `/` is
 /// anchored to the checkout root instead and matches only that exact
 /// subtree, so `packages/app/dist` never touches a top-level `dist`.
-/// Wildcards are deliberately not implemented - every `.shepignore` the
-/// design spec names (ReactMap's, Koji's) is one bare directory name, and
-/// glob matching is scope this task was never asked to carry.
+/// Wildcards never reach this function: `shepignore_patterns` refuses any
+/// pattern containing a glob metacharacter before `to_link` ever calls
+/// this, rather than accepting one and silently matching nothing.
 fn pattern_matches(path: &Path, pattern: &str) -> bool {
     let pattern = Path::new(pattern);
 
@@ -175,6 +195,21 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// Symlinks every path in `paths` from `checkout` into `release`, creating
 /// whatever parent directories the release needs along the way.
 ///
+/// `checkout` is canonicalised before anything is joined onto it. A
+/// symlink's target text is stored exactly as given - `symlink()` performs
+/// no resolution of its own - and the OS later resolves a relative target
+/// against the *symlink's own containing directory*, not against this
+/// process's working directory or against whatever the caller meant by
+/// `checkout`. A relative `checkout` therefore produced a symlink whose
+/// target text was embedded literally and dangled the moment anything
+/// read through it: `symlink()` itself still succeeded, so the deploy
+/// would carry on and the break would only surface after the swap and
+/// after the reload, when something finally tried to read a shared file.
+/// Canonicalising first makes the target text absolute regardless of what
+/// form `checkout` arrived in, and turns a checkout that cannot be
+/// resolved at all into an immediate, named error instead of a link that
+/// looks fine until it is used.
+///
 /// Reads from `checkout` and writes only under `release` - the dog never
 /// writes to the operator's own checkout, and any code path that would is a
 /// bug. `paths` are relative, the same relative paths [`to_link`] returns,
@@ -182,9 +217,16 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// file, onto `release` to decide where its symlink belongs.
 ///
 /// # Errors
+/// [`Error::Io`], naming `checkout`, if it cannot be canonicalised - it
+/// does not exist, or a component of it cannot be resolved. Otherwise
 /// [`Error::Io`], naming the release-side path that failed, if a parent
 /// directory cannot be created or the symlink itself cannot be made.
 pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(), Error> {
+    let checkout = fs::canonicalize(checkout).map_err(|source| Error::Io {
+        path: checkout.to_owned(),
+        source,
+    })?;
+
     for relative in paths {
         let target = checkout.join(relative);
         let link = release.join(relative);
@@ -208,6 +250,7 @@ pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     /// Builds a throwaway git repo for one test: `entries` are (path,
@@ -247,6 +290,14 @@ mod tests {
             .expect("spawn git");
         assert!(status.success(), "git {args:?} failed");
     }
+
+    /// Guards `link_into_resolves_even_when_checkout_is_relative`, the one
+    /// test in this module that mutates the process's current directory.
+    /// `std::env::set_current_dir` is global, process-wide state that
+    /// Rust's default parallel test runner does nothing to serialise, so a
+    /// lock is the difference between "one test briefly changes cwd" and
+    /// "two threads race to change and restore cwd at once".
+    static CWD_GUARD: Mutex<()> = Mutex::new(());
 
     /// fails if enumeration stops using git's own answer. Parsing
     /// `.gitignore` by hand gets negations (`!server/src/configs/.gitkeep`),
@@ -386,5 +437,102 @@ mod tests {
         assert!(linked_path.is_symlink());
         let contents = fs::read_to_string(&linked_path).expect("read through symlink");
         assert_eq!(contents, r#"{"real":true}"#);
+    }
+
+    /// fails if `link_into` goes back to embedding `checkout` literally as
+    /// the symlink's target text. A relative `checkout` used to produce a
+    /// symlink whose target the OS resolves against the symlink's own
+    /// directory inside the release, not against anything the caller
+    /// meant - `symlink()` itself never noticed, so the only way to catch
+    /// this is to actually read through the result. cwd is changed to the
+    /// checkout's own parent so `relative_checkout` is a genuinely relative
+    /// path the fix must canonicalise, not merely a path that happens to
+    /// already be absolute.
+    #[test]
+    fn link_into_resolves_even_when_checkout_is_relative() {
+        let repo = fixture_repo(&[
+            (".gitignore", "config/local.json\n"),
+            ("config/local.json", r#"{"real":true}"#),
+        ]);
+        let release = tempfile::tempdir().expect("release tempdir");
+        let paths = vec![PathBuf::from("config/local.json")];
+
+        let _guard = CWD_GUARD.lock().expect("cwd guard poisoned");
+        let original_cwd = std::env::current_dir().expect("read cwd");
+        std::env::set_current_dir(repo.path().parent().expect("repo has a parent"))
+            .expect("chdir into repo's parent");
+        let relative_checkout = PathBuf::from(repo.path().file_name().expect("repo has a name"));
+
+        let result = link_into(release.path(), &relative_checkout, &paths);
+
+        std::env::set_current_dir(&original_cwd).expect("restore cwd");
+        result.expect("links despite a relative checkout");
+
+        let linked_path = release.path().join("config").join("local.json");
+        let contents = fs::read_to_string(&linked_path).expect("read through symlink");
+        assert_eq!(contents, r#"{"real":true}"#);
+    }
+
+    /// fails if `link_into` stops surfacing a checkout it cannot resolve as
+    /// an immediate error. Silently doing nothing, or creating a dangling
+    /// link anyway, is exactly the failure-that-looks-like-success shape
+    /// the canonicalisation fix exists to close off.
+    #[test]
+    fn link_into_fails_loudly_when_checkout_does_not_exist() {
+        let release = tempfile::tempdir().expect("release tempdir");
+        let missing_checkout = release.path().join("no-such-checkout");
+        let paths = vec![PathBuf::from("config/local.json")];
+
+        let err = link_into(release.path(), &missing_checkout, &paths)
+            .expect_err("a checkout that does not exist cannot be canonicalised");
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    /// fails if a `.shepignore` pattern using `*` stops being refused. An
+    /// operator writing `*.log`, trusting the spec's "same idiom as
+    /// .gitignore" line, must get a loud failure naming the pattern rather
+    /// than a glob that silently matches nothing forever while the
+    /// artifact it named stays shared.
+    #[test]
+    fn shepignore_refuses_a_pattern_with_an_asterisk() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "*.log\n"),
+            ("dist/app.js", "//"),
+        ]);
+        let err = shepignore_patterns(repo.path()).expect_err("must refuse a glob pattern");
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("*.log"));
+    }
+
+    /// fails if a `.shepignore` pattern using `?` stops being refused - the
+    /// second of the three metacharacters `pattern_matches` never gets a
+    /// chance to mishandle, since none of them are meant to reach it.
+    #[test]
+    fn shepignore_refuses_a_pattern_with_a_question_mark() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "cache?.tmp\n"),
+            ("dist/app.js", "//"),
+        ]);
+        let err = shepignore_patterns(repo.path()).expect_err("must refuse a glob pattern");
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("cache?.tmp"));
+    }
+
+    /// fails if a `.shepignore` pattern using a `[...]` class stops being
+    /// refused - the third metacharacter, and the one most likely to be
+    /// dropped from a hand-written `contains` check without a test naming
+    /// it specifically.
+    #[test]
+    fn shepignore_refuses_a_pattern_with_a_bracket_class() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "cache[0-9].tmp\n"),
+            ("dist/app.js", "//"),
+        ]);
+        let err = shepignore_patterns(repo.path()).expect_err("must refuse a glob pattern");
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("cache[0-9].tmp"));
     }
 }
