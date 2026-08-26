@@ -87,60 +87,55 @@ pub enum Outcome {
     },
 }
 
-/// The least time a `Probed` reload gets, however small the app says it is.
+/// The slack shep adds to its own reload deadline, per instance.
 ///
-/// Generous, because a probed release's readiness is unbounded in a way
-/// nothing here can compute: the app this design was built against compiles
-/// its client at startup, and the probe is precisely the thing that will
-/// eventually say whether that finished. A give-up point rather than a
-/// wait - both modes poll and return as soon as the flock turns over - so a
-/// wide floor costs a healthy deploy nothing.
-const PROBED_FLOOR: Duration = Duration::from_secs(90);
-
-/// The least time an `Alive` reload gets.
-///
-/// Much smaller than [`PROBED_FLOOR`], and it can be: an ungated sheep's
-/// reload cost is not a mystery, it is `listen_timeout` per instance and
-/// shep's own bookkeeping around it, which [`budget`] computes. The floor is
-/// only headroom for a fast app on a slow machine. Keeping it small is what
-/// makes a release that genuinely cannot come up get rolled back in
-/// seconds rather than in a minute and a half.
-const ALIVE_FLOOR: Duration = Duration::from_secs(15);
-
-/// How much of the app's own readiness budget to allow for, per instance.
-///
-/// shep's heuristic readiness path sleeps `listen_timeout` per instance, and
-/// spawning, draining and reaping happen around that rather than inside it.
-/// Doubling is headroom for the parts nothing here can measure, not a claim
-/// that a reload takes exactly twice as long.
-const HEADROOM: u32 = 2;
+/// Copied from `RELOAD_DEADLINE_SLACK` in shep's `supervisor.rs`, where it
+/// is a five-second constant covering "scheduling jitter and nothing else"
+/// between the two timeouts below. Named here rather than folded into
+/// [`budget`]'s arithmetic so a reader can put the two files side by side.
+const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 
 /// How long this app's reload gets before verification gives up on it.
 ///
-/// Derived from the app rather than fixed, because a reload's cost is the
-/// app's to decide: `advance_reload` replaces one instance at a time, and a
-/// sheep with no readiness gate takes shep's heuristic path, which sleeps
-/// the whole of `listen_timeout` for each one. A four-instance probeless app
-/// with a fifteen-second `listen_timeout` therefore spends around a minute
-/// reloading while being entirely healthy. A fixed window smaller than that
-/// does not report a slow deploy - it rolls back a good one, and then cannot
-/// even do that, because the shepherd refuses a reload while the first is
-/// still running.
+/// This is shep's own formula, not an estimate of it. `Actor::arm_reload_
+/// deadline` (`supervisor.rs:3581`) bounds each swap at
+/// `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK` and ends the
+/// swap when that expires, and `advance_reload` walks the instance queue
+/// with `pop_front`, one swap at a time, so a whole reload is that per
+/// instance. Nothing here is left to infer.
 ///
-/// The number is the app's own arithmetic with [`HEADROOM`] on top, floored
-/// by mode: [`PROBED_FLOOR`] where readiness is unbounded, [`ALIVE_FLOOR`]
-/// where it is only what shep is going to sleep for anyway.
-fn budget(app: &AppConfig, mode: Verify) -> Duration {
-    let floor = match mode {
-        Verify::Probed => PROBED_FLOOR,
-        Verify::Alive => ALIVE_FLOOR,
-    };
+/// # Why it is copied rather than inferred
+///
+/// Three rounds of review answered "how long may a healthy reload take" by
+/// reasoning about shep's timing from outside, and each answer was wrong
+/// somewhere new. The first was fixed at ten seconds. The second derived
+/// `listen_timeout * instances` and doubled it, which supplies exactly
+/// `listen_timeout` of headroom per instance and so holds only while the
+/// drain is shorter than the readiness wait - and shep's own defaults are
+/// the other way round, `listen_timeout` three seconds against
+/// `graceful_timeout` eight. The drain is not incidental to this crate
+/// either: [`crate::verify`] requires every OLD instance to be gone, so the
+/// whole of it has to fit inside the window.
+///
+/// There is no floor. A budget shorter than shep's deadline rolls back
+/// healthy releases, and one longer buys nothing, because when that deadline
+/// expires shep ends the swap itself - there is nothing left to wait for.
+/// The five-second slack is already the margin, and it is shep's number for
+/// the same jitter.
+///
+/// `graceful_timeout` is the drain window and `listen_timeout` bounds
+/// readiness for EVERY source: `await_ready` (`probes/ready.rs`) wraps
+/// `Channel`, `Probe` and `Heuristic` alike in `tokio::time::timeout` and
+/// aborts the swap when it elapses. So a probed release's readiness is not
+/// unbounded, as an earlier version of this comment claimed - it is bounded
+/// by the same field, and an app that needs a minute to compile its client
+/// says so by setting `listen_timeout`, which this reads.
+fn budget(app: &AppConfig) -> Duration {
+    let per_instance = app.listen_timeout.as_duration()
+        + app.graceful_timeout.as_duration()
+        + RELOAD_DEADLINE_SLACK;
 
-    app.listen_timeout
-        .as_duration()
-        .saturating_mul(app.instances.max(1))
-        .saturating_mul(HEADROOM)
-        .max(floor)
+    per_instance.saturating_mul(app.instances.max(1))
 }
 
 /// Deploys the head of `state.branch` to the tree's sheep, rolling back if
@@ -203,7 +198,7 @@ pub async fn deploy<D: Daemon>(
 
     let app = flockfile::app_config(&release, sheep)?;
     refuse_ungated_verification(sheep, &app, state.verify)?;
-    let budget = budget(&app, state.verify);
+    let budget = budget(&app);
     let spec = flockfile::build_spec(&release)?;
     build::run(&release, &spec, app.user.as_deref()).await?;
 
@@ -231,7 +226,7 @@ pub async fn deploy<D: Daemon>(
         }
         Ok(false) => {
             let why = format!(
-                "it did not come up and stay up within {}s of the reload",
+                "it did not come up and stay up, {}s after the reload",
                 budget.as_secs()
             );
             let to = roll_back(
@@ -522,12 +517,7 @@ const RETRY_EVERY: Duration = Duration::from_millis(500);
 /// therefore the difference between a rollback that lands a few seconds late
 /// and one that cannot happen at all.
 ///
-/// Every error is retried, not only that one. The refusal arrives as a
-/// message rather than as anything this crate can match on, and the
-/// alternative - matching the shepherd's own wording - would break silently
-/// the first time it is reworded, in the one path where being wrong leaves a
-/// sheep split. The cost of retrying an error that was never going to clear
-/// is a bounded delay on a deploy that has already failed.
+/// Every error is retried, not only that one.
 ///
 /// # Errors
 /// The last failure, once `patience` has run out.
@@ -576,6 +566,7 @@ mod tests {
     use shep_client::shep_core::config::AppConfig;
     use shep_client::shep_core::protocol::ProcessInfo;
     use shep_client::shep_core::status::ProcStatus;
+    use shep_client::shep_core::values::UpDuration;
     use tempfile::TempDir;
 
     use crate::swap;
@@ -975,28 +966,48 @@ mod tests {
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
     }
 
-    /// fails if the verification window stops following the app. A
-    /// probeless sheep takes shep's heuristic readiness path, which sleeps
-    /// `listen_timeout` per instance, and `advance_reload` replaces one
-    /// instance at a time - so a four-instance app with a fifteen-second
-    /// timeout spends around a minute reloading while being perfectly
-    /// healthy. A window fixed below that rolls a good release back and
-    /// then cannot, because the shepherd will not take a second reload.
+    /// fails if this crate's reload window stops matching the shepherd's
+    /// own reload deadline. That deadline is
+    /// `listen_timeout + graceful_timeout + RELOAD_DEADLINE_SLACK` per
+    /// instance (`Actor::arm_reload_deadline`, `supervisor.rs:3581`, with
+    /// the five-second slack at `supervisor.rs:103`), and instances are
+    /// swapped strictly one at a time.
+    ///
+    /// Be clear about what this test can and cannot do. It restates the
+    /// formula, so it catches a change to OURS. It cannot see shep's, so it
+    /// cannot catch a change to THEIRS - the numbers below are copied by
+    /// hand from a file this crate does not depend on. What covers that
+    /// direction is `a_reload_that_uses_its_whole_drain_window_still_deploys`
+    /// in the integration tier, which puts a real shepherd through a reload
+    /// that spends its drain window and fails if the budget no longer holds
+    /// it.
+    ///
+    /// The arithmetic is spelled out rather than folded, because a test that
+    /// recomputes the implementation's expression only pins that it was
+    /// typed twice.
     #[test]
-    fn the_verification_window_follows_the_app() {
+    fn the_window_matches_the_shepherds_own_reload_deadline() {
         let mut app: AppConfig =
             toml::from_str("name = 'web'\nscript = './run.sh'").expect("parses");
 
-        // A small app gets its mode's floor. Probed's is generous because a
-        // probed release's readiness is unbounded; Alive's is not, because
-        // an ungated reload costs exactly what shep is going to sleep for.
-        assert_eq!(budget(&app, Verify::Probed), PROBED_FLOOR);
-        assert_eq!(budget(&app, Verify::Alive), ALIVE_FLOOR);
+        // shep's shipping defaults: listen 3s, graceful 8s, one instance.
+        // 3 + 8 + 5 = 16.
+        assert_eq!(app.listen_timeout.as_duration(), Duration::from_secs(3));
+        assert_eq!(app.graceful_timeout.as_duration(), Duration::from_secs(8));
+        assert_eq!(budget(&app), Duration::from_secs(16));
 
-        app.instances = 4;
-        app.listen_timeout = shep_client::shep_core::values::UpDuration::from_millis(15_000);
-        assert_eq!(budget(&app, Verify::Probed), Duration::from_secs(120));
-        assert_eq!(budget(&app, Verify::Alive), Duration::from_secs(120));
+        // The term the previous derivation dropped. Doubling
+        // `listen_timeout` supplied 3s of headroom against an 8s drain, and
+        // `verify` needs the whole drain to fit because it waits for every
+        // old instance to be gone.
+        app.instances = 2;
+        assert_eq!(budget(&app), Duration::from_secs(32));
+
+        // And it follows both fields, not just the one.
+        app.instances = 3;
+        app.graceful_timeout = UpDuration::from_millis(20_000);
+        app.listen_timeout = UpDuration::from_millis(1_000);
+        assert_eq!(budget(&app), Duration::from_secs(78));
     }
 
     /// fails if a rollback gives up the first time the shepherd says it is
@@ -1288,10 +1299,10 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("web"), "{shown}");
         assert!(shown.contains(&first), "{shown}");
-        assert!(
-            shown.contains("did not come up and stay up within 90s"),
-            "{shown}"
-        );
+        // Not the number, which follows the app: what matters here is that
+        // the reason survives into the sentence at all.
+        assert!(shown.contains("did not come up and stay up"), "{shown}");
+        assert!(shown.contains("after the reload"), "{shown}");
         assert!(!shown.contains("rolling back after"), "{shown}");
         assert_eq!(shown.matches("roll back").count(), 1, "{shown}");
         // The record never advanced, because nothing verified.
