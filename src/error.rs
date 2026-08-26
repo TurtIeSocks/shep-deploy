@@ -65,6 +65,31 @@ pub enum Error {
         /// else.
         stderr: String,
     },
+    /// Another deploy of the same sheep moved `current` while this one was
+    /// preparing its release.
+    ///
+    /// The swap is refused rather than performed: the other deploy may have
+    /// already verified a *newer* release, and swapping on top of it would
+    /// silently revert something that is live and healthy.
+    Raced {
+        /// The sheep whose `current` moved.
+        sheep: String,
+        /// What `current` pointed at when this deploy started.
+        started: String,
+        /// What it points at now.
+        found: String,
+    },
+    /// A release had to be rolled back, and the rollback itself failed.
+    ///
+    /// Carries both halves because either alone leaves an operator unable
+    /// to diagnose the machine: `why` is the failure that made a rollback
+    /// necessary, and the source is what went wrong performing it.
+    Rollback {
+        /// Why the rollback was wanted.
+        why: String,
+        /// What went wrong rolling back.
+        source: Box<Error>,
+    },
     /// A release was swapped in, never came up, and there was no previous
     /// release to fall back to.
     Unverified {
@@ -104,6 +129,21 @@ impl fmt::Display for Error {
                 Some(code) => write!(f, "`{command}` exited with status {code}: {stderr}"),
                 None => write!(f, "`{command}` was killed by a signal: {stderr}"),
             },
+            Self::Raced {
+                sheep,
+                started,
+                found,
+            } => write!(
+                f,
+                "another deploy of {sheep} moved current from {started} to {found} while this \
+                 one was building - refusing to swap on top of it, because that release may be \
+                 newer than this one"
+            ),
+            Self::Rollback { why, source } => write!(
+                f,
+                "rolling back after {why} failed: {source} - current may still point at the \
+                 release that was rejected"
+            ),
             Self::Unverified { sheep, sha } => write!(
                 f,
                 "{sheep} did not come up on release {sha}, and there is no previous release to \
@@ -123,9 +163,11 @@ impl core::error::Error for Error {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
             Self::Io { source, .. } => Some(source),
+            Self::Rollback { source, .. } => Some(&**source),
             Self::Protocol(_)
             | Self::Config(_)
             | Self::Git { .. }
+            | Self::Raced { .. }
             | Self::Unverified { .. }
             | Self::Build { .. } => None,
         }
@@ -171,6 +213,39 @@ mod tests {
         let shown = err.to_string();
         assert!(shown.contains("git fetch origin"));
         assert!(shown.contains("could not read Username"));
+    }
+
+    /// fails if a failed rollback reports only one of its two halves. The
+    /// failure that made a rollback necessary and the failure of the
+    /// rollback itself are both needed: the first says what the machine
+    /// was trying to do, the second says what state it is in now.
+    #[test]
+    fn a_failed_rollback_names_both_failures() {
+        let err = Error::Rollback {
+            why: "it did not come up".to_owned(),
+            source: Box::new(Error::Io {
+                path: PathBuf::from("/srv/x/current.tmp"),
+                source: std::io::Error::other("file exists"),
+            }),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("it did not come up"), "{shown}");
+        assert!(shown.contains("current.tmp"), "{shown}");
+    }
+
+    /// fails if a refused swap stops naming what `current` moved between.
+    /// The two shas are how an operator tells "another deploy beat me to
+    /// it" apart from "something clobbered current".
+    #[test]
+    fn a_raced_swap_names_both_releases() {
+        let err = Error::Raced {
+            sheep: "web".to_owned(),
+            started: "a1b2c3d".to_owned(),
+            found: "e4f5a6b".to_owned(),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("a1b2c3d"), "{shown}");
+        assert!(shown.contains("e4f5a6b"), "{shown}");
     }
 
     /// fails if a first deploy that never came up stops naming both the
