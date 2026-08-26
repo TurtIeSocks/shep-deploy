@@ -17,6 +17,7 @@
 mod daemon;
 mod error;
 mod paths;
+mod shared;
 mod state;
 
 fn main() {
