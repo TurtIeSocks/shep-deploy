@@ -38,6 +38,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::error::Error;
@@ -45,7 +46,24 @@ use crate::error::Error;
 /// What to run to turn a freshly checked-out release into something its
 /// declared script can execute, and what to salvage from wherever that run
 /// actually left its output.
-#[derive(Clone, PartialEq, Eq, Default)]
+///
+/// This is the `[build]` block of a release's own Flockfile, parsed by
+/// [`crate::flockfile::build_spec`]:
+///
+/// ```toml
+/// [build]
+/// command = "bun install && bun run build"
+/// env = { CARGO_TARGET_DIR = "/srv/cache/koji" }
+/// artifacts = ["target/release/koji"]
+/// ```
+///
+/// Every field is optional and an absent `[build]` block is the default
+/// value of this struct, which [`run`] treats as a no-op. Unknown keys are
+/// refused rather than ignored, matching `shep_core`'s own `AppConfig`: a
+/// typo in a build block would otherwise mean a build that silently never
+/// runs.
+#[derive(Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BuildSpec {
     /// The build command, run through `sh -c` inside the release. `None`
     /// is a no-op, not an error - see [`run`] for why.

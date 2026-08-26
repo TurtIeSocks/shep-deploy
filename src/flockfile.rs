@@ -38,6 +38,7 @@ use std::path::Path;
 use shep_client::shep_core::prelude::AppConfig;
 use toml::{Table, Value};
 
+use crate::build::BuildSpec;
 use crate::error::Error;
 
 /// The [`AppConfig`] for `sheep`, built from `release`'s own Flockfile.
@@ -57,11 +58,7 @@ use crate::error::Error;
 /// after merging, or if that app's table does not match [`AppConfig`]'s
 /// schema.
 pub fn app_config(release: &Path, sheep: &str) -> Result<AppConfig, Error> {
-    let committed = read_required(&release.join("Flockfile.toml"))?;
-    refuse_repo_privilege(&committed)?;
-
-    let override_doc = read_optional(&release.join("Flockfile.override.toml"))?;
-    let merged = deep_merge(committed, override_doc);
+    let merged = merged_document(release)?;
 
     let app = select_app(&merged, sheep)?;
     app.try_into().map_err(|source: toml::de::Error| {
@@ -69,6 +66,55 @@ pub fn app_config(release: &Path, sheep: &str) -> Result<AppConfig, Error> {
             "app {sheep:?} does not match shep's app schema: {source}"
         ))
     })
+}
+
+/// The release's `[build]` block, or the default (no command, which
+/// [`crate::build::run`] treats as a no-op) if it declares none.
+///
+/// Read from the same merged document [`app_config`] reads, so the
+/// operator's override wins here too. That is not incidental: `build.env`
+/// routinely names host-specific paths - a shared `CARGO_TARGET_DIR` is the
+/// example the design is built around - and those are exactly the values a
+/// committed file cannot know and an operator has to pin locally.
+///
+/// The block is top-level rather than a key on the app entry, because
+/// `AppConfig` refuses unknown fields: a `build` key inside `[[app]]` would
+/// make shep's own parser reject the entry. One block per Flockfile also
+/// matches what a release actually is - one checkout, built once - even
+/// when several sheep are deployed from the same repository.
+///
+/// # Errors
+/// As [`app_config`] for reading and merging the two files, plus
+/// [`Error::Config`] if the `[build]` block does not match
+/// [`BuildSpec`]'s schema - an unknown key, or a value of the wrong type.
+pub fn build_spec(release: &Path) -> Result<BuildSpec, Error> {
+    let merged = merged_document(release)?;
+    let Some(build) = merged.as_table().and_then(|doc| doc.get("build")) else {
+        return Ok(BuildSpec::default());
+    };
+
+    build.clone().try_into().map_err(|source: toml::de::Error| {
+        Error::Config(format!(
+            "{}: `[build]` does not match the build schema: {source}",
+            release.display()
+        ))
+    })
+}
+
+/// The committed Flockfile with the operator's override merged over it,
+/// refusing first if the committed file sets `user` or `group`.
+///
+/// Both public readers go through here, so the refusal applies whichever
+/// one was called and neither can see a document the other could not.
+///
+/// # Errors
+/// As [`app_config`], minus the app-selection failures.
+fn merged_document(release: &Path) -> Result<Value, Error> {
+    let committed = read_required(&release.join("Flockfile.toml"))?;
+    refuse_repo_privilege(&committed)?;
+
+    let override_doc = read_optional(&release.join("Flockfile.override.toml"))?;
+    Ok(deep_merge(committed, override_doc))
 }
 
 /// Reads and parses a Flockfile that must exist.
@@ -387,5 +433,78 @@ mod tests {
         let rel = fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x.js'\n")]);
         let err = app_config(rel.path(), "ghost").expect_err("no such app");
         assert!(err.to_string().contains("ghost"));
+    }
+
+    /// fails if a declared `[build]` block does not reach the build step.
+    /// `env` and `artifacts` are the two fields the design is built
+    /// around (a shared `CARGO_TARGET_DIR`, and copying the binary it
+    /// produces back into the release), so a block that parsed its command
+    /// and dropped either of those would still break rollback.
+    #[test]
+    fn a_build_block_parses_into_a_spec() {
+        let rel = fixture_release(&[(
+            "Flockfile.toml",
+            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\nenv = {              CARGO_TARGET_DIR = '/srv/cache' }\nartifacts = ['target/release/koji']\n",
+        )]);
+        let spec = build_spec(rel.path()).expect("parses");
+        assert_eq!(spec.command.as_deref(), Some("make build"));
+        assert_eq!(
+            spec.env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("/srv/cache")
+        );
+        assert_eq!(
+            spec.artifacts,
+            vec![std::path::PathBuf::from("target/release/koji")]
+        );
+    }
+
+    /// fails if a Flockfile with no `[build]` block becomes an error
+    /// rather than the no-op spec. ReactMap run as `bun .` declares no
+    /// build at all, which is one of the three worked examples this design
+    /// has to cover.
+    #[test]
+    fn an_absent_build_block_is_the_default_spec() {
+        let rel = fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x'\n")]);
+        assert_eq!(
+            build_spec(rel.path()).expect("parses"),
+            BuildSpec::default()
+        );
+    }
+
+    /// fails if the operator's override stops winning on the build block.
+    /// `build.env` names host-specific paths a committed file cannot know,
+    /// so pinning them locally is the whole reason the override reaches
+    /// this block at all.
+    #[test]
+    fn the_override_wins_on_the_build_block() {
+        let rel = fixture_release(&[
+            (
+                "Flockfile.toml",
+                "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\n",
+            ),
+            (
+                "Flockfile.override.toml",
+                "[build]\nenv = { CARGO_TARGET_DIR = '/srv/cache' }\n",
+            ),
+        ]);
+        let spec = build_spec(rel.path()).expect("parses");
+        assert_eq!(spec.command.as_deref(), Some("make build"));
+        assert_eq!(
+            spec.env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("/srv/cache")
+        );
+    }
+
+    /// fails if a typo in the build block is ignored instead of refused. A
+    /// silently-dropped `commands` key means a build that never runs, and
+    /// a deploy that swaps in a release nothing built.
+    #[test]
+    fn an_unknown_build_key_is_refused() {
+        let rel = fixture_release(&[(
+            "Flockfile.toml",
+            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommands = 'make build'\n",
+        )]);
+        let err = build_spec(rel.path()).expect_err("refuses");
+        assert!(err.to_string().contains("commands"));
     }
 }
