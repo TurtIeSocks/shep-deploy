@@ -22,6 +22,7 @@ mod git;
 mod paths;
 mod shared;
 mod state;
+mod swap;
 
 fn main() {
     println!("not yet implemented");
