@@ -622,18 +622,44 @@ it.
 
 ## Open questions
 
-- **Poll interval default.** 30 seconds is adequate for a single host and needs
-  no inbound port, no HMAC verification and no public exposure. Webhooks are
-  deliberately deferred: Vercel needs them because it is multi-tenant at scale.
-  Un-exposing a port after the fact is harder than adding one later.
-- **The `CARGO_TARGET_DIR` artifact copy is specified but not proven.** It
-  should be validated against Koji before the plan commits to it.
-- **Whether a `.shepignore` shipped by upstream is itself a risk.** Adding
-  `config/local.json` to it would stop a user's config being linked. Low
-  severity, since the app would visibly fail to start, but unrecorded
-  until now.
-- **Smit rendering when the terminal is narrow.** `shep flock` already drops
-  columns adaptively; where a smit sits in that priority order is undecided.
+All four are now closed. Kept with their answers rather than deleted, since
+the reasoning is what a later reader needs.
+
+- **Poll interval default: 30 seconds.** Adequate for a single host, and needs
+  no inbound port, no HMAC verification and no public exposure. Webhooks stay
+  deferred: Vercel needs them because it is multi-tenant at scale, and
+  un-exposing a port after the fact is harder than adding one later.
+- **The `CARGO_TARGET_DIR` artifact copy: measured, and this spec was wrong.**
+  Koji's `make build` does the copy-back itself, from a hardcoded
+  `cp ./target/release/koji koji`. Setting `CARGO_TARGET_DIR` means `./target`
+  is never created, so that `cp` exits 1. Measured 2026-08-26 with a throwaway
+  crate: absent `./target` and "No such file or directory" with the variable
+  set, exit 0 with `target` symlinked at the same cache.
+
+  So the dog does not set `CARGO_TARGET_DIR`. Each sheep gets a dog-owned
+  cache at `$SHEP_HOME/deploy/<sheep>/cache/target`, symlinked as `target`
+  inside each release worktree. That keeps builds incremental across releases
+  and leaves hardcoded `./target` paths working, which matters because running
+  a project's existing build command unmodified is the whole premise.
+
+  This is separate from `.shepignore`, which governs which ignored-and-present
+  files are linked from the USER's checkout. `target` stays listed there: the
+  user's own dev target directory should never be linked. The shared cache
+  belongs to the dog.
+- **An upstream-shipped `.shepignore` as a risk: accepted, not designed
+  around.** The dog links what the file says to link. A repository shipping a
+  hostile one is already a repository whose build commands you are running.
+  Revisit if a smit ever renders the linked set, since that would make the
+  contents visible rather than merely loud.
+- **Smit rendering on a narrow terminal: droppable.** Rin's call, 2026-08-26.
+  The smit sits low in `shep flock`'s adaptive drop order, among the first
+  columns to yield.
+
+  Read the condition she attached, because it is a requirement the permission
+  does not state outright: dropping it on narrow is acceptable *because* it is
+  seen regularly at full width. So the smit must never be dropped at full
+  width, and must not be crowded out there by a later change either. Pin both
+  ends with an exact-string test: present at full width, absent at narrow.
 
 ## Worked examples
 
