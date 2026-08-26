@@ -16,7 +16,7 @@
 - **`shep-client = "0.1.0"`** from crates.io. It re-exports `shep_core`, so do not depend on `shep-core` separately.
 - **License `MIT OR Apache-2.0`**, matching shep and `shep-log-rotate`.
 - **`#![forbid(unsafe_code)]`** at the crate root.
-- **Small per-module error enums with manual `Display`** (shep's IR-18 and IR-19). No `anyhow`. `shep-log-rotate`'s `src/error.rs` is the shape to copy.
+- **One small crate-level error enum with a manual `Display`** (shep's IR-18 and IR-19), living in `src/error.rs` and gaining variants as tasks need them. No `anyhow`. `shep-log-rotate`'s `src/error.rs` is the exact shape to copy: it has a single `Error` for the whole binary, and this plan follows it rather than splitting per module.
 - **Every public item needs docs and a deliberate `Debug` decision.** Redact anything carrying env or secrets, and pin the redaction with an exact-string test (shep's IR-41).
 - **The dog never writes to the user's checkout.** It reads from it and symlinks into releases. Any code path that would write there is a bug.
 - **`user`/`group` are never taken from a repo-supplied Flockfile.** See spec, "Pinning".
