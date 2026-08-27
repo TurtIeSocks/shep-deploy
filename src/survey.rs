@@ -173,7 +173,7 @@ impl Standing {
                 sha,
                 failed,
             } => format!(
-                "{}, holding {} after it did not land; a newer commit or a landing deploy \
+                "{}, holding {} after it did not land. A newer commit or a landing deploy \
                  clears it",
                 at(branch, sha.as_deref()),
                 short(failed)
@@ -493,7 +493,7 @@ mod tests {
             render(&rows),
             "bpm           watched       main@a1b2c3, deploys on every new commit\n\
              koji-staging  manual        main@a1b2c3, deploys only when asked\n\
-             reactmap-eu   held          main@a1b2c3, holding d4e5f6 after it did not land; a \
+             reactmap-eu   held          main@a1b2c3, holding d4e5f6 after it did not land. A \
              newer commit or a landing deploy clears it\n\
              reactmap      needs setup   a git checkout that ships a Flockfile\n\
              koji          eligible      a git checkout, nothing declares a deploy\n\
