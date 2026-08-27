@@ -308,6 +308,67 @@ mod tests {
         }
     }
 
+    /// fails if `named` starts printing a `DogSection`'s body. That
+    /// section routinely carries webhook credentials - a bark dog's URL is
+    /// the ordinary case - and this error text goes wherever the dog's
+    /// stderr goes. `Debug` would print the whole table, which is why this
+    /// arm is written by hand while the rest could have been derived.
+    ///
+    /// The assertion is exact rather than "does not contain the secret"
+    /// (IR-41): a formatting change that leaked half a line would still
+    /// pass a contains-check written against one fixture.
+    #[test]
+    fn a_dog_section_is_named_and_never_printed() {
+        let secret = "url = \"https://hooks.example.com/T00/B11/xoxb-not-a-real-token\"\n";
+        let response = Response::DogSection {
+            toml: secret.to_owned().into(),
+        };
+        assert_eq!(named(&response), "a DogSection");
+    }
+
+    /// fails if a response stops being named by what it is and how much of
+    /// it there is. The count is what makes these useful: "a Flock of 0" in
+    /// answer to `Describe` says the selector matched nothing, which reads
+    /// very differently from "a Flock of 12".
+    #[test]
+    fn a_listing_is_named_with_its_length() {
+        let flock = vec![sheep_named("web", None), sheep_named("api", None)];
+        assert_eq!(named(&Response::Flock(flock.clone())), "a Flock of 2");
+        assert_eq!(
+            named(&Response::Described(flock.clone())),
+            "a Described of 2"
+        );
+        assert_eq!(named(&Response::Started(flock.clone())), "a Started of 2");
+        assert_eq!(
+            named(&Response::Reloading(flock.clone())),
+            "a Reloading of 2"
+        );
+        assert_eq!(named(&Response::Restarted(flock)), "a Restarted of 2");
+        assert_eq!(named(&Response::Flock(Vec::new())), "a Flock of 0");
+    }
+
+    /// fails if the `#[non_exhaustive]` arm stops naming a variant this dog
+    /// was written before, or stops truncating it. That arm has only
+    /// `Debug` to work with, and some of those variants carry listings.
+    #[test]
+    fn an_unknown_response_is_named_from_debug_and_truncated() {
+        let response = Response::DogStarted(sheep_named("metrics", Some(1)));
+        let shown = named(&response);
+        assert!(shown.starts_with("DogStarted"), "{shown}");
+        assert!(shown.chars().count() <= 60, "{shown}");
+    }
+
+    /// fails if `unexpected` stops saying which request the answer was to.
+    /// "a Flock of 2" alone does not tell an operator which call went
+    /// wrong, and this dog makes six different ones.
+    #[test]
+    fn an_unexpected_answer_names_the_request_it_answered() {
+        let err = unexpected("Reload", &Response::Flock(Vec::new()));
+        let shown = err.to_string();
+        assert!(shown.contains("in answer to Reload"), "{shown}");
+        assert!(shown.contains("a Flock of 0"), "{shown}");
+    }
+
     /// fails if the dog cannot work out the name it was adopted under.
     /// A dog is spawned with no argv and one env entry, so the ONLY way it
     /// learns its own `[dog.<name>]` key is to find its own pid in the flock.
