@@ -241,13 +241,20 @@ pub async fn prepare<D: Daemon>(
 /// calls before the `Start` are in the same position, and their errors are
 /// passed through for the same reason.
 ///
-/// [`Daemon::delete`] and [`State::write`] are the two that are not.
-/// Both run only once the newcomer has been accepted, so an error from
-/// either leaves the sheep serving the new release with the changeover
-/// half finished: an old instance still registered, or `deploy.toml` not
-/// yet naming the sha. Neither is repaired here, because the release those
-/// steps were finishing is the one that just proved itself, and the next
-/// `shep-deploy deploy` writes the record anyway.
+/// Two steps run only once the newcomer has been accepted, and they are
+/// not alike.
+///
+/// [`Error::Stranded`] is a [`Daemon::delete`] that failed. The cutover
+/// landed and the new release is serving, but an instance it replaced is
+/// still registered, and that does NOT settle: a later deploy reloads every
+/// instance of the name and respawns each from its own spec, so the
+/// leftover comes back on the pre-adoption config every time. The ids are
+/// collected rather than the first failure returned, so the error can name
+/// every one of them.
+///
+/// [`State::write`] failing is the mild one, and it is passed through. The
+/// release is serving and only the record is missing, which the next
+/// `shep-deploy deploy` writes.
 pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<String, Error> {
     let Prepared {
         tree,
@@ -278,12 +285,33 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
         CutOver::Done => {
             // By id, because Start added the newcomer BESIDE these under
             // the same name and a name selector would take it down too.
+            //
+            // Collected rather than `?`d. A delete that failed partway
+            // leaves instances that a later deploy does not clean up but
+            // RELOADS, respawning each from its own pre-adoption spec, so
+            // the ids have to reach the operator. Stopping at the first
+            // failure would hide the rest of them.
+            let mut stranded = Vec::new();
             for id in previous {
-                daemon.delete(id).await?;
+                if daemon.delete(id).await.is_err() {
+                    stranded.push(id);
+                }
             }
+
+            // Written either way: the release is serving, so the record
+            // naming it is true whatever the cleanup did.
             state.deployed = Some(sha.clone());
             state.write(&tree.state_file())?;
-            Ok(sha)
+
+            if stranded.is_empty() {
+                Ok(sha)
+            } else {
+                Err(Error::Stranded {
+                    sheep,
+                    sha,
+                    ids: stranded,
+                })
+            }
         }
         // Nothing was spawned and nothing was recorded, so there is nothing
         // to clean up and nothing to say beyond what the shepherd said.
@@ -1278,6 +1306,12 @@ mod tests {
         cutover_fixture_of(&[7], vec![(Duration::ZERO, Shape::Absent)], None).await
     }
 
+    /// A newcomer that comes up and stays, with every `delete` refused.
+    async fn cutover_fixture_comes_up_but_refuses_deletes() -> (CutOverDouble, Prepared, Dirs) {
+        let (daemon, prepared, dirs) = cutover_fixture_of(&[7, 8], comes_up(), None).await;
+        (daemon.refusing_deletes(), prepared, dirs)
+    }
+
     /// A shepherd that accepts the `Start` and then stops answering.
     ///
     /// Muted from the instant the `Start` lands, which is the worst
@@ -1504,6 +1538,39 @@ mod tests {
         assert!(
             shown.contains("shep-deploy setup bpm"),
             "it says how to try again: {shown}"
+        );
+    }
+
+    /// fails if a delete the shepherd refused is passed over in silence,
+    /// or if only the first failure is reported. The cutover landed and the
+    /// new release is serving, so it would be easy to call this cosmetic,
+    /// and it is not: what is left behind is an instance the next deploy
+    /// does not clean up but RELOADS, respawning it from its own
+    /// pre-adoption spec, so it serves the operator's checkout code while
+    /// the supervisor keeps it alive. That is verbatim the consequence the
+    /// "leave the original running" design was reversed over. The ids have
+    /// to reach the operator, all of them, with the command that removes
+    /// them.
+    ///
+    /// The record is still written, because the release really is serving.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_delete_names_every_instance_it_left_behind() {
+        let (daemon, prepared, _dirs) = cutover_fixture_comes_up_but_refuses_deletes().await;
+        let path = prepared.tree.state_file();
+        let sha = prepared.sha.clone();
+
+        let err = cut_over(&daemon, prepared).await.expect_err("names them");
+
+        let shown = err.to_string();
+        assert!(shown.contains("shep delete 7"), "{shown}");
+        assert!(
+            shown.contains("shep delete 8"),
+            "not just the first one: {shown}"
+        );
+        assert_eq!(
+            State::read(&path).expect("reads").deployed,
+            Some(sha),
+            "the release is serving, so the record names it"
         );
     }
 

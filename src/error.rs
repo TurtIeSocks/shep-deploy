@@ -192,6 +192,27 @@ pub enum Error {
         /// its own says nothing about the record left behind.
         source: Option<Box<Error>>,
     },
+    /// A cutover landed, and one or more of the instances it replaced
+    /// could not be removed.
+    ///
+    /// The new release IS serving; only the cleanup failed. That is still an
+    /// error rather than a warning, because what it leaves behind does not
+    /// stay still. A deploy reloads EVERY instance of the sheep's name and
+    /// replaces each from its own spec, so a leftover is respawned from the
+    /// PRE-ADOPTION config on every deploy from now on, serving the
+    /// operator's checkout code while being actively kept alive by the
+    /// supervisor. Stale and forgotten would be tolerable; stale and
+    /// restarted on every deploy is a deploy that silently half applies,
+    /// and it is the consequence the "leave the original running" design
+    /// was reversed over.
+    Stranded {
+        /// The sheep that was cut over.
+        sheep: String,
+        /// The release it is now serving.
+        sha: String,
+        /// The instances that could not be removed.
+        ids: Vec<u32>,
+    },
     /// A release's build command exited without succeeding.
     ///
     /// Deliberately carries only the exit status, not captured output the
@@ -322,6 +343,21 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
+            Self::Stranded { sheep, sha, ids } => {
+                let removes: Vec<String> =
+                    ids.iter().map(|id| format!("`shep delete {id}`")).collect();
+                write!(
+                    f,
+                    "{sheep} was cut over to {sha} and the new release is serving, but {} of the \
+                     instances it replaced could not be removed and are still registered. They \
+                     are still running the code from {sheep}'s own checkout, and they will not \
+                     go away on their own: every deploy from now on reloads EVERY instance of \
+                     the name and respawns each from its own spec, so these come back on the \
+                     pre-adoption config each time. Remove them: {}.",
+                    ids.len(),
+                    removes.join(", ")
+                )
+            }
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
@@ -347,6 +383,7 @@ impl core::error::Error for Error {
             | Self::Git { .. }
             | Self::Raced { .. }
             | Self::Unverified { .. }
+            | Self::Stranded { .. }
             | Self::Build { .. } => None,
         }
     }

@@ -232,7 +232,9 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
 /// # Errors
 /// [`Error::Io`] if `$SHEP_HOME` cannot be resolved, [`Error::Connect`] if
 /// the shepherd's socket cannot be reached, and whatever
-/// [`optin::prepare`] or [`optin::cut_over`] return.
+/// [`optin::prepare`] or [`optin::cut_over`] return. [`Error::Stranded`] is
+/// the one that is returned AFTER a success is printed: the cutover landed
+/// and the instances it replaced did not all go.
 async fn setup_once(sheep: &str) -> Result<u8, Error> {
     let client = Client::connect(&socket()?).await?;
     let daemon = Live::new(client);
@@ -241,10 +243,21 @@ async fn setup_once(sheep: &str) -> Result<u8, Error> {
     // Read before `cut_over` consumes `prepared`.
     let current = prepared.tree.current();
 
-    let sha = optin::cut_over(&daemon, prepared).await?;
-    println!("{sheep} now deploys from {}, at {sha}", current.display());
-
-    Ok(0)
+    match optin::cut_over(&daemon, prepared).await {
+        Ok(sha) => {
+            println!("{sheep} now deploys from {}, at {sha}", current.display());
+            Ok(0)
+        }
+        // The cutover landed and only the cleanup did not, so the operator
+        // still needs the path - it is the one thing this command tells
+        // them that nothing else will - and then the error says what is
+        // left to remove by hand.
+        Err(err @ Error::Stranded { .. }) => {
+            println!("{sheep} now deploys from {}", current.display());
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Reports where every registered sheep stands, and touches nothing.
