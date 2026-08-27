@@ -324,6 +324,10 @@ mod tests {
             1
         );
         assert_eq!(code_for(&Error::Build { status: Some(3) }), 1);
+        assert_eq!(
+            code_for(&Error::Connect(shep_client::ConnectError::HandshakeClosed)),
+            5
+        );
     }
 
     /// fails if a rollback that happened on the ORDINARY path stops being
