@@ -11,9 +11,49 @@ Watches a git branch, builds a release in an isolated directory, swaps to it, re
 
 It is an external dog, the same shape as [shep-log-rotate](https://github.com/TurtIeSocks/shep-log-rotate): an ordinary binary you adopt, talking to the daemon over the socket the CLI already uses.
 
+## What one deploy does
+
+1. Fetch into a bare clone, and compare the branch head to the last deployed sha.
+2. `git worktree add` the new sha, sharing the object store.
+3. Symlink the shared files in: whatever git ignores and `.shepignore` does not.
+4. Run the build, as the app's `user` if it sets one.
+5. `rename(2)` `current` onto the new release.
+6. `Reload` the sheep.
+7. Verify. On failure, put `current` back and reload again.
+
+Steps 1 to 4 never touch the running app. A build that fails costs a directory, not an outage.
+
+Verification waits for a *new* process to reach `Online`, not for any process to be `Online`. shep answers a reload before it has finished one, and keeps the old instance when the replacement never becomes ready, so "something is online" is true throughout a deploy that failed.
+
+## Layout
+
+Everything lives under `$SHEP_HOME/deploy/<sheep>/`:
+
+```text
+git/                 one bare clone, shared by every release
+releases/<sha>/      a worktree per release
+current -> releases/<sha>
+deploy.toml          remote, branch, deployed sha, verify mode, watch mode
+```
+
+The sheep's `cwd` is `current`, permanently. Set it explicitly when you register the app: a Flockfile `cwd` left to default is resolved at registration, which pins the sheep to one release and makes every later swap invisible to it.
+
+## Usage
+
+```sh
+shep-deploy deploy <sheep>
+shep-deploy deploy <sheep> --watch auto|manual
+```
+
+`--watch` changes the setting and returns without deploying.
+
+`verify = "probed"` (the default) needs the app to have a `readiness_probe` or `wait_ready`; without one, shep reports a process `Online` for not having died yet, so there is nothing to verify against and the deploy is refused. `verify = "alive"` is the deliberate downgrade: a new process, still running ten seconds later.
+
 ## Status
 
-Early scaffold. The crate builds and has its error type. Everything else is still to come; see the [implementation plan](docs/writing-plans/plans/2026-08-26-deploy-engine.md).
+The deploy sequence and the operator command work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, opt-in (surveying the flock and cutting a sheep over for the first time), release retention, and Windows.
+
+See [docs/writing-plans/plans/2026-08-26-deploy-engine.md](docs/writing-plans/plans/2026-08-26-deploy-engine.md) for what was built, and the [design spec](docs/brainstorming/specs/2026-08-26-deploy-dog-design.md) for what it is for.
 
 ## License
 
