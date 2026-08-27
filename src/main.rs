@@ -92,6 +92,15 @@ the verbs above is reached with the verb spelled out: `shep deploy deploy survey
 /// two of those were the same code until Rin ruled otherwise.
 const ROLLED_BACK: u8 = 12;
 
+/// A cutover that landed and then could not tidy up: the sheep is live on the
+/// new release, and something after the swap failed.
+///
+/// Its own code rather than the generic 1, because a script has to tell three
+/// outcomes apart: it worked, it worked and needs tidying, it failed. The
+/// poll loop is why that matters. Unattended, a generic failure here reads as
+/// a deploy that did not land, and it would retry one that did.
+const STRANDED: u8 = 13;
+
 /// What a parsed argv means to do.
 ///
 /// Split out of `main` so the routing decision - which pattern wins when
@@ -192,6 +201,7 @@ const fn code_for_outcome(outcome: &Outcome) -> u8 {
 fn code_for(err: &Error) -> u8 {
     match err {
         Error::RolledBack { .. } => ROLLED_BACK,
+        Error::Stranded { .. } => STRANDED,
         Error::Config(_) => 4,
         Error::Connect(_) => 5,
         _ => 1,
@@ -414,6 +424,28 @@ mod tests {
             code_for(&rolled_back),
             code_for(&Error::Build { status: Some(1) })
         );
+    }
+
+    /// fails if a cutover that landed and then could not tidy up is reported
+    /// as an ordinary failure. The sheep IS live on the new release; only the
+    /// cleanup after the swap did not finish. The poll loop is why the
+    /// distinction has to survive into the exit status: unattended, a generic
+    /// failure here reads as a deploy that never landed, and it would redeploy
+    /// one that did.
+    #[test]
+    fn a_stranded_cutover_is_neither_a_success_nor_an_ordinary_failure() {
+        let stranded = Error::Stranded {
+            sheep: "web".to_owned(),
+            sha: "abc1234".to_owned(),
+            ids: vec![3],
+        };
+        assert_eq!(code_for(&stranded), STRANDED);
+        assert_ne!(STRANDED, 0);
+        assert_ne!(
+            code_for(&stranded),
+            code_for(&Error::Build { status: Some(1) })
+        );
+        assert_ne!(code_for(&stranded), ROLLED_BACK);
     }
 
     /// fails if this dog stops joining shep's own exit-code taxonomy and
