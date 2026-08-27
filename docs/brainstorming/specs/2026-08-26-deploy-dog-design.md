@@ -377,13 +377,26 @@ than an opt-out that silently checks nothing.
 
 Two fields on the Flockfile's build block, both driven by Koji:
 
-- **`build.env`**, environment for the build. `CARGO_TARGET_DIR` pointed at a
-  shared cache keeps Rust compilation warm across releases, which matters
-  because a from-scratch Koji build per deploy is not acceptable.
+- **`build.env`**, environment for the build. Arbitrary variables the build
+  command needs.
 - **`build.artifacts`**, paths copied out of the build environment into the
-  release afterwards. With a shared `CARGO_TARGET_DIR` the binary lands outside
-  the release, so `script = ./target/release/koji` needs it copied back for the
-  script to resolve and for rollback to have a real artifact.
+  release afterwards, for a build that writes its output somewhere the release
+  cannot see.
+
+**Warm builds do NOT come from `CARGO_TARGET_DIR`, and this section used to say
+they did.** Measured on 2026-08-26: with that variable set, `./target` is never
+created, so a build command that hardcodes it fails outright. Koji's own
+`make build` ends in `cp ./target/release/koji koji` and exits 1. That shape is
+the common one in Makefiles and shell scripts, so a dog that claims the variable
+breaks the very build commands it exists to run unmodified.
+
+Instead each sheep gets a dog-owned cache at
+`$SHEP_HOME/deploy/<sheep>/cache/target`, symlinked as `target` inside every
+release worktree. Compilation stays warm across releases AND a hardcoded
+`./target/release/koji` still resolves, so no artifact needs copying back for
+the Rust case at all. This is separate from `.shepignore`, which governs what is
+linked from the USER's checkout; `target` stays listed there, because the user's
+own build directory should never be linked.
 
 Node needs neither: bun, yarn and pnpm all keep global caches outside the repo,
 so a fresh worktree install is mostly cache hits.
@@ -397,7 +410,7 @@ The dog surveys the flock via `ListFlock` and reports, without deploying
 anything. Discovery is read-only; deploying requires opt-in.
 
 ```
-reactmap   needs setup     git checkout, declares a deploy block
+reactmap   needs setup     git checkout, ships a Flockfile
 koji       eligible        git checkout, nothing declares a deploy
 legacy     not eligible    /opt/legacy is not a git repository
 ```
@@ -516,13 +529,21 @@ in the bootstrap case a running app is still pointing into it.
 
 ## Concurrency
 
-A push landing mid-deploy aborts the in-flight deploy and starts again at the
-newer commit, **but only before the swap**. Once `current` has moved, the
-deploy finishes and verifies, and the newer commit deploys after. Tearing down
-mid-cutover is how you end up with nothing running.
+A push landing mid-deploy does NOT abort it. The deploy finishes, and the newer
+commit is picked up on the following poll. One tick of latency, never a wrong
+outcome.
 
-Rin's reasoning for aborting rather than queueing: the common case is a hotfix
-chasing a bad deploy, and the superseded build was not wanted anyway.
+This reverses an earlier decision, and the earlier reasoning was sound as far as
+it went: the common case is a hotfix chasing a bad deploy, so the superseded
+build was not wanted anyway. What it weighed was waste. What it did not weigh
+was the cost of the mechanism. Aborting means threading cancellation through the
+build's child process and fetching while a build runs, which is concurrency
+around the swap, and that is where every serious defect in this crate has lived.
+One wasted build is cheap against that.
+
+The original limit still holds for the same reason it was written: nothing is
+ever torn down once `current` has moved. Tearing down mid-cutover is how you end
+up with nothing running.
 
 ## Prerequisites
 
@@ -674,9 +695,10 @@ the reasoning is what a later reader needs.
 
 ## Worked examples
 
-**Koji.** `.shepignore` is `target`. Build is `make build` with
-`CARGO_TARGET_DIR` pointed at a shared cache and `target/release/koji` copied
-back. `.env` is ignored-and-present, so it links automatically. Script is
+**Koji.** `.shepignore` is `target`. Build is `make build`, unmodified: its own
+`cp ./target/release/koji koji` resolves through the `target` symlink into the
+dog-owned cache, so nothing is copied back and no build variable is set. `.env`
+is ignored-and-present, so it links automatically. Script is
 `./target/release/koji`.
 
 **ReactMap with a build script.** `.shepignore` is `dist`. Build is
