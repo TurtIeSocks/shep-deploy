@@ -286,9 +286,13 @@ async fn on_remove() -> ExitCode {
     let Ok(home) = shep_home() else {
         return ExitCode::SUCCESS;
     };
-    // Built from `home` rather than through `socket()`, which is fallible
-    // for the same reason `shep_home` is and has already been answered here.
-    let socket = home.join("run").join("shep.sock");
+    // Through `socket()` rather than a second `home.join(...)`: joining by
+    // hand here was a second place that knew the control socket's layout,
+    // and a change to it would have had to land in both without anything
+    // catching the drift.
+    let Ok(socket) = socket() else {
+        return ExitCode::SUCCESS;
+    };
     match Client::connect(&socket).await {
         Ok(client) => {
             let daemon = Live::new(client);
