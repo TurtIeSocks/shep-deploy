@@ -212,8 +212,6 @@ pub fn worktree_add(git_dir: &Path, at: &Path, sha: &str) -> Result<(), Error> {
 /// # Errors
 /// [`Error::Git`] if `at` is not a worktree of `git_dir`. [`Error::Io`] if
 /// `git` itself cannot be launched, or if `at` is not valid UTF-8.
-// Retention reclaims old releases; retention is plan two.
-#[allow(dead_code)]
 pub fn worktree_remove(git_dir: &Path, at: &Path) -> Result<(), Error> {
     let at = path_str(at)?;
     run_git(git_dir, &["worktree", "remove", "--force", at]).map(|_| ())
@@ -233,8 +231,6 @@ pub fn worktree_remove(git_dir: &Path, at: &Path) -> Result<(), Error> {
 /// has no non-zero exit path for an ordinary bare repository, so
 /// [`Error::Git`] is not expected in practice, but is still possible if
 /// `git_dir` is not a valid repository at all.
-// As `worktree_remove`: retention is plan two.
-#[allow(dead_code)]
 pub fn worktree_prune(git_dir: &Path) -> Result<(), Error> {
     run_git(git_dir, &["worktree", "prune"]).map(|_| ())
 }

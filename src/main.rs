@@ -39,6 +39,7 @@ mod error;
 mod flockfile;
 mod git;
 mod paths;
+mod retention;
 mod shared;
 mod state;
 mod swap;
@@ -189,7 +190,8 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
     let client = Client::connect(&socket()?).await?;
     let daemon = Live::new(client);
 
-    let outcome = deploy::deploy(&daemon, &tree, &mut state).await?;
+    let keep = config::read(&daemon).await?.retention;
+    let outcome = deploy::deploy(&daemon, &tree, &mut state, keep).await?;
     match &outcome {
         Outcome::UpToDate => println!("{sheep} is up to date at {}", deployed(&state)),
         Outcome::Deployed { sha } => println!("{sheep} deployed {sha}"),

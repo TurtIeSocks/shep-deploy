@@ -67,7 +67,7 @@ use crate::error::Error;
 use crate::paths::Tree;
 use crate::state::{State, Verify, Watch};
 use crate::verify::Generation;
-use crate::{build, flockfile, git, shared, swap, verify};
+use crate::{build, flockfile, git, retention, shared, swap, verify};
 
 /// What one deploy did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,10 +226,18 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// record lags, so the next deploy of the same sha repeats the work and
 /// writes it again. A caller that treats every error as "the old release is
 /// still serving" is wrong about this one.
+///
+/// `keep` is the retention count: once a deploy verifies, [`crate::retention`]
+/// reclaims every release beyond the newest `keep`, sparing whatever
+/// `current` names regardless of age. A prune failure is reported with
+/// `eprintln!` rather than returned - see that module's own doc - so it
+/// never turns a deploy that already succeeded into one this function
+/// reports as failed.
 pub async fn deploy<D: Daemon>(
     daemon: &D,
     tree: &Tree,
     state: &mut State,
+    keep: usize,
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
     let started_at = swap::resolve(&tree.current())?;
@@ -290,6 +298,13 @@ pub async fn deploy<D: Daemon>(
         Landed::Verified => {
             state.deployed = Some(head.clone());
             state.write(&tree.state_file())?;
+            // After the record, and never fatal. See `crate::retention`'s
+            // own doc for both halves: full turnover means nothing is
+            // still executing from an older release, and a deploy that has
+            // already verified and recorded itself did succeed.
+            if let Err(err) = retention::prune(tree, keep) {
+                eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
+            }
             Ok(Outcome::Deployed { sha: head })
         }
         // Nothing was ever started on the new release, so there is nothing
@@ -1358,9 +1373,14 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         commit_on_origin(&fixture, "second.txt");
 
-        let outcome = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
-            .await
-            .expect("completes");
+        let outcome = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect("completes");
 
         assert!(matches!(outcome, Outcome::RolledBack { .. }));
         assert_eq!(
@@ -1375,7 +1395,7 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_head_does_nothing() {
         let mut fixture = fixture_with_previous_release();
-        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
         assert!(matches!(outcome, Outcome::UpToDate));
@@ -1391,7 +1411,7 @@ mod tests {
         let second = commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::ready();
 
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -1431,6 +1451,7 @@ mod tests {
             &Shepherd::keeps_the_old_instance(),
             &fixture.tree,
             &mut fixture.state,
+            5,
         )
         .await
         .expect("completes");
@@ -1515,7 +1536,7 @@ mod tests {
         // two instances' budget and outside one's.
         let daemon = Shepherd::ready_after(200).running(2);
 
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -1561,7 +1582,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
 
         let daemon = Shepherd::busy_for(3);
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -1591,6 +1612,7 @@ mod tests {
             &Shepherd::busy_for(u32::MAX),
             &fixture.tree,
             &mut fixture.state,
+            5,
         )
         .await
         .expect_err("the rollback cannot reload");
@@ -1638,7 +1660,7 @@ mod tests {
         fixture.state.verify = crate::state::Verify::Alive;
         commit_on_origin(&fixture, "second.txt");
 
-        let outcome = deploy(&Shepherd::flapping(), &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&Shepherd::flapping(), &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -1663,7 +1685,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::unregistered();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("the rollback cannot reload");
 
@@ -1692,7 +1714,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::ready();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("no probe to wait on");
 
@@ -1723,7 +1745,7 @@ mod tests {
         .expect("write a channel-gated Flockfile");
         let second = commit_on_origin(&fixture, "second.txt");
 
-        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -1745,7 +1767,7 @@ mod tests {
         .expect("write a probeless Flockfile");
         let second = commit_on_origin(&fixture, "second.txt");
 
-        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -1767,7 +1789,7 @@ mod tests {
         .expect("write Flockfile");
         commit_on_origin(&fixture, "second.txt");
 
-        let err = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+        let err = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("the build fails");
 
@@ -1789,7 +1811,7 @@ mod tests {
         let mut fixture = fixture_with_previous_release();
         fixture.state.branch = "gone".to_owned();
 
-        let err = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state)
+        let err = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("no such branch");
 
@@ -1820,7 +1842,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::unreachable();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("the shepherd cannot be asked anything");
 
@@ -1853,7 +1875,7 @@ mod tests {
         // The deploy's own reply is lost; the rollback's gets through.
         let daemon = Shepherd::losing_replies(1);
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("no reply came back");
 
@@ -1894,6 +1916,7 @@ mod tests {
             &Shepherd::losing_replies(u32::MAX),
             &fixture.tree,
             &mut fixture.state,
+            5,
         )
         .await
         .expect_err("no reload is ever confirmed");
@@ -1957,7 +1980,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::too_busy_to_start();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("the shepherd would not take the reload");
 
@@ -1985,7 +2008,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::never_ready();
 
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -2015,7 +2038,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::describe_fails();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("describe fails");
 
@@ -2069,7 +2092,7 @@ mod tests {
         assert_eq!(fixture.state.deployed.as_deref(), Some(live.as_str()));
 
         let daemon = Shepherd::never_ready();
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect("completes");
 
@@ -2120,9 +2143,14 @@ mod tests {
         assert!(swap::resolve(&fixture.tree.current()).unwrap().is_some());
         assert!(!fixture.tree.release(&live).exists());
 
-        let err = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
-            .await
-            .expect_err("nothing usable to roll back to");
+        let err = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect_err("nothing usable to roll back to");
 
         assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
         assert!(
@@ -2152,9 +2180,14 @@ mod tests {
             .expect("retention removes the old worktree");
         assert!(!fixture.tree.release(&live).exists());
 
-        let err = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
-            .await
-            .expect_err("nothing left to roll back to");
+        let err = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect_err("nothing left to roll back to");
 
         assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
         assert_eq!(
@@ -2175,9 +2208,14 @@ mod tests {
         let mut fixture = fixture_before_any_release();
         let first = crate::git::remote_head(&fixture.tree.git(), "main").expect("head");
 
-        let err = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
-            .await
-            .expect_err("nothing to roll back to");
+        let err = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect_err("nothing to roll back to");
 
         assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
         let shown = err.to_string();
@@ -2226,7 +2264,7 @@ mod tests {
         std::os::unix::fs::symlink(fixture.home.path(), &link).expect("symlink the home");
         let same_tree = Tree::for_sheep(&link, "web");
 
-        let err = deploy(&Shepherd::never_ready(), &same_tree, &mut fixture.state)
+        let err = deploy(&Shepherd::never_ready(), &same_tree, &mut fixture.state, 5)
             .await
             .expect_err("there is no other release to go back to");
 
@@ -2247,9 +2285,14 @@ mod tests {
         fixture.state.deployed = None;
         commit_on_origin(&fixture, "second.txt");
 
-        deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
-            .await
-            .expect("completes");
+        deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect("completes");
 
         assert_eq!(fixture.state.deployed.as_deref(), Some(live.as_str()));
         assert_eq!(
@@ -2276,6 +2319,7 @@ mod tests {
             &Shepherd::planting(stale),
             &fixture.tree,
             &mut fixture.state,
+            5,
         )
         .await
         .expect_err("the swap back collides with the stale tmp link");
@@ -2308,7 +2352,7 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::never_ready();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
             .await
             .expect_err("current moved under it");
 
@@ -2354,5 +2398,36 @@ mod tests {
             Some(fixture.tree.release(&previous))
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a prune failure fails the deploy that triggered it. The
+    /// `Landed::Verified` arm's `if let Err` exists precisely so that this
+    /// cannot happen: a deploy that verified and wrote its record already
+    /// succeeded, and a worktree that will not delete costs disk, not
+    /// correctness.
+    ///
+    /// The failure is real, not simulated: `first`'s worktree admin
+    /// bookkeeping is removed out from under it, so `git worktree remove
+    /// --force` on the directory that is still sitting there answers
+    /// "is not a working tree" - the same failure an operator's own `rm -rf`
+    /// on a release directory would leave behind.
+    #[tokio::test]
+    async fn a_prune_failure_does_not_fail_the_deploy() {
+        let mut fixture = fixture_with_previous_release();
+        let first = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+        deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
+            .await
+            .expect("second release verifies");
+
+        fs::remove_dir_all(fixture.tree.git().join("worktrees").join(&first))
+            .expect("corrupt first's worktree bookkeeping");
+
+        commit_on_origin(&fixture, "third.txt");
+        let outcome = deploy(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 2)
+            .await
+            .expect("a prune failure must not fail the deploy");
+
+        assert!(matches!(outcome, Outcome::Deployed { .. }), "{outcome:?}");
     }
 }
