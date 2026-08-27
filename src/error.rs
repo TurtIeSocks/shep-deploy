@@ -185,6 +185,14 @@ pub enum Error {
         removed: bool,
         /// Whether the shepherd's persisted roll was put back.
         repaired: bool,
+        /// The deploy tree that was built, resolved.
+        ///
+        /// Carried rather than spelled `$SHEP_HOME/deploy/<sheep>` in the
+        /// message. That variable is usually unset in an operator's own
+        /// shell - `ShepPaths::resolve` falls back to `~/.shep` - so the
+        /// remedy this error exists to give would expand to `/deploy/web`
+        /// and silently do nothing.
+        tree: PathBuf,
         /// The shepherd's own failure, when that is what ended the cutover.
         ///
         /// `None` for the ordinary case, a release that did not come up
@@ -294,6 +302,7 @@ impl fmt::Display for Error {
                 why,
                 removed,
                 repaired,
+                tree,
                 source,
             } => {
                 write!(f, "{sheep}'s first cutover did not come up. {why}")?;
@@ -328,8 +337,8 @@ impl fmt::Display for Error {
                      nothing has ever been served from its tree. Do NOT run `shep deploy \
                      {sheep}` against it - that would reload the sheep at its own checkout and \
                      report success for a release nothing served. Fix what this message names, \
-                     remove the tree under $SHEP_HOME/deploy/{sheep}, and run `shep-deploy setup \
-                     {sheep}` again."
+                     remove {}, and run `shep-deploy setup {sheep}` again.",
+                    tree.display()
                 )?;
                 if !repaired {
                     // The half an operator cannot see. `shep flock` shows a

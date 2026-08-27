@@ -348,6 +348,7 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
                 why,
                 removed: undone.removed,
                 repaired: undone.recorded,
+                tree: tree.root().to_owned(),
                 source: None,
             })
         }
@@ -364,6 +365,7 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
                 why: SHEPHERD_QUIET.to_owned(),
                 removed: undone.removed,
                 repaired: undone.recorded,
+                tree: tree.root().to_owned(),
                 source: Some(Box::new(source)),
             })
         }
@@ -1701,6 +1703,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_abandoned_cutover_says_the_target_is_not_deployable_yet() {
         let (daemon, prepared, _dirs) = cutover_fixture_dies_during_dwell().await;
+        let tree = prepared.tree.root().to_owned();
 
         let err = cut_over(&daemon, prepared).await.expect_err("gives up");
 
@@ -1708,6 +1711,15 @@ mod tests {
         assert!(shown.contains("is NOT a deploy target"), "{shown}");
         assert!(shown.contains("Do NOT run `shep deploy bpm`"), "{shown}");
         assert!(shown.contains("shep-deploy setup bpm"), "{shown}");
+        // Resolved, not `$SHEP_HOME/deploy/bpm`. That variable is usually
+        // unset in an operator's own shell, where the fallback is `~/.shep`,
+        // so the unexpanded form makes `rm -rf` target `/deploy/bpm` and do
+        // nothing at all. The remedy is the whole point of this message.
+        assert!(
+            shown.contains(&format!("remove {}", tree.display())),
+            "{shown}"
+        );
+        assert!(!shown.contains("$SHEP_HOME"), "{shown}");
     }
 
     /// fails if a cutover that never spawned anything blames the port. The
