@@ -53,7 +53,7 @@
 //! the running app keeps serving and the operator's fix is one `rm` once
 //! they have checked no deploy is in flight.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::time::{Instant, sleep};
@@ -558,19 +558,22 @@ fn refuse_ungated_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Re
 /// never comes up, and framing it as a rollback that failed described a
 /// machine nobody could recognise.
 ///
-/// Whether there is anything to roll back to is decided by comparing shas,
-/// not paths. Both spellings name the same release when they agree, but
-/// `previous` is link text read off disk and `attempted` is a sha this
-/// process just resolved, and the two need not be written the same way:
-/// `$SHEP_HOME` reaches this crate through
+/// Whether there is anything to roll back to at all is
+/// [`rollback_target`]'s decision, and it reads both `current` and
+/// `deploy.toml` rather than only the first.
+///
+/// It compares shas, not paths. Both spellings name the same release when
+/// they agree, but `previous` is link text read off disk and `attempted` is
+/// a sha this process just resolved, and the two need not be written the
+/// same way: `$SHEP_HOME` reaches this crate through
 /// [`std::path::absolute`], which does not resolve symlinks, and the dog
 /// and the operator's own CLI can each arrive at a different literal path
 /// for one directory. A sha comparison has no such degree of freedom.
 ///
 /// # Errors
-/// [`Error::Unverified`] if there is nothing to roll back to - `current`
-/// never pointed anywhere, or it already points at the release that just
-/// failed, which between them mean this was the target's first deploy.
+/// [`Error::Unverified`] if [`rollback_target`] finds nothing to roll back
+/// to: neither `current` nor `deploy.toml` names an earlier release that is
+/// still on disk.
 /// [`Error::Split`], unwrapped, if that is what [`restore`] returned.
 /// [`Error::RollbackFailed`] wrapping anything else it returned.
 async fn roll_back<D: Daemon>(
@@ -582,7 +585,7 @@ async fn roll_back<D: Daemon>(
     why: &str,
     patience: Duration,
 ) -> Result<String, Error> {
-    let Some(previous) = previous.filter(|path| sha_of(path) != attempted) else {
+    let Some(previous) = rollback_target(tree, state, previous, attempted) else {
         return Err(Error::Unverified {
             sheep: tree.sheep().to_owned(),
             sha: attempted.to_owned(),
@@ -590,8 +593,8 @@ async fn roll_back<D: Daemon>(
         });
     };
 
-    let to = sha_of(previous);
-    restore(daemon, tree, state, previous, attempted, why, patience)
+    let to = sha_of(&previous);
+    restore(daemon, tree, state, &previous, attempted, why, patience)
         .await
         // `Split` already carries `why`, and says more about the machine
         // than the wrapper's own tail could - wrapping it produced a
@@ -606,6 +609,42 @@ async fn roll_back<D: Daemon>(
         })?;
 
     Ok(to)
+}
+
+/// Which release a rollback should return to, or `None` when there is
+/// genuinely no earlier one.
+///
+/// Two places know of an earlier release and they can disagree, so both are
+/// asked. `current` is the first choice: it is what was serving a moment
+/// ago. `deploy.toml` is the second, and it is not a nicety - a deploy
+/// killed between its swap and its `State::write` is precisely the
+/// interruption [`restore`]'s record correction exists to repair, and it
+/// leaves `current` already naming the release being attempted while the
+/// record still names a good one. Reading `current` alone, the retry
+/// concluded that `previous == attempted` meant a first deploy with nothing
+/// to roll back to, and left a release that would not come up serving.
+///
+/// The record's release has to still be on disk to be a candidate.
+/// Retention removes old worktrees, so a sha in `deploy.toml` is not a
+/// promise that anything is there to point at, and a rollback onto a path
+/// that does not exist would swap `current` to a dangling link.
+fn rollback_target(
+    tree: &Tree,
+    state: &State,
+    previous: Option<&Path>,
+    attempted: &str,
+) -> Option<PathBuf> {
+    if let Some(path) = previous.filter(|path| sha_of(path) != attempted) {
+        return Some(path.to_owned());
+    }
+
+    let recorded = state.deployed.as_deref()?;
+    if recorded == attempted {
+        return None;
+    }
+
+    let release = tree.release(recorded);
+    release.exists().then_some(release)
 }
 
 /// Points `current` back at `previous`, corrects the record to match, and
@@ -1790,6 +1829,88 @@ mod tests {
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
     }
 
+    /// fails if a rollback decides "there is nothing to go back to" from
+    /// `current` alone. A deploy killed between its swap and its
+    /// `State::write` is exactly the interruption `restore`'s record
+    /// correction exists to repair, and it leaves `current` already naming
+    /// the release being attempted while `deploy.toml` still names a good
+    /// one whose worktree is on disk.
+    ///
+    /// Read `current` alone and the retry concludes `previous == attempted`,
+    /// reports "there is nothing to roll back to", attempts no rollback
+    /// reload, and leaves a release that will not come up serving.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_reads_deploy_toml_when_current_is_already_the_new_release() {
+        let mut fixture = fixture_with_previous_release();
+        let live = fixture.state.deployed.clone().expect("a previous release");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        // What an interrupted deploy leaves behind: the swap happened, the
+        // record write did not.
+        crate::git::fetch(&fixture.tree.git(), &fixture.state.remote).expect("fetch");
+        install_release(&fixture, &second);
+        assert_eq!(fixture.state.deployed.as_deref(), Some(live.as_str()));
+
+        let daemon = Shepherd::never_ready();
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect("completes");
+
+        assert_eq!(
+            outcome,
+            Outcome::RolledBack {
+                to: live.clone(),
+                why: "it did not come up and stay up, 16s after the reload".to_owned(),
+            }
+        );
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&live))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(live.as_str()));
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("deploy.toml")
+                .deployed
+                .as_deref(),
+            Some(live.as_str())
+        );
+        // The deploy's own reload, and the rollback's onto the recorded
+        // release. The second is the one the old code never sent.
+        assert_eq!(daemon.attempt_count(), 2);
+    }
+
+    /// fails if a sha in `deploy.toml` is treated as a release that is
+    /// there. Retention removes old worktrees, so the record can name one
+    /// that no longer exists on disk, and rolling back onto it would point
+    /// `current` at a dangling link - a sheep whose `cwd` resolves to
+    /// nothing, which is worse than the release that would not come up.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorded_release_that_is_gone_is_not_a_rollback_target() {
+        let mut fixture = fixture_with_previous_release();
+        let live = fixture.state.deployed.clone().expect("a previous release");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        // The same interrupted deploy as above, except that retention has
+        // since swept the release the record names.
+        crate::git::fetch(&fixture.tree.git(), &fixture.state.remote).expect("fetch");
+        install_release(&fixture, &second);
+        crate::git::worktree_remove(&fixture.tree.git(), &fixture.tree.release(&live))
+            .expect("retention removes the old worktree");
+        assert!(!fixture.tree.release(&live).exists());
+
+        let err = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("nothing left to roll back to");
+
+        assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&second)),
+            "current stays where it was rather than dangling"
+        );
+    }
+
     /// fails if a first deploy that never comes up is reported as a
     /// rollback that failed. Nothing was rolled back, because there was
     /// nothing to roll back to, and the wrapped form said "no previous
@@ -1815,6 +1936,12 @@ mod tests {
         assert!(shown.contains("after the reload"), "{shown}");
         assert!(!shown.contains("rolling back after"), "{shown}");
         assert_eq!(shown.matches("roll back").count(), 1, "{shown}");
+        // It says what it looked at rather than asserting which case this
+        // is. "This is its first deploy" is true here and false on a retry
+        // after an interrupted one, which reaches the same variant.
+        assert!(shown.contains("current"), "{shown}");
+        assert!(shown.contains("deploy.toml"), "{shown}");
+        assert!(!shown.contains("first deploy"), "{shown}");
         // The record never advanced, because nothing verified.
         assert_eq!(fixture.state.deployed, None);
     }

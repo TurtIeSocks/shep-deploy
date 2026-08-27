@@ -125,13 +125,18 @@ pub enum Error {
         /// What went wrong before the rollback.
         source: Box<Error>,
     },
-    /// A release was swapped in, never came up, and there was no previous
+    /// A release was swapped in, never came up, and there was no earlier
     /// release to fall back to.
     ///
     /// Not a failed rollback: no rollback was attempted, because there was
-    /// nothing to attempt one against. This is a target's first deploy, and
-    /// it is the failure a new user is most likely to meet, so it says the
-    /// whole thing in one sentence rather than being wrapped in another.
+    /// nothing to attempt one against. Usually that is a target's first
+    /// deploy, which is the failure a new user is most likely to meet - but
+    /// not always, so the message says what was looked at rather than
+    /// asserting which case it is. A retry after an interrupted deploy
+    /// reaches this too, when `current` already names the release being
+    /// attempted and `deploy.toml`'s own release has been swept up by
+    /// retention. It says the whole thing in one sentence rather than being
+    /// wrapped in another.
     Unverified {
         /// The sheep that did not come up.
         sheep: String,
@@ -208,8 +213,9 @@ impl fmt::Display for Error {
             }
             Self::Unverified { sheep, sha, why } => write!(
                 f,
-                "{sheep}: {why}, and this is its first deploy, so there is nothing to roll back \
-                 to - it is still pointed at {sha}"
+                "{sheep}: {why}, and there is no earlier release to roll back to - neither \
+                 current nor deploy.toml names one that is still on disk - so it is still \
+                 pointed at {sha}"
             ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
