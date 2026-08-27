@@ -48,6 +48,7 @@ mod flockfile;
 mod git;
 mod optin;
 mod paths;
+mod restore;
 mod retention;
 mod roll;
 mod shared;
@@ -100,6 +101,8 @@ const ROLLED_BACK: u8 = 12;
 enum Route<'a> {
     /// No argv at all: the supervised poll loop, per the dog contract.
     Poll,
+    /// shep's on-remove lifecycle hook: put every sheep back.
+    OnRemove,
     /// Report where every registered sheep stands.
     Survey,
     /// Deploy the named sheep.
@@ -123,6 +126,7 @@ enum Route<'a> {
 fn route<'a>(args: &[&'a str]) -> Route<'a> {
     match args {
         [] => Route::Poll,
+        ["on-remove"] => Route::OnRemove,
         ["survey"] => Route::Survey,
         ["setup", sheep] => Route::Setup(sheep),
         ["deploy", sheep] => Route::Deploy(sheep),
@@ -147,6 +151,11 @@ async fn main() -> ExitCode {
             println!("shep-deploy: the poll loop is not implemented yet");
             return ExitCode::SUCCESS;
         }
+        // Its own connection, matching every sibling verb, rather than
+        // reaching for a `daemon` that does not exist in this scope. It
+        // returns an `ExitCode` directly, not a `Result<u8, Error>`, because
+        // it never fails outward - see `on_remove`'s own doc.
+        Route::OnRemove => return on_remove().await,
         Route::Survey => survey_once().await,
         Route::Deploy(sheep) => deploy_once(sheep).await,
         Route::Setup(sheep) => setup_once(sheep).await,
@@ -249,6 +258,38 @@ async fn survey_once() -> Result<u8, Error> {
 
     print!("{}", survey::survey(&daemon, &shep_home()?).await?);
     Ok(0)
+}
+
+/// The on-remove hook. shep runs this argv before forgetting the dog, under
+/// a timeout, and proceeds regardless of the outcome.
+///
+/// ALWAYS exits 0, including when a sheep could not be restored and
+/// including when the shepherd cannot be reached at all. An operator asking
+/// to remove something is entitled to have it removed, and a nonzero exit
+/// here would be a dog arguing about its own uninstallation. Failures are
+/// named in the report instead, which is the output shep pipes to them and
+/// the only thing they see about any of this.
+async fn on_remove() -> ExitCode {
+    let Ok(home) = shep_home() else {
+        return ExitCode::SUCCESS;
+    };
+    // Built from `home` rather than through `socket()`, which is fallible
+    // for the same reason `shep_home` is and has already been answered here.
+    let socket = home.join("run").join("shep.sock");
+    match Client::connect(&socket).await {
+        Ok(client) => {
+            let daemon = Live::new(client);
+            print!("{}", restore::report(&restore::all(&daemon, &home).await));
+        }
+        // Nothing was restored and nothing was broken. Said plainly,
+        // because silence here is indistinguishable from success.
+        Err(err) => println!(
+            "no sheep were restored: the shepherd could not be reached ({err}). Any sheep this \
+             dog took over is still running from its deploy tree under {}.",
+            home.join("deploy").display()
+        ),
+    }
+    ExitCode::SUCCESS
 }
 
 /// Sets `sheep`'s watch mode and returns, without deploying.
@@ -417,5 +458,15 @@ mod tests {
         // The escape hatch for a sheep whose name is a verb.
         assert_eq!(route(&["deploy", "survey"]), Route::Deploy("survey"));
         assert_eq!(route(&[]), Route::Poll);
+    }
+
+    /// fails if `on-remove` stops routing to its own hook, or starts being
+    /// swallowed by the bare-name catch-all - a sheep really could be named
+    /// `on-remove`, and it gets the same escape hatch every other verb
+    /// does.
+    #[test]
+    fn on_remove_routes_to_its_own_hook() {
+        assert_eq!(route(&["on-remove"]), Route::OnRemove);
+        assert_eq!(route(&["deploy", "on-remove"]), Route::Deploy("on-remove"));
     }
 }

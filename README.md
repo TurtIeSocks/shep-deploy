@@ -45,9 +45,12 @@ shep-deploy deploy <sheep>
 shep-deploy deploy <sheep> --watch auto|manual
 shep-deploy setup <sheep>
 shep-deploy survey
+shep-deploy on-remove
 ```
 
 `--watch` changes the setting and returns without deploying. `survey` reports where every registered sheep stands and starts, registers and writes nothing.
+
+`shep-deploy on-remove` is the lifecycle hook: shep runs it before forgetting the dog, and it puts every sheep back where it ran before the dog took over. A sheep the dog bootstrapped has nowhere to go back to, so it is left running from `current` and the report says exactly that, with the path. **The deploy tree is never deleted.** It is not the dog's to delete, and in the bootstrap case a running app is still pointing into it.
 
 `setup` takes a sheep over: it builds the tree, fetches the repository, links the shared files in, builds the first release, and re-registers the sheep with its `cwd` set to `current`. **The first cutover is the one deploy that may have downtime.** It runs two instances at once, so an app that does not bind with `SO_REUSEPORT` cannot take its own port while the original still holds it, and the new instance is then removed and the original left serving. Every deploy after the first replaces the instance rather than joining it, and does not meet this.
 
@@ -75,7 +78,7 @@ Unix only. This is deliberate, not a gap waiting to be filled by accident: the d
 
 ## Status
 
-The deploy sequence, the operator commands and opt-in all work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, removing the dog and putting a sheep back, and Windows.
+The deploy sequence, the operator commands, opt-in, and on-remove restore all work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, and Windows.
 
 See [docs/writing-plans/plans/2026-08-26-deploy-engine.md](docs/writing-plans/plans/2026-08-26-deploy-engine.md) for what was built, and the [design spec](docs/brainstorming/specs/2026-08-26-deploy-dog-design.md) for what it is for.
 

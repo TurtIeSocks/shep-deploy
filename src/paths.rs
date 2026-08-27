@@ -33,7 +33,6 @@ use crate::error::Error;
 /// [`Error::Io`], naming `<shep_home>/deploy`, if it exists but cannot be
 /// listed. An absent directory is an empty list, not an error: that is
 /// every shepherd with no targets yet.
-#[expect(dead_code)]
 pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
     let root = shep_home.join("deploy");
     let entries = match std::fs::read_dir(&root) {
