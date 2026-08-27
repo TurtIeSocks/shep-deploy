@@ -40,6 +40,11 @@ const DEPLOY_BIN: &str = env!("CARGO_BIN_EXE_shep-deploy");
 /// up and fails the test.
 const PATIENCE: Duration = Duration::from_secs(60);
 
+/// `src/main.rs`'s `ROLLED_BACK`, restated because a test binary cannot see
+/// a binary crate's internals. A change to one without the other fails this
+/// test, which is the point.
+const ROLLED_BACK_EXIT: u8 = 12;
+
 /// The `shep` binary under test.
 ///
 /// # Panics
@@ -596,6 +601,15 @@ fn a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves() {
     assert!(
         !stdout.contains(&format!("deployed {second}")),
         "the broken release must never be reported deployed: {stdout}"
+    );
+    // The rollback reached the operator's shell, not just the operator's
+    // eyes. A unit test proves the mapping; only a real deploy proves the
+    // mapping is on the path a rollback actually takes, and this one goes
+    // through `Ok(Outcome::RolledBack)`, which exited 0 until today.
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(ROLLED_BACK_EXIT)),
+        "a rolled-back deploy must not report success: {stdout}{stderr}"
     );
 
     // `current` points at the old release again...

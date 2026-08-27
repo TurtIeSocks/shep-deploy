@@ -47,6 +47,8 @@ shep-deploy deploy <sheep> --watch auto|manual
 
 `--watch` changes the setting and returns without deploying.
 
+Exit codes follow [shep's own taxonomy](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md): `0` deployed or already up to date, `2` bad arguments, `4` bad configuration, `5` no daemon answered, `1` anything else. **`12` is this dog's own: the deploy was rejected and the previous release was put back.** A script that treats any nonzero code as "the deploy broke" will be wrong about `12`, where the flock is healthy on the old release.
+
 `verify = "probed"` (the default) needs the app to have a `readiness_probe` or `wait_ready`; without one, shep reports a process `Online` for not having died yet, so there is nothing to verify against and the deploy is refused. `verify = "alive"` is the deliberate downgrade: a new process, still running ten seconds later.
 
 ## Security
@@ -60,6 +62,10 @@ Set `user` on the app and the build drops to that user's uid and primary group, 
 shep-deploy warns when it is about to run a build as root with no `user` set. It does not refuse. Whether an app runs without a `user` is shep's call and the operator's, not a deploy dog's.
 
 Nothing else here handles credentials. Git auth is inherited from the user the build runs as, so a private repository works exactly as it does in that user's own shell, and no token passes through any URL or argument this crate builds.
+
+## Platform
+
+Unix only. This is deliberate, not a gap waiting to be filled by accident: the deploy model is `rename(2)` over a symlink, the build's privilege drop is a uid and a gid, and both are Unix concepts the code uses directly rather than through a portability layer. Building on Windows fails with one sentence saying so. Windows support is planned and will be scoped on its own.
 
 ## Status
 

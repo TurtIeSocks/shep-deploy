@@ -23,6 +23,14 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(unix))]
+compile_error!(
+    "shep-deploy is Unix only. This is deliberate rather than an oversight: the deploy model is \
+     rename(2) over a symlink, the build's privilege drop is a uid and a gid, and both are Unix \
+     concepts this crate uses directly rather than through a portability layer. Windows support \
+     is planned and will be scoped separately."
+);
+
 mod build;
 mod daemon;
 mod deploy;
@@ -48,33 +56,122 @@ use crate::paths::Tree;
 use crate::state::{State, Watch};
 
 /// What a direct invocation accepts. Printed on anything else.
-const USAGE: &str = "usage: shep-deploy deploy <sheep> [--watch auto|manual]";
+const USAGE: &str = "\
+usage: shep-deploy <verb> [args]
+
+  deploy <sheep> [--watch auto|manual]   deploy one sheep, or set how it is watched
+  setup <sheep>                          take a sheep over
+  survey                                 report where every sheep stands
+  on-remove                              lifecycle hook; shep runs this itself
+
+Adopted as `deploy`, the same verbs run as `shep deploy <verb> [args]`, and
+`shep deploy <sheep>` deploys one sheep directly. A sheep whose name is one of
+the verbs above is reached with the verb spelled out: `shep deploy deploy survey`.";
+
+/// The exit code for a deploy that was rolled back.
+///
+/// shep's own taxonomy (`docs/specs/shep-v1.md` section 9) runs from 0 to 11
+/// and this is the next free number, claimed rather than invented: a
+/// rollback is a cause shep has no code for, and every cause this dog
+/// shares with shep uses shep's number for it. A script must be able to
+/// tell three outcomes apart, deployed, cleanly reverted, and broke, and
+/// two of those were the same code until Rin ruled otherwise.
+const ROLLED_BACK: u8 = 12;
+
+/// What a parsed argv means to do.
+///
+/// Split out of `main` so the routing decision - which pattern wins when
+/// several could match - is testable on its own. A match that both decides
+/// and acts can only be exercised by actually running the binary.
+#[derive(Debug, PartialEq, Eq)]
+enum Route<'a> {
+    /// No argv at all: the supervised poll loop, per the dog contract.
+    Poll,
+    /// Report where every sheep stands.
+    Survey,
+    /// Deploy the named sheep.
+    Deploy(&'a str),
+    /// Set the named sheep's watch mode.
+    Watch { sheep: &'a str, mode: &'a str },
+    /// Nothing above matched; print [`USAGE`] and exit on the usage code.
+    Usage,
+}
+
+/// Decides what an argv means, without acting on it.
+///
+/// Verb forms are matched before the passthrough arms, deliberately: shep's
+/// dog passthrough strips this dog's own name, so `shep deploy koji` and
+/// `shep-deploy koji` both arrive as `["koji"]`, indistinguishable from a
+/// sheep whose name really is a verb. Checking verbs first means a sheep
+/// named `survey` needs the explicit form, `shep deploy deploy survey`,
+/// which is the escape hatch [`USAGE`] documents rather than a silent trap.
+fn route<'a>(args: &[&'a str]) -> Route<'a> {
+    match args {
+        [] => Route::Poll,
+        ["survey"] => Route::Survey,
+        ["deploy", sheep] => Route::Deploy(sheep),
+        ["deploy", sheep, "--watch", mode] => Route::Watch { sheep, mode },
+        // Reached only through `shep deploy <sheep>`: the passthrough
+        // shipped in shep 0.1.1 and strips the dog's own name, so the
+        // flagship command arrives as a bare sheep name with no verb.
+        // Last, so a verb always wins.
+        [sheep] => Route::Deploy(sheep),
+        [sheep, "--watch", mode] => Route::Watch { sheep, mode },
+        _ => Route::Usage,
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let outcome = match args.as_slice() {
-        // The supervised mode: no argv at all, per the dog contract.
-        [] => {
+    let outcome = match route(&args) {
+        Route::Poll => {
             println!("shep-deploy: the poll loop is not implemented yet");
             return ExitCode::SUCCESS;
         }
-        ["deploy", sheep] => deploy_once(sheep).await,
-        ["deploy", sheep, "--watch", mode] => set_watch(sheep, mode),
-        _ => {
+        Route::Survey => {
+            println!("shep-deploy: survey is not implemented yet");
+            return ExitCode::SUCCESS;
+        }
+        Route::Deploy(sheep) => deploy_once(sheep).await,
+        Route::Watch { sheep, mode } => set_watch(sheep, mode),
+        Route::Usage => {
             eprintln!("{USAGE}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(2);
         }
     };
 
     match outcome {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("shep-deploy: {err}");
-            ExitCode::FAILURE
+            ExitCode::from(code_for(&err))
         }
+    }
+}
+
+/// The exit code for a run that finished, reporting what it finished as.
+const fn code_for_outcome(outcome: &Outcome) -> u8 {
+    match outcome {
+        Outcome::UpToDate | Outcome::Deployed { .. } => 0,
+        Outcome::RolledBack { .. } => ROLLED_BACK,
+    }
+}
+
+/// The exit code for a run that failed.
+///
+/// Every arm but the first is shep's own number for the same cause, so an
+/// operator reading a dog's status does not have to learn a second
+/// vocabulary. Anything with no more specific cause is 1, which is shep's
+/// rule as well.
+fn code_for(err: &Error) -> u8 {
+    match err {
+        Error::RolledBack { .. } => ROLLED_BACK,
+        Error::Config(_) => 4,
+        Error::Connect(_) => 5,
+        _ => 1,
     }
 }
 
@@ -84,20 +181,21 @@ async fn main() -> ExitCode {
 /// Whatever [`deploy::deploy`] returns, plus [`Error::Io`] if the target's
 /// `deploy.toml` cannot be read and [`Error::Connect`] if the shepherd's
 /// socket cannot be reached.
-async fn deploy_once(sheep: &str) -> Result<(), Error> {
+async fn deploy_once(sheep: &str) -> Result<u8, Error> {
     let tree = Tree::for_sheep(&shep_home()?, sheep);
     let mut state = State::read(&tree.state_file())?;
 
     let client = Client::connect(&socket()?).await?;
     let daemon = Live::new(client);
 
-    match deploy::deploy(&daemon, &tree, &mut state).await? {
+    let outcome = deploy::deploy(&daemon, &tree, &mut state).await?;
+    match &outcome {
         Outcome::UpToDate => println!("{sheep} is up to date at {}", deployed(&state)),
         Outcome::Deployed { sha } => println!("{sheep} deployed {sha}"),
         Outcome::RolledBack { to, why } => println!("{sheep} rolled back to {to}: {why}"),
     }
 
-    Ok(())
+    Ok(code_for_outcome(&outcome))
 }
 
 /// Sets `sheep`'s watch mode and returns, without deploying.
@@ -105,7 +203,7 @@ async fn deploy_once(sheep: &str) -> Result<(), Error> {
 /// # Errors
 /// [`Error::Config`] if `mode` is neither `auto` nor `manual`,
 /// [`Error::Io`] if `deploy.toml` cannot be read or written.
-fn set_watch(sheep: &str, mode: &str) -> Result<(), Error> {
+fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
     let watch = match mode {
         "auto" => Watch::Auto,
         "manual" => Watch::Manual,
@@ -133,7 +231,7 @@ fn set_watch(sheep: &str, mode: &str) -> Result<(), Error> {
         );
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// `$SHEP_HOME`, absolute.
@@ -179,5 +277,87 @@ const fn named(watch: Watch) -> &'static str {
     match watch {
         Watch::Auto => "auto",
         Watch::Manual => "manual",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// fails if a rolled-back deploy stops being distinguishable from a
+    /// hard failure by exit status alone. A script running
+    /// `shep deploy web && notify` has three outcomes to tell apart:
+    /// deployed, rejected and cleanly reverted, and broke. Collapsing the
+    /// middle one into either neighbour is what makes "reports a success it
+    /// did not achieve" possible, which is the species of every serious
+    /// finding in the engine plan.
+    #[test]
+    fn a_rollback_has_its_own_code_distinct_from_failure_and_success() {
+        let rolled_back = Error::RolledBack {
+            to: "old-sha".to_owned(),
+            source: Box::new(Error::Build { status: Some(1) }),
+        };
+        assert_eq!(code_for(&rolled_back), ROLLED_BACK);
+        assert_ne!(ROLLED_BACK, 0);
+        assert_ne!(
+            code_for(&rolled_back),
+            code_for(&Error::Build { status: Some(1) })
+        );
+    }
+
+    /// fails if this dog stops joining shep's own exit-code taxonomy and
+    /// starts inventing numbers. These four are shep's, from
+    /// docs/specs/shep-v1.md section 9, and an operator who has learned that
+    /// 5 means "no daemon answered" should not have to learn a second
+    /// meaning for it because a dog chose differently.
+    #[test]
+    fn the_shared_causes_use_sheps_own_numbers() {
+        assert_eq!(code_for(&Error::Config("bad".to_owned())), 4);
+        assert_eq!(code_for(&Error::Protocol("odd".to_owned())), 1);
+        assert_eq!(
+            code_for(&Error::Git {
+                command: "git fetch".to_owned(),
+                status: Some(128),
+                stderr: String::new(),
+            }),
+            1
+        );
+        assert_eq!(code_for(&Error::Build { status: Some(3) }), 1);
+    }
+
+    /// fails if a rollback that happened on the ORDINARY path stops being
+    /// reported. `Outcome::RolledBack` is the common trigger, a verify that
+    /// timed out, and `Error::RolledBack` is the rarer one where something
+    /// failed after the reload. Both mean the requested deploy did not
+    /// happen, so both take the same code; only this one is reached through
+    /// `Ok`.
+    #[test]
+    fn the_ok_rollback_path_reports_the_same_code() {
+        let outcome = Outcome::RolledBack {
+            to: "old-sha".to_owned(),
+            why: "it did not come up".to_owned(),
+        };
+        assert_eq!(code_for_outcome(&outcome), ROLLED_BACK);
+        assert_eq!(code_for_outcome(&Outcome::UpToDate), 0);
+        assert_eq!(
+            code_for_outcome(&Outcome::Deployed {
+                sha: "new".to_owned()
+            }),
+            0
+        );
+    }
+
+    /// fails if a bare sheep name stops routing to a deploy, or if it
+    /// starts shadowing a verb. `shep deploy koji` is the flagship command
+    /// and arrives here as `["koji"]`, with no verb, because the
+    /// passthrough strips the dog's own name.
+    #[test]
+    fn a_bare_name_is_a_deploy_and_a_verb_still_wins() {
+        assert_eq!(route(&["koji"]), Route::Deploy("koji"));
+        assert_eq!(route(&["deploy", "koji"]), Route::Deploy("koji"));
+        assert_eq!(route(&["survey"]), Route::Survey);
+        // The escape hatch for a sheep whose name is a verb.
+        assert_eq!(route(&["deploy", "survey"]), Route::Deploy("survey"));
+        assert_eq!(route(&[]), Route::Poll);
     }
 }
