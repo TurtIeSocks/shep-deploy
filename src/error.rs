@@ -436,33 +436,36 @@ mod tests {
         );
     }
 
-    /// fails if a first deploy that never came up stops naming the sheep,
-    /// the release it is stuck on, or what went wrong. This is the failure
-    /// a new user is most likely to meet, and the message is all they get.
+    /// fails if a release with nothing to roll back to stops naming the
+    /// sheep, the release it is stuck on, or what went wrong. Usually that
+    /// is a first deploy, which is the failure a new user is most likely to
+    /// meet - but a retry after an interrupted deploy reaches it too, so
+    /// the test is named for the variant rather than for one of its causes.
+    /// The message is all an operator gets either way.
     #[test]
-    fn an_unverified_first_release_names_the_sheep_the_sha_and_the_reason() {
+    fn an_unverified_release_names_the_sheep_the_sha_and_the_reason() {
         let err = Error::Unverified {
             sheep: "web".to_owned(),
             sha: "a1b2c3d".to_owned(),
-            why: "it did not come up within 90s of the reload".to_owned(),
+            why: "it did not come up and stay up, 16s after the reload".to_owned(),
         };
         let shown = err.to_string();
         assert!(shown.contains("web"), "{shown}");
         assert!(shown.contains("a1b2c3d"), "{shown}");
-        assert!(shown.contains("did not come up within 90s"), "{shown}");
+        assert!(shown.contains("did not come up and stay up"), "{shown}");
     }
 
-    /// fails if the first-deploy failure starts saying the same thing
-    /// twice. It used to arrive wrapped in `RollbackFailed`, which framed a
-    /// rollback nobody attempted as one that failed, and then said "no
-    /// previous release" and "still pointed at" once each in both layers.
-    /// One sentence, each fact once.
+    /// fails if this failure starts saying the same thing twice. It used to
+    /// arrive wrapped in `RollbackFailed`, which framed a rollback nobody
+    /// attempted as one that failed, and then said "no previous release"
+    /// and "still pointed at" once each in both layers. One sentence, each
+    /// fact once.
     #[test]
-    fn an_unverified_first_release_says_each_fact_once() {
+    fn an_unverified_release_says_each_fact_once() {
         let err = Error::Unverified {
             sheep: "web".to_owned(),
             sha: "a1b2c3d".to_owned(),
-            why: "it did not come up within 90s of the reload".to_owned(),
+            why: "it did not come up and stay up, 16s after the reload".to_owned(),
         };
         let shown = err.to_string();
         assert_eq!(shown.matches("roll back").count(), 1, "{shown}");

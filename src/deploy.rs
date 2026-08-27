@@ -262,12 +262,21 @@ pub async fn deploy<D: Daemon>(
     }
     swap::point_at(&tree.current(), &release)?;
 
-    // THE BOUNDARY. Every fallible step from here on lives inside `land`,
-    // so that this one `match` is the only place that decides what to undo.
-    // It used to sit around a `settle` call with the generation capture
-    // outside it, and that one line outside was enough to leave `current`
-    // on a release nothing had verified: see [`land`].
+    // THE BOUNDARY. Every step from here that can fail and might need
+    // undoing lives inside `land`, so that this one `match` is the only
+    // place that decides what to undo. The boundary used to sit around a
+    // reload-and-verify call with the generation capture outside it, and
+    // that one line outside was enough to leave `current` on a release
+    // nothing had verified: see [`land`].
     match land(daemon, sheep, &app, state.verify).await {
+        // The record write below is the one fallible thing past the swap
+        // that `land` does not own, and it is deliberate rather than a
+        // leak. It runs only after a verify has SUCCEEDED, so the new
+        // release is up and serving: there is nothing to undo, and undoing
+        // it would take a healthy release out of service. What its failure
+        // costs is a record that lags, which the next poll resolves by
+        // deploying the same sha again - wasteful, and safe. That is why it
+        // is a `?` here rather than a `Landed` variant.
         Landed::Verified => {
             state.deployed = Some(head.clone());
             state.write(&tree.state_file())?;
@@ -357,15 +366,20 @@ enum Landed {
 /// Reloads `sheep` onto the release that has just been swapped in, and
 /// waits for the verdict `mode` asks for.
 ///
-/// Every fallible thing a deploy does after the swap happens here, and that
-/// is the point rather than tidiness. This function cannot return an error:
-/// each failure is a [`Landed`] variant, so the caller's `match` is
-/// exhaustive over "what has to be undone" instead of over "what went
-/// wrong", and a step added here later cannot quietly escape the rollback
-/// decision the way `Generation::of` did - one `?` outside the boundary
-/// left `current` on a release nothing had verified, `deploy.toml` on the
-/// old one, no reload ever sent, and any later restart bringing the sheep
-/// up on the unverified release.
+/// Every failure a deploy can meet after the swap AND might have to undo
+/// happens here, and that is the point rather than tidiness. This function
+/// cannot return an error: each failure is a [`Landed`] variant, so the
+/// caller's `match` is exhaustive over "what has to be undone" instead of
+/// over "what went wrong", and a step added here later cannot quietly
+/// escape the rollback decision the way `Generation::of` did - one `?`
+/// outside the boundary left `current` on a release nothing had verified,
+/// `deploy.toml` on the old one, no reload ever sent, and any later restart
+/// bringing the sheep up on the unverified release.
+///
+/// One fallible step past the swap is deliberately NOT here: writing the
+/// record after a successful verify. It has nothing to undo, because by
+/// then the new release is up and serving. `deploy`'s own `Verified` arm
+/// says so where that write is.
 ///
 /// The generation is captured before the reload, and both readings of it
 /// matter: [`crate::verify::wait`] needs to know which processes were
@@ -1978,12 +1992,12 @@ mod tests {
     }
 
     /// fails if an error arriving after the reload gets a lesser rollback
-    /// than a failed verification does. `settle` reloads before it
-    /// verifies, so a `describe` that fails transiently - which
-    /// `verify::wait`'s own doc anticipates - arrives with shep already
-    /// running the new release and the old instance already drained. A swap
-    /// without a reload there leaves the daemon on the new code while both
-    /// signals an operator would check name the old one.
+    /// than a failed verification does. `land` reloads before it verifies,
+    /// so a `describe` that fails transiently - which `verify::wait`'s own
+    /// doc anticipates - arrives with shep already running the new release
+    /// and the old instance already drained. A swap without a reload there
+    /// leaves the daemon on the new code while both signals an operator
+    /// would check name the old one.
     #[tokio::test]
     async fn a_verify_error_after_the_reload_still_reloads_the_rollback() {
         let mut fixture = fixture_with_previous_release();

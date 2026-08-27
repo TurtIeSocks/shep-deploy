@@ -784,6 +784,15 @@ warm across releases but lands the binary outside the release, where
 EOF
 ```
 
+> **Later correction, left outside the quote above because that quote is
+> commit `00ff839` verbatim.** "It runs as the target sheep's user and never
+> as the shepherd's" holds only when the app sets `user`, and nothing refuses
+> a deploy for an app that does not. Rin decided the behaviour stays and the
+> documentation changes: see `src/build.rs`'s module doc, the README's
+> security section, and the spec's security posture, all of which state the
+> condition and the exposure. The build warns when it is about to run as root
+> with no `user` set; it never declines.
+
 ---
 
 ## Task 8: The swap
