@@ -263,8 +263,9 @@ const fn code_for_outcome(outcome: &Outcome) -> u8 {
 
 /// The exit code for a run that failed.
 ///
-/// Every arm but the first is shep's own number for the same cause, so an
-/// operator reading a dog's status does not have to learn a second
+/// The first two arms are this dog's own numbers, for outcomes shep has no
+/// code for. Every arm after them is shep's own number for the same cause, so
+/// an operator reading a dog's status does not have to learn a second
 /// vocabulary. Anything with no more specific cause is 1, which is shep's
 /// rule as well.
 fn code_for(err: &Error) -> u8 {
