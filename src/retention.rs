@@ -90,9 +90,13 @@ pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
         removed.push(sha);
     }
 
-    if !removed.is_empty() {
-        git::worktree_prune(&tree.git())?;
-    }
+    // Unconditionally, not only when this cycle removed something. `prune`
+    // exists for worktrees that vanished by some other means, an operator's
+    // own `rm -rf` or a crash mid-build, and gating it on our own removals
+    // stopped it running in exactly that case. A hand-removed release then
+    // stayed registered, and redeploying that sha failed with "is a missing
+    // but already registered worktree".
+    git::worktree_prune(&tree.git())?;
 
     Ok(removed)
 }
@@ -229,6 +233,29 @@ mod tests {
     /// it leaves the sheep with a `cwd` that resolves to nothing, so the
     /// next restart cannot start it at all, and the deploy that caused it
     /// reported success minutes earlier.
+    /// fails if `prune` only clears git's stale worktree bookkeeping on
+    /// cycles that removed something themselves. `worktree_prune` exists for
+    /// the directory that vanished by some other means, an operator's own
+    /// `rm -rf` or a crash mid-build, and gating it on our own removals
+    /// stopped it running in exactly that case. The sha then stayed
+    /// registered, and redeploying it failed with "is a missing but already
+    /// registered worktree".
+    #[test]
+    fn a_release_removed_by_hand_is_deregistered_even_when_nothing_is_pruned() {
+        let (tree, shas) = fixture_tree_with_releases(2);
+        let orphan = tree.release(&shas[0]);
+        fs::remove_dir_all(&orphan).expect("remove the release by hand");
+
+        // keep is larger than the release count, so nothing is past it and
+        // `removed` comes back empty. That is the case the gate broke.
+        let removed = prune(&tree, 5).expect("prune");
+        assert!(removed.is_empty(), "nothing was past the keep count");
+
+        git::worktree_add(&tree.git(), &orphan, &shas[0])
+            .expect("the sha redeploys after prune cleared its registration");
+        assert!(orphan.is_dir(), "the release is back on disk");
+    }
+
     #[test]
     fn the_live_release_is_never_pruned_whatever_its_age() {
         let all = releases(&["new", "old", "older", "ancient"]);
