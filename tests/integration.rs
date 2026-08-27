@@ -54,6 +54,24 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// [`the_supervised_dog_deploys_a_moved_branch_without_being_asked`].
 const POLL_WINDOW: Duration = Duration::from_secs(20);
 
+/// The default `crate::config` falls back to when a dog cannot name itself,
+/// restated because a test binary cannot see a binary crate's internals.
+///
+/// The assertion below is the whole point. `POLL_WINDOW` sits between a
+/// measured two seconds and this thirty, and that bracket is what makes the
+/// configured interval observable. Lower this toward twenty and the test stops
+/// distinguishing a dog that read its section from one that did not, then
+/// starts flaking, in that order. Neither failure names its cause, so the
+/// relationship is asserted at compile time rather than described.
+const DEFAULT_INTERVAL_SECS: u64 = 30;
+
+const _: () = assert!(
+    POLL_WINDOW.as_secs() + 5 <= DEFAULT_INTERVAL_SECS,
+    "POLL_WINDOW must stay under config::DEFAULT_INTERVAL with room to spare, \
+     or a defaulted dog's next tick can land inside the window and the test \
+     stops telling the two apart"
+);
+
 /// `src/main.rs`'s `ROLLED_BACK`, restated because a test binary cannot see
 /// a binary crate's internals. A change to one without the other fails this
 /// test, which is the point.
