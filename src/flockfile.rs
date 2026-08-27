@@ -73,9 +73,9 @@ pub fn app_config(release: &Path, sheep: &str) -> Result<AppConfig, Error> {
 ///
 /// Read from the same merged document [`app_config`] reads, so the
 /// operator's override wins here too. That is not incidental: `build.env`
-/// routinely names host-specific paths - a shared `CARGO_TARGET_DIR` is the
-/// example the design is built around - and those are exactly the values a
-/// committed file cannot know and an operator has to pin locally.
+/// routinely names host-specific paths - a registry token or a `NODE_ENV`,
+/// say - and those are exactly the values a committed file cannot know and
+/// an operator has to pin locally.
 ///
 /// The block is top-level rather than a key on the app entry, because
 /// `AppConfig` refuses unknown fields: a `build` key inside `[[app]]` would
@@ -436,10 +436,10 @@ mod tests {
     }
 
     /// fails if a declared `[build]` block does not reach the build step.
-    /// `env` and `artifacts` are the two fields the design is built
-    /// around (a shared `CARGO_TARGET_DIR`, and copying the binary it
-    /// produces back into the release), so a block that parsed its command
-    /// and dropped either of those would still break rollback.
+    /// `env` and `artifacts` both matter to a real build - a pinned
+    /// registry token, and a binary the release can't see the build
+    /// producing - so a block that parsed its command and dropped either
+    /// of those would still break rollback.
     #[test]
     fn a_build_block_parses_into_a_spec() {
         let rel = fixture_release(&[(

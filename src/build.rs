@@ -47,13 +47,17 @@
 //!   never moves and the running app is untouched, because it lives in a
 //!   directory the build never touches. This is the part that replaces a
 //!   hardcoded sleep between a build and a restart.
-//! - **`build.artifacts` exists because of `build.env`.** A shared
-//!   `CARGO_TARGET_DIR` keeps Rust compilation warm across releases, which
-//!   matters because a from-scratch Koji build per deploy is not
-//!   acceptable. It does this by moving cargo's entire output tree outside
-//!   the release, so a declared artifact has to be copied back in or
-//!   `script = ./target/release/koji` resolves to nothing and rollback has
-//!   no binary to roll back to.
+//! - **`build.artifacts` exists for a build that writes outside the
+//!   release.** Warm Rust builds do NOT need it: each sheep gets a
+//!   dog-owned cache symlinked in as `target` (see
+//!   [`crate::paths::Tree::cache_target`]), so compilation stays warm
+//!   across releases AND a hardcoded `./target/release/koji` still
+//!   resolves, with nothing copied back. Setting `CARGO_TARGET_DIR`
+//!   instead was measured on 2026-08-26 and rejected: with it set
+//!   `./target` is never created, so Koji's own `make build`, which ends
+//!   in `cp ./target/release/koji koji`, exits 1. `artifacts` remains for
+//!   the builds that genuinely do put their output somewhere the release
+//!   cannot see, including one an operator points elsewhere themselves.
 
 use std::collections::BTreeMap;
 use std::fmt;
