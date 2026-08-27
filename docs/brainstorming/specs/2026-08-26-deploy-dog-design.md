@@ -433,9 +433,20 @@ postinstall scripts are the most common supply-chain vector in the Node
 ecosystem.
 
 **Builds run as the target sheep's `user` and primary group, never as the
-shepherd's.** shep already resolves `user`/`group` per app, so the machinery
-exists. A compromised ReactMap build gets ReactMap's privileges and nothing
-more. This is the single requirement in this section that is not optional.
+shepherd's — when the app sets one.** shep already resolves `user`/`group`
+per app, so the machinery exists. A compromised ReactMap build gets
+ReactMap's privileges and nothing more.
+
+**An app with no `user` gets no drop, and the dog does not refuse it.** This
+was left open when the section was written and is now decided: the build then
+runs as whatever the shepherd runs as, which where the shepherd is root — the
+arrangement recommended below — means repository-supplied build code
+executing as root on every deploy. Refusing those deploys was considered and
+rejected: an app without `user` is a configuration shep itself accepts, and a
+deploy dog is not the place to start declining it. So this is a control an
+operator switches on by setting `user`, not a property of the design, and the
+implementation's module doc says so where somebody configuring an app will
+read it.
 
 Both halves matter, not just the user. The shepherd is commonly run as root
 specifically so it can drop privileges (see the recommendation below); a build

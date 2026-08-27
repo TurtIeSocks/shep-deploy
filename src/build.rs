@@ -7,13 +7,34 @@
 //! single most common supply-chain vector in the Node ecosystem, and
 //! `make build` is arbitrary by construction - there is no way to make
 //! running someone else's build script safe, only ways to bound the damage
-//! when it turns out to be malicious. [`run`] is that bound: the build
-//! never runs with the shepherd's own uid, gid, or supplementary groups,
-//! and a failing build never reaches the swap. Uid alone would not be
-//! enough - the design spec recommends running the shepherd as root
-//! specifically so it can drop privileges, and a child that only dropped
-//! uid would keep root's own gid for the whole build - see [`run`]'s own
-//! doc for the detail.
+//! when it turns out to be malicious. [`run`] is that bound, and how much of
+//! a bound it is depends entirely on one field.
+//!
+//! ## The privilege drop happens only when the app sets `user`
+//!
+//! **With `user` set**, the build runs as that user's uid, primary gid and
+//! nothing else: none of the shepherd's own privilege survives into it. Uid
+//! alone would not be enough - the design spec recommends running the
+//! shepherd as root specifically so it can drop privileges, and a child that
+//! only dropped uid would keep root's own gid for the whole build - see
+//! [`run`]'s own doc for the detail.
+//!
+//! **With `user` unset, which is the default, there is no drop at all.** The
+//! build runs as whatever the shepherd runs as. Where the shepherd is root -
+//! the arrangement its own docs recommend, precisely so that it CAN drop
+//! privileges - a repository's `bun install` postinstall or `make build`
+//! executes as root, with the shepherd's full privilege, on every deploy.
+//! Nothing here refuses that deploy: this crate's job is to run the build the
+//! Flockfile describes, and an app with no `user` is a legitimate
+//! configuration that shep itself accepts.
+//!
+//! That is a deliberate decision by this project's owner rather than an
+//! oversight, and it is stated here in full so an operator can act on it:
+//! **setting `user` on the app is what turns this module's bound on.**
+//! Without it the deploy still works and the failure modes above still hold
+//! - a failing build still never reaches the swap - but "a compromised build
+//! gets the app's privileges and nothing more" is not one of the guarantees
+//! in force.
 //!
 //! Three behaviours worth knowing before reading [`run`]'s body:
 //!
