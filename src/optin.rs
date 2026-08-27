@@ -1399,14 +1399,15 @@ mod tests {
         assert_eq!(daemon.deleted(), vec![7, 8]);
     }
 
-    /// fails if a new instance that never comes up is left registered. The
+    /// fails if a new instance that came up and then died is left
+    /// registered. The
     /// likeliest cause is the one the design names: both instances are
     /// alive at once, so without SO_REUSEPORT the new one cannot bind the
     /// port and dies. Leaving it behind gives the operator a permanently
     /// errored second instance of their app and an old one still serving,
     /// with nothing saying which is which.
     #[tokio::test(start_paused = true)]
-    async fn a_newcomer_that_never_comes_up_is_deleted_and_the_old_one_kept() {
+    async fn a_newcomer_that_dies_during_the_dwell_is_deleted_and_the_old_one_kept() {
         let (daemon, prepared, _dirs) = cutover_fixture_dies_during_dwell().await;
 
         let err = cut_over(&daemon, prepared).await.expect_err("gives up");
@@ -1435,9 +1436,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_newcomer_that_went_online_without_serving_is_still_rejected() {
         let (daemon, prepared, _dirs) = cutover_fixture_online_then_gone().await;
-        cut_over(&daemon, prepared)
+
+        let err = cut_over(&daemon, prepared)
             .await
             .expect_err("the dwell catches it");
+
+        // Which failure, not merely that there was one: the fixture would
+        // also error if the fake stopped answering, and that would pass a
+        // bare `expect_err` while establishing nothing about the dwell.
+        assert!(matches!(err, Error::CutOver { .. }), "{err}");
+        assert!(err.to_string().contains("did not stay up"), "{err}");
     }
 
     /// fails if a newcomer that crash-loops through the dwell is accepted.
@@ -1448,9 +1456,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_newcomer_that_crash_loops_through_the_dwell_is_rejected() {
         let (daemon, prepared, _dirs) = cutover_fixture_crash_looping().await;
-        cut_over(&daemon, prepared)
+
+        let err = cut_over(&daemon, prepared)
             .await
             .expect_err("the pids moved");
+
+        // The pid check, named: a crash-looped newcomer is present at the
+        // same count under a different pid, so this is the branch that has
+        // to fire rather than the restart count beside it.
+        assert!(matches!(err, Error::CutOver { .. }), "{err}");
+        assert!(err.to_string().contains("did not stay up"), "{err}");
     }
 
     /// fails if an abandoned cutover leaves shep's persisted roll naming
@@ -1505,7 +1520,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_refused_start_deletes_nothing() {
         let (daemon, prepared, _dirs) = cutover_fixture_refusing_start().await;
-        cut_over(&daemon, prepared).await.expect_err("refused");
+
+        let err = cut_over(&daemon, prepared).await.expect_err("refused");
+
+        // The shepherd's own refusal, unchanged. An `Error::CutOver` here
+        // would be this crate claiming a cutover was abandoned when none
+        // was ever begun.
+        assert!(matches!(err, Error::Request(_)), "{err}");
         assert!(daemon.deleted().is_empty());
     }
 
@@ -1683,6 +1704,9 @@ mod tests {
         let err = cut_over(&daemon, prepared).await.expect_err("gives up");
 
         assert!(matches!(err, Error::CutOver { .. }), "{err}");
+        // The restart count, specifically. The pid check cannot fire here:
+        // the row the dwell sees is the one phase one adopted.
+        assert!(err.to_string().contains("already restarted"), "{err}");
         assert!(
             !daemon.deleted().contains(&7),
             "the healthy original is kept: {:?}",
@@ -1698,7 +1722,28 @@ mod tests {
     async fn the_record_advances_only_after_the_newcomer_is_online() {
         let (daemon, prepared, _dirs) = cutover_fixture_never_appears().await;
         let path = prepared.tree.state_file();
-        cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        assert!(matches!(err, Error::CutOver { .. }), "{err}");
         assert_eq!(State::read(&path).expect("reads").deployed, None);
+    }
+
+    /// fails if a cutover that DID land stops recording what it landed, or
+    /// answers with a sha that is not the one under `current`. The negative
+    /// is pinned next door and the positive was not, so both lines writing
+    /// the record could be deleted with the suite still green - and the
+    /// state they leave, a cut-over sheep whose record names no release, is
+    /// what makes `shep deploy` report success for a release nothing served.
+    #[tokio::test(start_paused = true)]
+    async fn the_record_and_the_answer_name_the_release_that_was_cut_over() {
+        let (daemon, prepared, _dirs) = cutover_fixture().await;
+        let path = prepared.tree.state_file();
+        let expected = prepared.sha.clone();
+
+        let sha = cut_over(&daemon, prepared).await.expect("cuts over");
+
+        assert_eq!(sha, expected, "the sha it answers with");
+        assert_eq!(State::read(&path).expect("reads").deployed, Some(expected));
     }
 }
