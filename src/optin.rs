@@ -816,7 +816,8 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
         write_target(home.path(), "bpm", Watch::Auto, Some("old"));
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let err = prepare(&daemon, home.path(), "bpm")
             .await
@@ -835,7 +836,8 @@ mod tests {
     async fn the_pre_adoption_cwd_and_script_are_recorded() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let prepared = prepare(&daemon, home.path(), "bpm")
             .await
@@ -856,7 +858,8 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
         git_in(checkout.path(), &["checkout", "-q", "-b", "stable"]);
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let prepared = prepare(&daemon, home.path(), "bpm")
             .await
@@ -873,7 +876,8 @@ mod tests {
         let checkout = checkout_with_commit();
         std::fs::write(checkout.path().join(".gitignore"), "local.json\n").expect("write");
         std::fs::write(checkout.path().join("local.json"), "{}").expect("write");
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let prepared = prepare(&daemon, home.path(), "bpm")
             .await
@@ -898,7 +902,8 @@ mod tests {
         let checkout = checkout_with_commit();
         let head = head_sha(checkout.path());
         git_in(checkout.path(), &["checkout", "-q", &head]);
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let err = prepare(&daemon, home.path(), "bpm")
             .await
@@ -1228,7 +1233,8 @@ mod tests {
     ) -> (CutOverDouble, Prepared, Dirs) {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        let roll = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let roll = RollOf(&entries);
         let prepared = prepare(&roll, home.path(), "bpm").await.expect("prepares");
 
         (
@@ -1643,7 +1649,8 @@ mod tests {
         write_target(home.path(), "bpm", Watch::Auto, Some("old"));
         let tree = Tree::for_sheep(home.path(), "bpm");
         std::fs::write(tree.state_file(), "this is not toml = = =").expect("corrupt the record");
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let err = prepare(&daemon, home.path(), "bpm")
             .await
@@ -1678,7 +1685,8 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
         write_target(home.path(), "bpm", Watch::Auto, None);
-        let daemon = RollOf(&[("bpm", checkout.path())]);
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
 
         let err = prepare(&daemon, home.path(), "bpm")
             .await
