@@ -18,12 +18,35 @@ use crate::state::{State, Watch};
 /// Where one sheep stands with respect to this dog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Standing {
-    /// Already a target, polled for new commits.
+    /// Already a target, polled for new commits, with nothing held back.
     Watched {
         /// The branch it tracks.
         branch: String,
         /// The sha it is deployed at, or `None` before its first deploy.
         sha: Option<String>,
+    },
+    /// Already a target and watched, holding one commit that did not land.
+    ///
+    /// Not broken and not paused by anybody. `watch` is still `auto` and a
+    /// newer commit deploys as usual; what the loop is declining to do is
+    /// attempt THAT sha again, having already built it, swapped to it and
+    /// rolled it back once. See [`crate::state::State::failed`].
+    ///
+    /// Watched-with-a-hold rather than a variant of watched, because those
+    /// two are the rows an operator most needs to tell apart: one has
+    /// nothing to do and the other has been stuck since somebody pushed.
+    ///
+    /// Read from the record alone. This module never fetches - it is
+    /// read-only end to end - so a hold that a push has already cleared
+    /// still shows here until the tick that deploys the newer commit.
+    Held {
+        /// The branch it tracks.
+        branch: String,
+        /// The sha it is deployed at - what is still serving - or `None`
+        /// before its first deploy.
+        sha: Option<String>,
+        /// The sha that did not land, which the loop is leaving alone.
+        failed: String,
     },
     /// Already a target, deployed only when asked.
     Manual {
@@ -54,10 +77,20 @@ pub enum Standing {
 pub fn classify(shep_home: &Path, app: &AppConfig) -> Standing {
     let tree = Tree::for_sheep(shep_home, &app.name);
     if let Ok(state) = State::read(&tree.state_file()) {
-        let (branch, sha) = (state.branch.clone(), state.deployed.clone());
-        return match state.watch {
-            Watch::Auto => Standing::Watched { branch, sha },
-            Watch::Manual => Standing::Manual { branch, sha },
+        let (branch, sha) = (state.branch, state.deployed);
+        // A hold is only reported for a target something polls. `failed`
+        // is written by an operator's own deploy too, and for a manual
+        // target it changes nothing at all - the next `shep deploy` retries
+        // that sha deliberately - so calling it "held" would name a
+        // restraint that is not there.
+        return match (state.watch, state.failed) {
+            (Watch::Auto, Some(failed)) => Standing::Held {
+                branch,
+                sha,
+                failed,
+            },
+            (Watch::Auto, None) => Standing::Watched { branch, sha },
+            (Watch::Manual, _) => Standing::Manual { branch, sha },
         };
     }
 
@@ -114,6 +147,7 @@ impl Standing {
     fn label(&self) -> &'static str {
         match self {
             Self::Watched { .. } => "watched",
+            Self::Held { .. } => "held",
             Self::Manual { .. } => "manual",
             Self::NeedsSetup => "needs setup",
             Self::Eligible => "eligible",
@@ -130,6 +164,20 @@ impl Standing {
                     at(branch, sha.as_deref())
                 )
             }
+            // Says all four things, because leaving any of them out is how
+            // this row gets read as "the dog has stopped": what is still
+            // serving, which commit is held, that the commit is the reason
+            // rather than the dog, and that a push fixes it.
+            Self::Held {
+                branch,
+                sha,
+                failed,
+            } => format!(
+                "{}, holding {} after it did not land; a newer commit or a landing deploy \
+                 clears it",
+                at(branch, sha.as_deref()),
+                short(failed)
+            ),
             Self::Manual { branch, sha } => {
                 format!("{}, deploys only when asked", at(branch, sha.as_deref()))
             }
@@ -141,15 +189,20 @@ impl Standing {
 }
 
 /// `main@a1b2c3`, or just the branch for a target with no deploy yet.
+fn at(branch: &str, sha: Option<&str>) -> String {
+    sha.map_or_else(
+        || format!("{branch}, not deployed yet"),
+        |sha| format!("{branch}@{}", short(sha)),
+    )
+}
+
+/// A sha as a listing shows it: the first six characters.
 ///
 /// `get`, not a slice: a hand-edited `deploy.toml` carrying a sha shorter
 /// than six characters must degrade to that shorter string rather than
 /// panic in the middle of a listing.
-fn at(branch: &str, sha: Option<&str>) -> String {
-    sha.map_or_else(
-        || format!("{branch}, not deployed yet"),
-        |sha| format!("{branch}@{}", sha.get(..6).unwrap_or(sha)),
-    )
+fn short(sha: &str) -> &str {
+    sha.get(..6).unwrap_or(sha)
 }
 
 /// The whole flock, classified and rendered.
@@ -196,7 +249,13 @@ mod tests {
     /// Writes `<home>/deploy/<sheep>/deploy.toml` through `State::write`, so
     /// the fixture and the real reader agree by construction rather than by
     /// a hand-written string that can drift.
-    fn write_target(home: &Path, sheep: &str, watch: Watch, sha: Option<&str>) {
+    fn write_target(
+        home: &Path,
+        sheep: &str,
+        watch: Watch,
+        sha: Option<&str>,
+        failed: Option<&str>,
+    ) {
         let tree = Tree::for_sheep(home, sheep);
         std::fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
@@ -204,7 +263,7 @@ mod tests {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
             deployed: sha.map(str::to_owned),
-            failed: None,
+            failed: failed.map(str::to_owned),
             verify: crate::state::Verify::default(),
             watch,
             origin_cwd: None,
@@ -280,7 +339,13 @@ mod tests {
     fn an_existing_target_reports_its_watch_mode_not_its_eligibility() {
         let home = tempfile::tempdir().expect("tempdir");
         let current = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "bpm", Watch::Manual, Some("a1b2c3d4e5f6"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Manual,
+            Some("a1b2c3d4e5f6"),
+            None,
+        );
 
         let standing = classify(home.path(), &app("bpm", current.path().to_str()));
         assert!(matches!(standing, Standing::Manual { .. }), "{standing:?}");
@@ -325,6 +390,68 @@ mod tests {
         ));
     }
 
+    /// fails if a target holding a commit that did not land reads as one
+    /// that is simply up to date. It is the same row today: the sha shown
+    /// is the one still serving, and the reason says it deploys on every
+    /// new commit, so a target that has been stuck since yesterday and one
+    /// that has nothing to do are the same three columns.
+    ///
+    /// Asserted on the words rather than on the variant, because the words
+    /// are what an operator reads and the variant is not.
+    #[test]
+    fn a_held_target_says_what_it_is_holding_and_what_clears_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let current = tempfile::tempdir().expect("tempdir");
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("a1b2c3d4e5f6"),
+            Some("d4e5f6a7b8c9"),
+        );
+
+        let row = render(&[(
+            "bpm".to_owned(),
+            classify(home.path(), &app("bpm", current.path().to_str())),
+        )]);
+
+        assert!(row.contains("held"), "{row}");
+        assert!(row.contains("a1b2c3"), "what is still serving: {row}");
+        assert!(row.contains("d4e5f6"), "what it is holding: {row}");
+        assert!(row.contains("did not land"), "why it is holding: {row}");
+        assert!(row.contains("newer commit"), "what clears it: {row}");
+        assert!(
+            !row.contains("deploys on every new commit"),
+            "that is the line this row is not: {row}"
+        );
+    }
+
+    /// fails if a manual target with a failed sha is reported as holding.
+    /// The hold is the poll loop's and nothing polls a manual target, so
+    /// there is no restraint to describe: an operator asking by name
+    /// retries that same commit deliberately. "Holding" would name a thing
+    /// that is not happening to them.
+    #[test]
+    fn a_manual_target_with_a_failed_sha_is_still_manual() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let current = tempfile::tempdir().expect("tempdir");
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Manual,
+            Some("a1b2c3d4e5f6"),
+            Some("d4e5f6a7b8c9"),
+        );
+
+        let row = render(&[(
+            "bpm".to_owned(),
+            classify(home.path(), &app("bpm", current.path().to_str())),
+        )]);
+
+        assert!(row.contains("only when asked"), "{row}");
+        assert!(!row.contains("held"), "{row}");
+    }
+
     /// fails if the rendered table stops naming every standing, or stops
     /// reading as columns. This is the entire output of a command whose
     /// only job is to be read, and an exact string is what keeps a later
@@ -340,6 +467,21 @@ mod tests {
                     sha: Some("a1b2c3d4e5f6".to_owned()),
                 },
             ),
+            (
+                "koji-staging".to_owned(),
+                Standing::Manual {
+                    branch: "main".to_owned(),
+                    sha: Some("a1b2c3d4e5f6".to_owned()),
+                },
+            ),
+            (
+                "reactmap-eu".to_owned(),
+                Standing::Held {
+                    branch: "main".to_owned(),
+                    sha: Some("a1b2c3d4e5f6".to_owned()),
+                    failed: "d4e5f6a7b8c9".to_owned(),
+                },
+            ),
             ("reactmap".to_owned(), Standing::NeedsSetup),
             ("koji".to_owned(), Standing::Eligible),
             (
@@ -349,10 +491,13 @@ mod tests {
         ];
         assert_eq!(
             render(&rows),
-            "bpm       watched       main@a1b2c3, deploys on every new commit\n\
-             reactmap  needs setup   a git checkout that ships a Flockfile\n\
-             koji      eligible      a git checkout, nothing declares a deploy\n\
-             legacy    not eligible  /opt/legacy is not a git repository\n"
+            "bpm           watched       main@a1b2c3, deploys on every new commit\n\
+             koji-staging  manual        main@a1b2c3, deploys only when asked\n\
+             reactmap-eu   held          main@a1b2c3, holding d4e5f6 after it did not land; a \
+             newer commit or a landing deploy clears it\n\
+             reactmap      needs setup   a git checkout that ships a Flockfile\n\
+             koji          eligible      a git checkout, nothing declares a deploy\n\
+             legacy        not eligible  /opt/legacy is not a git repository\n"
         );
     }
 
