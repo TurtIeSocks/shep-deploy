@@ -722,10 +722,20 @@ fn a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves() {
         "current must be back on the release that works"
     );
 
-    // ...deploy.toml still names it, never the release that failed...
+    // ...deploy.toml still names it as what is deployed, never the release
+    // that failed. The failed sha IS in the file, as the sha the poll loop
+    // holds on until the branch moves, so this asks about the key rather
+    // than about the file.
     let state = fs::read_to_string(shepherd.home().join("deploy/web/deploy.toml")).expect("state");
-    assert!(state.contains(&first), "{state}");
-    assert!(!state.contains(&second), "{state}");
+    assert!(
+        state.contains(&format!("deployed = \"{first}\"")),
+        "{state}"
+    );
+    assert!(
+        !state.contains(&format!("deployed = \"{second}\"")),
+        "{state}"
+    );
+    assert!(state.contains(&format!("failed = \"{second}\"")), "{state}");
 
     // ...and the process the shepherd is supervising is running the old
     // release's code. This is the assertion that fails before generation
