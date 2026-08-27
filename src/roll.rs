@@ -35,14 +35,12 @@ use crate::error::Error;
 
 /// The roll's envelope, mirrored down to the one field this crate reads.
 #[derive(Deserialize)]
-#[cfg_attr(not(test), expect(dead_code))]
 struct Roll {
     apps: Vec<Entry>,
 }
 
 /// One sheep's entry. `instances_running` is shep-daemon's and unused here.
 #[derive(Deserialize)]
-#[cfg_attr(not(test), expect(dead_code))]
 struct Entry {
     app: AppConfig,
 }
@@ -55,8 +53,6 @@ struct Entry {
 /// # Errors
 /// Whatever [`Daemon::save_roll`] returns, plus [`Error::Io`] naming the
 /// roll if it cannot be read and [`Error::Config`] if it cannot be parsed.
-// The survey and opt-in are the callers; neither exists yet.
-#[expect(dead_code)]
 pub async fn registered<D: Daemon>(daemon: &D) -> Result<BTreeMap<String, AppConfig>, Error> {
     let path = daemon.save_roll().await?;
     let text = fs::read_to_string(&path).map_err(|source| Error::Io {
@@ -70,7 +66,6 @@ pub async fn registered<D: Daemon>(daemon: &D) -> Result<BTreeMap<String, AppCon
 ///
 /// # Errors
 /// [`Error::Config`] naming `path` and the likeliest cause.
-#[cfg_attr(not(test), expect(dead_code))]
 fn read(path: &Path, text: &str) -> Result<BTreeMap<String, AppConfig>, Error> {
     parse(text).map_err(|source| {
         Error::Config(format!(
@@ -88,7 +83,6 @@ fn read(path: &Path, text: &str) -> Result<BTreeMap<String, AppConfig>, Error> {
 ///
 /// # Errors
 /// [`serde_json::Error`] if the text is not a roll this crate understands.
-#[cfg_attr(not(test), expect(dead_code))]
 fn parse(text: &str) -> Result<BTreeMap<String, AppConfig>, serde_json::Error> {
     let roll: Roll = serde_json::from_str(text)?;
     Ok(roll

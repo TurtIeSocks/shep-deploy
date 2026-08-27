@@ -126,10 +126,8 @@ pub trait Daemon {
     ///
     /// # Errors
     /// As [`Self::dog_config`].
-    // Called by `crate::roll::registered`, which reads the file this
-    // writes. That function itself has no caller yet - the survey and
-    // opt-in are plan two - so this is dead until one of them lands.
-    #[expect(dead_code)]
+    // Called by `crate::roll::registered`, which `crate::survey::survey`
+    // calls in turn.
     async fn save_roll(&self) -> Result<PathBuf, Error>;
 }
 

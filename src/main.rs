@@ -16,10 +16,12 @@
 //! ```text
 //! shep-deploy deploy <sheep>
 //! shep-deploy deploy <sheep> --watch auto|manual
+//! shep-deploy survey
 //! ```
 //!
 //! `--watch` changes one setting and returns without deploying. See
-//! [`deploy::set_watch`].
+//! [`deploy::set_watch`]. `survey` reports where every registered sheep
+//! stands and touches nothing; see [`survey::survey`].
 
 #![forbid(unsafe_code)]
 
@@ -43,6 +45,7 @@ mod retention;
 mod roll;
 mod shared;
 mod state;
+mod survey;
 mod swap;
 mod verify;
 
@@ -134,10 +137,7 @@ async fn main() -> ExitCode {
             println!("shep-deploy: the poll loop is not implemented yet");
             return ExitCode::SUCCESS;
         }
-        Route::Survey => {
-            println!("shep-deploy: survey is not implemented yet");
-            return ExitCode::SUCCESS;
-        }
+        Route::Survey => survey_once().await,
         Route::Deploy(sheep) => deploy_once(sheep).await,
         Route::Watch { sheep, mode } => set_watch(sheep, mode),
         Route::Usage => {
@@ -200,6 +200,19 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
     }
 
     Ok(code_for_outcome(&outcome))
+}
+
+/// Reports where every registered sheep stands, and touches nothing.
+///
+/// # Errors
+/// [`Error::Io`] if `$SHEP_HOME` cannot be resolved, and whatever
+/// [`survey::survey`] returns.
+async fn survey_once() -> Result<u8, Error> {
+    let client = Client::connect(&socket()?).await?;
+    let daemon = Live::new(client);
+
+    print!("{}", survey::survey(&daemon, &shep_home()?).await?);
+    Ok(0)
 }
 
 /// Sets `sheep`'s watch mode and returns, without deploying.

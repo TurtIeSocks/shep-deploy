@@ -18,6 +18,47 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::error::Error;
+
+/// Every sheep that is a deploy target, by name.
+///
+/// A target is a directory under `<shep_home>/deploy` holding a
+/// `deploy.toml`. Reading the directory rather than a list held anywhere
+/// else is what makes a tree self-describing: it survives the dog being
+/// rehomed, re-adopted under a different name, or replaced by a different
+/// deploy dog entirely, which is the same reasoning that put per-target
+/// state in the tree instead of in `[dog.<name>]`.
+///
+/// # Errors
+/// [`Error::Io`], naming `<shep_home>/deploy`, if it exists but cannot be
+/// listed. An absent directory is an empty list, not an error: that is
+/// every shepherd with no targets yet.
+#[expect(dead_code)]
+pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
+    let root = shep_home.join("deploy");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(Error::Io { path: root, source }),
+    };
+
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::Io {
+            path: root.clone(),
+            source,
+        })?;
+        if !entry.path().join("deploy.toml").is_file() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            found.push(name.to_owned());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// The deploy tree for one sheep.
 ///
 /// Holds only the tree's root; every other path is derived from it on

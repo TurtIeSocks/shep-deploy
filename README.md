@@ -43,9 +43,10 @@ The sheep's `cwd` is `current`, permanently. Set it explicitly when you register
 ```sh
 shep-deploy deploy <sheep>
 shep-deploy deploy <sheep> --watch auto|manual
+shep-deploy survey
 ```
 
-`--watch` changes the setting and returns without deploying.
+`--watch` changes the setting and returns without deploying. `survey` reports where every sheep stands and starts, registers and writes nothing.
 
 Exit codes follow [shep's own taxonomy](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md): `0` deployed or already up to date, `2` bad arguments, `4` bad configuration, `5` no daemon answered, `1` anything else. **`12` is this dog's own: the deploy was rejected and the previous release was put back.** A script that treats any nonzero code as "the deploy broke" will be wrong about `12`, where the flock is healthy on the old release.
 
