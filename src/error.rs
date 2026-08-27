@@ -91,7 +91,13 @@ pub enum Error {
         source: Box<Error>,
     },
     /// A rollback put `current` and `deploy.toml` back, and then could not
-    /// get the shepherd to reload onto them.
+    /// confirm a reload onto them.
+    ///
+    /// "Could not confirm" rather than "was refused", because both reach
+    /// here and they are not the same: the shepherd can decline the reload
+    /// outright, or it can accept one whose reply never comes back. Either
+    /// way this crate does not know which release the running instances are
+    /// on, which is the whole of what the message has to convey.
     ///
     /// The one state this crate cannot repair on its own, and it is named
     /// rather than glossed: the filesystem and the record agree with each
@@ -200,8 +206,8 @@ impl fmt::Display for Error {
                 source,
             } => write!(
                 f,
-                "{sheep}: {why}, so it was rolled back to {on} - but the shepherd would not \
-                 reload onto it ({source}). current and deploy.toml both name {on}; one or more \
+                "{sheep}: {why}, so it was rolled back to {on} - but no reload onto it could be \
+                 confirmed ({source}). current and deploy.toml both name {on}; one or more \
                  instances may still be running {running}. The reload that blocked this one has \
                  to finish first: a `stopping` row in `shep flock` means it is still draining, \
                  but the earlier part of a swap shows no row of its own, so wait for the pids in \

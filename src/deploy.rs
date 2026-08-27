@@ -326,6 +326,12 @@ pub async fn deploy<D: Daemon>(
 /// `current` back restores the machine exactly. After it, a process may be
 /// running the new release, and a symlink moving back does not move a
 /// running process.
+///
+/// That question is NOT the same as whether the reload request returned an
+/// error, and reading it off `Result::is_err` was wrong in the direction
+/// that leaves a machine split: see [`never_reached_the_shepherd`]. Only a
+/// failure that is known to have happened before the shepherd could act
+/// counts as [`Self::NotStarted`].
 enum Landed {
     /// The flock turned over and the new release is serving.
     Verified,
@@ -373,7 +379,11 @@ async fn land<D: Daemon>(daemon: &D, sheep: &str, app: &AppConfig, mode: Verify)
     let patience = budget(app, before.instances());
 
     if let Err(source) = daemon.reload(sheep).await {
-        return Landed::NotStarted(source);
+        return if never_reached_the_shepherd(&source) {
+            Landed::NotStarted(source)
+        } else {
+            Landed::Failed { source, patience }
+        };
     }
     // After the RPC returns, so "{n}s after the reload" is measured from
     // the reload rather than from a request before it.
@@ -393,6 +403,48 @@ async fn land<D: Daemon>(daemon: &D, sheep: &str, app: &AppConfig, mode: Verify)
         },
         Err(source) => Landed::Failed { source, patience },
     }
+}
+
+/// Whether a failed reload request definitely never started a swap.
+///
+/// An allowlist, not a denylist, and that direction is the whole of the
+/// decision: being wrong here in the "nothing started" direction leaves a
+/// process running the new release with `current` pointed back at the old
+/// one and no reload ever sent, which is the split state
+/// [`Error::Split`] exists to name. Being wrong the other way costs one
+/// needless reload of a healthy sheep. So anything not known to have failed
+/// before the shepherd could act is treated as though it might have acted.
+///
+/// Two shapes qualify, both from [`RequestError`]'s own documented meaning:
+///
+/// - `Rpc`, which is "the daemon accepted the request and answered it with a
+///   structured error". shep answers a reload with an ACCEPTANCE before it
+///   spawns anything (`handle_reload` refuses on the presence of the map key
+///   first), so an error answer means no swap began. This is the case
+///   `ReloadInFlight` arrives as.
+/// - `Wire`, which is the request body failing to encode. It never left this
+///   process.
+///
+/// Everything else is ambiguous and is treated as an acceptance that may
+/// have happened. `Timeout` is "no reply within the deadline plus
+/// `DEADLINE_GRACE`", five seconds and two, which is a real window in which
+/// the shepherd can have accepted and begun spawning from the new `current`.
+/// `Closed` is the connection dropping before the reply arrived, which says
+/// nothing about whether the request was acted on. [`Error::Protocol`] means
+/// the shepherd answered SOMETHING, so it processed the request, and a
+/// daemon answering the wrong variant tells us nothing about what it did.
+/// `RequestError` is `#[non_exhaustive]`, so a variant added later lands in
+/// the same fail-safe direction rather than in this list.
+///
+/// [`is_retryable`] draws its own line in the same place for the same
+/// reason, and the two disagreeing is what let this through: the rollback's
+/// reload already treated `Timeout` as "might yet clear" while the deploy's
+/// reload treated it as "never happened".
+fn never_reached_the_shepherd(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Request(RequestError::Rpc(_) | RequestError::Wire(_))
+    )
 }
 
 /// Puts `current` back after a deploy that never started anything.
@@ -989,6 +1041,12 @@ mod tests {
         /// Whether the deploy's OWN reload is refused too, rather than only
         /// the rollback's.
         refuse_from_the_first: Cell<bool>,
+        /// How many reloads LAND and then answer a transport error - the
+        /// reply lost rather than the request refused. The swap goes ahead
+        /// each time, so the flock turns over exactly as it would have; all
+        /// the caller learns is that no answer came back. `u32::MAX` never
+        /// stops losing them.
+        replies_lost: Cell<u32>,
         /// Every `reload` call, refused ones included - which is how a test
         /// can see whether something was retried.
         attempts: Cell<u32>,
@@ -1023,6 +1081,7 @@ mod tests {
                 refusals: Cell::new(0),
                 refusal_code: RpcErrorCode::Internal,
                 refuse_from_the_first: Cell::new(false),
+                replies_lost: Cell::new(0),
                 attempts: Cell::new(0),
                 flapping: false,
                 instances: 1,
@@ -1124,6 +1183,20 @@ mod tests {
         /// The same shepherd, running `instances` instances.
         fn running(self, instances: u32) -> Self {
             Self { instances, ..self }
+        }
+
+        /// A shepherd whose next `count` reloads are accepted and acted on
+        /// with their replies never coming back: `Timeout` after the swap
+        /// has already begun.
+        ///
+        /// The window is real rather than theoretical - `DEFAULT_DEADLINE`
+        /// is five seconds and `DEADLINE_GRACE` two, and a reload of
+        /// several instances outlives both by design, which is why shep
+        /// answers it as an acceptance in the first place.
+        fn losing_replies(count: u32) -> Self {
+            let shepherd = Self::ready();
+            shepherd.replies_lost.set(count);
+            shepherd
         }
 
         /// A shepherd that has never heard of this sheep: every reload
@@ -1232,6 +1305,16 @@ mod tests {
                 })));
             }
             self.reloads.set(self.reloads.get() + 1);
+
+            let lost = self.replies_lost.get();
+            if lost > 0 {
+                if lost != u32::MAX {
+                    self.replies_lost.set(lost - 1);
+                }
+                return Err(Error::Request(RequestError::Timeout {
+                    after: Duration::from_secs(7),
+                }));
+            }
             Ok(())
         }
         async fn restart(&self, _sheep: &str) -> Result<(), Error> {
@@ -1491,7 +1574,10 @@ mod tests {
         assert!(matches!(err, Error::Split { .. }), "{err:?}");
         let shown = err.to_string();
         assert!(!shown.contains("rolling back after"), "{shown}");
-        assert!(shown.contains("would not reload onto it"), "{shown}");
+        assert!(
+            shown.contains("no reload onto it could be confirmed"),
+            "{shown}"
+        );
         assert!(shown.contains(&previous), "{shown}");
         assert!(shown.contains(&second), "{shown}");
         assert!(shown.contains("shep reload web"), "{shown}");
@@ -1719,6 +1805,110 @@ mod tests {
             "current must not be left on a release nothing verified"
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a reload whose REPLY was lost is treated as one that never
+    /// happened. `Timeout` is "no reply within the deadline plus
+    /// `DEADLINE_GRACE`" - five seconds and two - and shep answers a reload
+    /// as an acceptance precisely because a real one outlives that. So the
+    /// shepherd can have accepted it and begun spawning from the new
+    /// `current` before the client gave up waiting.
+    ///
+    /// Sent down the "nothing was started" path, that becomes a genuinely
+    /// split machine reported as a bare transport error: `current` and
+    /// `deploy.toml` on the old release, the flock running the new one, and
+    /// no reload ever sent onto the old release.
+    #[tokio::test(start_paused = true)]
+    async fn a_reload_whose_reply_is_lost_is_rolled_back() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+        // The deploy's own reply is lost; the rollback's gets through.
+        let daemon = Shepherd::losing_replies(1);
+
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("no reply came back");
+
+        // Rolled back, not shrugged off: the deploy failed, and the error
+        // says what is live again with the timeout still underneath it.
+        assert!(matches!(err, Error::RolledBack { .. }), "{err:?}");
+        assert!(
+            matches!(
+                err.source()
+                    .and_then(<dyn core::error::Error>::downcast_ref),
+                Some(Error::Request(RequestError::Timeout { .. }))
+            ),
+            "{err:?}"
+        );
+        // The deploy's own reload, and the rollback's onto the old release.
+        // The second is the one the "nothing started" path never sent.
+        assert_eq!(daemon.attempt_count(), 2);
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a rollback whose own reload is never confirmed stops
+    /// reporting the split state. This is the arm that had no test at any
+    /// tier until the fake learned to lose a reply: `restore` swaps back,
+    /// corrects the record, and then cannot get an answer about the reload
+    /// for the whole budget, so which release the instances are on is
+    /// genuinely unknown.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_that_is_never_confirmed_reports_the_split_state() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+
+        let err = deploy(
+            &Shepherd::losing_replies(u32::MAX),
+            &fixture.tree,
+            &mut fixture.state,
+        )
+        .await
+        .expect_err("no reload is ever confirmed");
+
+        assert!(matches!(err, Error::Split { .. }), "{err:?}");
+        let shown = err.to_string();
+        assert!(shown.contains("could be confirmed"), "{shown}");
+        assert!(shown.contains(&previous), "{shown}");
+        // The two things this crate controls still agree with each other.
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if the "did it start" question stops being read off the error
+    /// shape. Only a failure that is known to have happened before the
+    /// shepherd could act counts, because being wrong that way leaves a
+    /// split machine while being wrong the other way costs one needless
+    /// reload of a healthy sheep.
+    #[test]
+    fn only_a_definite_refusal_counts_as_never_started() {
+        let rpc = Error::Request(RequestError::Rpc(RpcError {
+            code: RpcErrorCode::Internal,
+            message: "web is already being reloaded".to_owned(),
+        }));
+        assert!(never_reached_the_shepherd(&rpc));
+
+        // Ambiguous: the shepherd may have accepted and acted.
+        assert!(!never_reached_the_shepherd(&Error::Request(
+            RequestError::Timeout {
+                after: Duration::from_secs(7)
+            }
+        )));
+        assert!(!never_reached_the_shepherd(&Error::Request(
+            RequestError::Closed
+        )));
+        // It answered something, so it processed the request.
+        assert!(!never_reached_the_shepherd(&Error::Protocol(
+            "a Flock in answer to Reload".to_owned()
+        )));
     }
 
     /// fails if a refusal of the deploy's OWN reload is treated as though
