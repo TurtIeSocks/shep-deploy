@@ -244,6 +244,7 @@ pub async fn deploy<D: Daemon>(
     if !release.exists() {
         git::worktree_add(&tree.git(), &release, &head)?;
     }
+    shared::link_cache(&release, &tree.cache_target())?;
     shared::link_into(
         &release,
         &state.checkout,

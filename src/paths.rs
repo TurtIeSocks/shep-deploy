@@ -83,6 +83,27 @@ impl Tree {
     pub fn state_file(&self) -> PathBuf {
         self.root.join("deploy.toml")
     }
+
+    /// The dog's own build cache for this sheep, shared by every release.
+    ///
+    /// Outside `releases/` deliberately: retention removes worktrees under
+    /// there, and a cache swept up with one would turn the next deploy into
+    /// a from-scratch build.
+    #[must_use]
+    pub fn cache(&self) -> PathBuf {
+        self.root.join("cache")
+    }
+
+    /// The directory every release's `target` symlink points at.
+    ///
+    /// Named `target` rather than pointed at by `CARGO_TARGET_DIR` because
+    /// setting that variable means `./target` is never created, and a build
+    /// command ending in `cp ./target/release/koji koji` then exits 1.
+    /// Measured, and the reason this is a symlink at all.
+    #[must_use]
+    pub fn cache_target(&self) -> PathBuf {
+        self.cache().join("target")
+    }
 }
 
 #[cfg(test)]
@@ -127,5 +148,31 @@ mod tests {
         let a = Tree::for_sheep(Path::new("/srv/shep"), "bpm");
         let b = Tree::for_sheep(Path::new("/srv/shep"), "ctm");
         assert_ne!(a.state_file(), b.state_file());
+    }
+
+    /// fails if the cache moves out of the tree or changes name. Every
+    /// release symlinks `target` at this one path, so a release built
+    /// against a cache at one location and a later release linking another
+    /// would silently lose every incremental artifact between them, which
+    /// reads as "the build is just slow today".
+    #[test]
+    fn the_build_cache_lives_in_the_tree() {
+        let tree = Tree::for_sheep(Path::new("/srv/shep"), "koji");
+        assert_eq!(tree.cache(), Path::new("/srv/shep/deploy/koji/cache"));
+        assert_eq!(
+            tree.cache_target(),
+            Path::new("/srv/shep/deploy/koji/cache/target")
+        );
+    }
+
+    /// fails if the cache is ever placed inside `releases/`. It has to
+    /// outlive every release it serves: retention removes worktrees under
+    /// `releases/`, and a cache swept up with one would make the next
+    /// deploy a from-scratch build, which for Koji is the exact outcome
+    /// this whole mechanism exists to avoid.
+    #[test]
+    fn the_cache_is_not_inside_releases() {
+        let tree = Tree::for_sheep(Path::new("/srv/shep"), "koji");
+        assert!(!tree.cache().starts_with(tree.releases()));
     }
 }

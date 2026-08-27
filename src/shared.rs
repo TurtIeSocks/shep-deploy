@@ -246,13 +246,60 @@ pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(
             })?;
         }
 
-        symlink(&target, &link).map_err(|source| Error::Io {
-            path: link.clone(),
-            source,
+        symlink(&target, &link).map_err(|source| {
+            if source.kind() == io::ErrorKind::AlreadyExists {
+                return Error::Config(format!(
+                    "{} is already present in the release, so {} cannot be linked from the \
+                     checkout. The usual cause is a build output that git ignores and \
+                     `.shepignore` does not: this dog gives each sheep its own build cache and \
+                     links it in first, and the operator's own build artifacts must not be \
+                     shared into a release at all, because the next release's build would write \
+                     through the link and replace what the current one is serving. Add {} to \
+                     `.shepignore` in the checkout.",
+                    link.display(),
+                    relative.display(),
+                    relative.display()
+                ));
+            }
+            Error::Io {
+                path: link.clone(),
+                source,
+            }
         })?;
     }
 
     Ok(())
+}
+
+/// Points `release/target` at the dog's own build cache, creating the cache
+/// if this is the first release to want it.
+///
+/// Runs BEFORE [`link_into`], so a checkout that shares its own `target`
+/// (no `.shepignore`, which the design says is a misconfiguration rather
+/// than a mode) collides in `link_into` where the error can name the fix,
+/// rather than here where it cannot.
+///
+/// A release that already has a `target` path is left exactly as it is and
+/// gets no cache. That is a repository which committed the directory, which
+/// is unusual and its own business; overruling it would be this crate
+/// deciding the repository's layout for it.
+///
+/// # Errors
+/// [`Error::Io`], naming the cache, if it cannot be created; naming the
+/// link, if the symlink cannot be made for any reason other than something
+/// already being there.
+pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
+    let link = release.join("target");
+    if link.exists() || link.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(cache_target).map_err(|source| Error::Io {
+        path: cache_target.to_owned(),
+        source,
+    })?;
+
+    symlink(cache_target, &link).map_err(|source| Error::Io { path: link, source })
 }
 
 #[cfg(test)]
@@ -542,5 +589,66 @@ mod tests {
         let err = shepignore_patterns(repo.path()).expect_err("must refuse a glob pattern");
         assert!(matches!(err, Error::Config(_)));
         assert!(err.to_string().contains("cache[0-9].tmp"));
+    }
+
+    /// fails if a release does not get a `target` pointing at the dog's own
+    /// cache. Without it every deploy of a Rust project is a from-scratch
+    /// build, which the design calls not acceptable for Koji specifically.
+    #[test]
+    fn a_release_gets_target_linked_at_the_cache() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let release = root.path().join("release");
+        let cache = root.path().join("cache/target");
+        fs::create_dir_all(&release).expect("release dir");
+
+        link_cache(&release, &cache).expect("links");
+
+        let link = release.join("target");
+        assert_eq!(fs::read_link(&link).expect("a symlink"), cache);
+        assert!(cache.is_dir(), "the cache itself must be created");
+    }
+
+    /// fails if a release that ships its own tracked `target/` is treated
+    /// as an error. A repository committing that directory is unusual and
+    /// its own business; refusing the deploy over it would be this crate
+    /// overruling the repository about the repository's own layout.
+    #[test]
+    fn a_release_that_ships_its_own_target_is_left_alone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let release = root.path().join("release");
+        fs::create_dir_all(release.join("target")).expect("a committed target");
+        let cache = root.path().join("cache/target");
+
+        link_cache(&release, &cache).expect("does nothing, successfully");
+
+        assert!(
+            release.join("target").is_dir(),
+            "the repository's own directory must survive"
+        );
+        assert!(
+            fs::read_link(release.join("target")).is_err(),
+            "and must not have been replaced by a link"
+        );
+    }
+
+    /// fails if a checkout sharing its own `target` collides with the
+    /// dog's cache and produces a bare "File exists". The two are genuinely
+    /// different things, the operator's dev artifacts and the dog's shared
+    /// cache, and the design says the operator's own target directory must
+    /// never be linked. The fix is one line in `.shepignore`, so the error
+    /// says so.
+    #[test]
+    fn a_checkout_sharing_target_says_how_to_fix_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let release = root.path().join("release");
+        let checkout = root.path().join("checkout");
+        fs::create_dir_all(&release).expect("release");
+        fs::create_dir_all(checkout.join("target")).expect("their own target");
+        link_cache(&release, &root.path().join("cache/target")).expect("links");
+
+        let err = link_into(&release, &checkout, &[PathBuf::from("target")]).expect_err("collides");
+        let shown = err.to_string();
+        assert!(shown.contains(".shepignore"), "{shown}");
+        assert!(shown.contains("target"), "{shown}");
     }
 }
