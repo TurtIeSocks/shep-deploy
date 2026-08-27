@@ -79,6 +79,22 @@ pub enum Restored {
         /// Why neither the restore nor the fallback could put it back.
         why: String,
     },
+    /// The muster roll itself could not be read, so none of these
+    /// pre-existing sheep could be checked against it at all.
+    ///
+    /// One row for the whole run rather than one per sheep: the roll is a
+    /// single read shared by every target, so its failure is a dog-wide
+    /// condition, not a property of any one of them. Repeating "sheep is no
+    /// longer registered" once per target would also bury the real cause -
+    /// [`roll::read`](crate::roll)'s own crafted, actionable message about
+    /// a shepherd newer than this dog - behind a guess this module made up
+    /// because it never got to check.
+    RollUnreadable {
+        /// Every pre-existing sheep this run could not check.
+        sheep: Vec<String>,
+        /// [`roll::registered`](crate::roll)'s own failure.
+        why: String,
+    },
 }
 
 /// Puts every target back, and answers with one row per target.
@@ -95,10 +111,19 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
     };
     // Read once for every target rather than once per target: it costs a
     // SaveRoll round trip, and a removal is not the moment to make N of
-    // them.
-    let registered = roll::registered(daemon).await.unwrap_or_default();
+    // them. Kept as a `Result` rather than `.unwrap_or_default()`: an empty
+    // map here is indistinguishable from "nothing is registered", and
+    // `put_back` would report every pre-existing sheep as "no longer
+    // registered" - a fabricated cause standing in for whatever
+    // `roll::registered` actually failed with.
+    let registered = roll::registered(daemon).await;
 
     let mut results = Vec::new();
+    // Pre-existing sheep whose restore needs the roll, deferred here rather
+    // than reported as they are found: a roll that cannot be read is one
+    // failure shared by every one of them, not N separate ones.
+    let mut blocked_by_roll = Vec::new();
+
     for sheep in names {
         let tree = Tree::for_sheep(shep_home, &sheep);
         let state = match State::read(&tree.state_file()) {
@@ -114,7 +139,9 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
 
         // Nothing to restore means the dog bootstrapped this sheep, so it
         // is left running and TOLD about. Deleting an app because a deploy
-        // tool was uninstalled would be much worse than leaving it.
+        // tool was uninstalled would be much worse than leaving it. This
+        // needs no roll at all, so a roll that failed to read does not
+        // touch it.
         let (Some(cwd), Some(script)) = (state.origin_cwd, state.origin_script) else {
             results.push(Restored::LeftRunning {
                 sheep,
@@ -123,8 +150,13 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             continue;
         };
 
+        let Ok(registered) = &registered else {
+            blocked_by_roll.push(sheep);
+            continue;
+        };
+
         results.push(
-            match put_back(daemon, &sheep, &registered, &cwd, &script).await {
+            match put_back(daemon, &sheep, registered, &cwd, &script).await {
                 PutBack::Done => Restored::Returned { sheep, to: cwd },
                 PutBack::Untouched(err) => Restored::Failed {
                     sheep,
@@ -137,6 +169,16 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             },
         );
     }
+
+    if let Err(err) = &registered
+        && !blocked_by_roll.is_empty()
+    {
+        results.push(Restored::RollUnreadable {
+            sheep: blocked_by_roll,
+            why: err.to_string(),
+        });
+    }
+
     results
 }
 
@@ -249,6 +291,13 @@ pub fn report(results: &[Restored]) -> String {
                  flock. It will not come back on its own after a restart. Re-register it from \
                  its own Flockfile.\n"
             ),
+            // One row naming every affected sheep and the roll's own
+            // cause, rather than one wrong-shaped guess per sheep.
+            Restored::RollUnreadable { sheep, why } => format!(
+                "{}: none of these could be checked against the muster roll, so none of them \
+                 could be restored ({why})\n",
+                sheep.join(", ")
+            ),
         })
         .collect()
 }
@@ -315,15 +364,20 @@ mod tests {
     /// `save_roll` answers with a roll naming every sheep it was
     /// constructed with, `cwd` under the deploy tree and `script` an
     /// arbitrary placeholder - what the shepherd is presumed to have had
-    /// registered before this dog's removal began. `describe` answers one
-    /// running instance for whichever name is asked. `calls()` records only
-    /// `delete` and `start`, in order: those are the two that change the
-    /// flock, and the ordering this pins is between them. `save_roll` and
-    /// `describe` are reads and are not recorded, so a reordering of those
-    /// does not break the assertion.
+    /// registered before this dog's removal began - unless it was built
+    /// [`Self::with_unreadable_roll`], which writes a roll no shepherd of
+    /// this crate's `shep-core` could have written, so `roll::registered`
+    /// fails with its own real, crafted cause rather than this double
+    /// inventing one. `describe` answers one running instance for whichever
+    /// name is asked. `calls()` records only `delete` and `start`, in
+    /// order: those are the two that change the flock, and the ordering
+    /// this pins is between them. `save_roll` and `describe` are reads and
+    /// are not recorded, so a reordering of those does not break the
+    /// assertion.
     struct Recording {
         sheep: Vec<&'static str>,
         refuse: Refuse,
+        unreadable_roll: bool,
         calls: RefCell<Vec<&'static str>>,
         starts: RefCell<Vec<AppConfig>>,
         attempts: Cell<usize>,
@@ -334,6 +388,7 @@ mod tests {
             Self {
                 sheep: sheep.to_vec(),
                 refuse,
+                unreadable_roll: false,
                 calls: RefCell::new(Vec::new()),
                 starts: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
@@ -354,6 +409,15 @@ mod tests {
         /// Every `start` call is refused, for every sheep.
         fn refusing_every_start(sheep: &[&'static str]) -> Self {
             Self::new(sheep, Refuse::Always)
+        }
+
+        /// `save_roll` answers with a roll `roll::registered` cannot parse,
+        /// naming no particular sheep - a roll failure is dog-wide, so
+        /// nothing here is keyed to the sheep the test writes to disk.
+        fn with_unreadable_roll() -> Self {
+            let mut this = Self::new(&[], Refuse::Never);
+            this.unreadable_roll = true;
+            this
         }
 
         fn calls(&self) -> Vec<&'static str> {
@@ -414,6 +478,19 @@ mod tests {
         }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
             let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.keep().join("flock.json");
+            if self.unreadable_roll {
+                // An unknown field is what a newer shepherd would actually
+                // write - `AppConfig` is `deny_unknown_fields` - and is what
+                // makes `roll::read` produce its own crafted, actionable
+                // message rather than this double inventing one.
+                fs::write(
+                    &path,
+                    "{\"apps\":[{\"app\":{\"name\":\"w\",\"a_field_from_the_future\":1}}]}",
+                )
+                .expect("write roll");
+                return Ok(path);
+            }
             let apps: Vec<String> = self
                 .sheep
                 .iter()
@@ -424,7 +501,6 @@ mod tests {
                     )
                 })
                 .collect();
-            let path = dir.keep().join("flock.json");
             fs::write(&path, format!("{{\"apps\":[{}]}}", apps.join(","))).expect("write roll");
             Ok(path)
         }
@@ -575,6 +651,37 @@ mod tests {
         write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
         all(&Recording::with_registered(&["bpm"]), home.path()).await;
         assert!(home.path().join("deploy/bpm/deploy.toml").is_file());
+    }
+
+    /// fails if a muster roll that cannot be read produces a separate,
+    /// fabricated "not registered" row per pre-existing sheep instead of
+    /// one row naming all of them and the roll's own real cause. An
+    /// operator meeting N copies of a wrong guess has less to act on than
+    /// one line naming the actual reason - here, `roll::read`'s "newer
+    /// shepherd" message - and the affected sheep.
+    #[tokio::test]
+    async fn a_roll_read_failure_is_reported_once_dog_wide_with_the_real_cause() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_with_origin(home.path(), "aaa", "/srv/a", "./a");
+        write_target_with_origin(home.path(), "zzz", "/srv/z", "./z");
+        let daemon = Recording::with_unreadable_roll();
+
+        let results = all(&daemon, home.path()).await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "one row for the whole roll failure, not one per sheep: {results:?}"
+        );
+        assert!(matches!(results[0], Restored::RollUnreadable { .. }));
+        let text = report(&results);
+        assert!(text.contains("aaa"), "{text}");
+        assert!(text.contains("zzz"), "{text}");
+        assert!(text.contains("newer"), "{text}");
+        assert!(
+            daemon.calls().is_empty(),
+            "nothing was deleted or started without a readable roll"
+        );
     }
 
     /// fails if `on-remove` ever turns a partial failure into a nonzero
