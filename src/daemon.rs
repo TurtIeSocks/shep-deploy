@@ -24,16 +24,17 @@
 //! lift this into a library and it starts firing, at which point the
 //! trade-off wants deciding rather than silencing.
 //!
-//! Do not add trait methods speculatively. These six are the surface plan
-//! one (this plan) and plan two need between them, not six with a proven
-//! caller today: `list_flock`, `describe` and `reload` are already
-//! exercised inside plan one (`adopted_name` below, probe-based
-//! verification, and the deploy sequence). `dog_config` reads the
-//! `[dog.<name>]` section that names the poll loop's interval and
-//! retention, via `crate::config::read` and `adopted_name` below.
-//! `restart` has no caller in plan one either; Task 10 chose `Reload` for
-//! the whole deploy sequence. It stays because this task's own brief named
-//! all six up front, not because a caller can be pointed at today.
+//! Do not add trait methods speculatively. These eight are the surface plan
+//! one and plan two need between them, not eight that looked useful:
+//! `list_flock`, `describe` and `reload` are exercised inside plan one
+//! (`adopted_name` below, probe-based verification, and the deploy
+//! sequence). `dog_config` reads the `[dog.<name>]` section that names the
+//! poll loop's interval and retention, via `crate::config::read` and
+//! `adopted_name` below. `start` and `delete` are the cutover's, in
+//! `crate::optin`: it registers the sheep against `current` and then
+//! removes the instances that `Start` was added beside. `restart` is the
+//! one with no caller at all; Task 10 chose `Reload` for the whole deploy
+//! sequence, and it stays because plan one's own brief named it up front.
 //!
 //! # Self-identification
 //!
@@ -58,7 +59,7 @@ use crate::error::Error;
 
 /// Everything this dog asks the shepherd for.
 ///
-/// Narrow on purpose: six methods cover the whole plan, and each is written
+/// Narrow on purpose: eight methods cover the whole plan, and each is written
 /// against whatever the shepherd itself calls the operation (`shep reload`,
 /// `shep restart`, ...) rather than against this crate's own vocabulary for
 /// it, so a reader who knows shep already knows what each one does.
@@ -94,9 +95,18 @@ pub trait Daemon {
     ///
     /// # Errors
     /// As [`Self::dog_config`].
-    // Opt-in registers the sheep it is taking over; opt-in is plan two.
-    #[expect(dead_code)]
     async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error>;
+
+    /// Stop and deregister one instance, by its stable numeric id.
+    ///
+    /// By id and never by name, because the cutover deliberately runs two
+    /// instances of one app at once: `Request::Start` on a registered name
+    /// ADDS an instance rather than re-registering, so a name selector here
+    /// would delete the replacement along with the instance it replaced.
+    ///
+    /// # Errors
+    /// As [`Self::dog_config`].
+    async fn delete(&self, id: u32) -> Result<(), Error>;
 
     /// Replace one sheep, by exact name, with a fresh instance of the same
     /// app.
@@ -182,6 +192,16 @@ impl Daemon for Live {
         }
     }
 
+    async fn delete(&self, id: u32) -> Result<(), Error> {
+        let asked = Request::Delete {
+            selector: SelectorSpec::Id(id),
+        };
+        match self.0.request(asked).await? {
+            Response::Deleted(_) => Ok(()),
+            other => Err(unexpected("Delete", &other)),
+        }
+    }
+
     async fn reload(&self, sheep: &str) -> Result<(), Error> {
         let asked = Request::Reload {
             selector: SelectorSpec::Name(sheep.to_owned()),
@@ -226,6 +246,7 @@ fn named(response: &Response) -> String {
         Response::Flock(flock) => format!("a Flock of {}", flock.len()),
         Response::Described(flock) => format!("a Described of {}", flock.len()),
         Response::Started(flock) => format!("a Started of {}", flock.len()),
+        Response::Deleted(ids) => format!("a Deleted of {}", ids.len()),
         Response::Reloading(flock) => format!("a Reloading of {}", flock.len()),
         Response::Restarted(flock) => format!("a Restarted of {}", flock.len()),
         Response::DogSection { .. } => "a DogSection".to_owned(),
@@ -296,6 +317,9 @@ mod tests {
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
             unimplemented!()
         }
+        async fn delete(&self, _id: u32) -> Result<(), Error> {
+            unimplemented!()
+        }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             unimplemented!()
         }
@@ -323,6 +347,9 @@ mod tests {
             Err(Error::Protocol("no session".to_owned()))
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn delete(&self, _id: u32) -> Result<(), Error> {
             Err(Error::Protocol("no session".to_owned()))
         }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
@@ -385,6 +412,7 @@ mod tests {
             "a Reloading of 2"
         );
         assert_eq!(named(&Response::Restarted(flock)), "a Restarted of 2");
+        assert_eq!(named(&Response::Deleted(vec![7, 8])), "a Deleted of 2");
         assert_eq!(named(&Response::Flock(Vec::new())), "a Flock of 0");
     }
 
@@ -401,7 +429,7 @@ mod tests {
 
     /// fails if `unexpected` stops saying which request the answer was to.
     /// "a Flock of 2" alone does not tell an operator which call went
-    /// wrong, and this dog makes six different ones.
+    /// wrong, and this dog makes eight different ones.
     #[test]
     fn an_unexpected_answer_names_the_request_it_answered() {
         let err = unexpected("Reload", &Response::Flock(Vec::new()));

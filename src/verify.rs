@@ -108,13 +108,36 @@ impl Generation {
         u32::try_from(self.pids.len()).unwrap_or(u32::MAX)
     }
 
+    /// The generation a listing already in hand describes.
+    ///
+    /// [`Self::of`] takes a [`Daemon`] and issues a request; this takes the
+    /// answer to one. The cutover's first phase already holds the listing it
+    /// wants to freeze, and asking again would both cost a round trip and
+    /// risk freezing a DIFFERENT set of pids than the one it just decided
+    /// on, which is the sort of gap a crash-looping release fits through.
+    pub(crate) fn of_infos(infos: &[&ProcessInfo]) -> Self {
+        Self {
+            pids: infos.iter().filter_map(|info| info.pid).collect(),
+        }
+    }
+
     /// Whether `info` is running under a pid this generation never had.
     ///
     /// An instance with no pid at all is never new. That is the honest
     /// reading rather than a defensive one: a `WaitingRestart` or errored
     /// instance has no process, and a deploy verified against one would be
     /// verified against nothing.
-    fn is_new(&self, info: &ProcessInfo) -> bool {
+    ///
+    /// Two callers, asking the same question for different reasons. [`wait`]
+    /// asks it inside [`Self::has_turned_over`], which additionally requires
+    /// EVERY instance to be new - a reload replaces them all, so an old one
+    /// still present means the reload is not finished. `crate::optin`'s
+    /// cutover asks it bare, because a cutover deliberately leaves the old
+    /// instance running beside the new one and a full turnover would never
+    /// arrive. Do not "fix" either call site by tightening it toward the
+    /// other: they are different requests to the shepherd, not two spellings
+    /// of one.
+    pub(crate) fn is_new(&self, info: &ProcessInfo) -> bool {
         info.pid.is_some_and(|pid| !self.pids.contains(&pid))
     }
 
@@ -122,8 +145,9 @@ impl Generation {
     ///
     /// The mirror of [`Self::is_new`], for the dwell: after a turnover the
     /// question stops being "is this different" and becomes "is this still
-    /// the same one".
-    fn holds(&self, info: &ProcessInfo) -> bool {
+    /// the same one". `crate::optin`'s cutover dwells on the same question
+    /// about the instance its own `Start` spawned.
+    pub(crate) fn holds(&self, info: &ProcessInfo) -> bool {
         info.pid.is_some_and(|pid| self.pids.contains(&pid))
     }
 
@@ -145,10 +169,13 @@ impl Generation {
 /// reload takes is the app's business, and `crate::deploy` derives that from
 /// the app, while how long a new release has to survive before anyone
 /// believes in it is this crate's.
-const DWELL: Duration = Duration::from_secs(10);
+pub(crate) const DWELL: Duration = Duration::from_secs(10);
 
 /// How often either mode asks the shepherd again.
-const POLL: Duration = Duration::from_millis(100);
+///
+/// One cadence for the crate: `crate::optin`'s cutover polls on this too,
+/// because "how often do we ask the shepherd again" has one answer here.
+pub(crate) const POLL: Duration = Duration::from_millis(100);
 
 /// Watch `sheep` for up to `budget`, judging health the way `mode` says to,
 /// against the generation that was serving before the reload.
@@ -250,7 +277,11 @@ fn is_online(info: &ProcessInfo) -> bool {
 }
 
 /// Whether one instance still counts as "running" for [`Verify::Alive`].
-fn is_alive(info: &ProcessInfo) -> bool {
+///
+/// Shared with `crate::optin`'s cutover rather than copied into it: the
+/// cutover's accept predicate IS this one, and two spellings of it would
+/// drift apart with nothing to notice.
+pub(crate) fn is_alive(info: &ProcessInfo) -> bool {
     matches!(info.status, ProcStatus::Starting | ProcStatus::Online)
 }
 
@@ -316,6 +347,9 @@ mod tests {
             Ok(self.sequence[index].clone())
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn delete(&self, _id: u32) -> Result<(), Error> {
             unimplemented!()
         }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {

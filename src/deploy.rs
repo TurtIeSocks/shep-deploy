@@ -95,7 +95,10 @@ pub enum Outcome {
 /// is a five-second constant covering "scheduling jitter and nothing else"
 /// between the two timeouts below. Named here rather than folded into
 /// [`budget`]'s arithmetic so a reader can put the two files side by side.
-const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
+///
+/// `crate::optin`'s cutover budget reads this one rather than copying shep's
+/// constant into a second file.
+pub(crate) const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 
 /// How long a reload of `instances` instances of this app gets before
 /// verification gives up on it.
@@ -1328,6 +1331,9 @@ mod tests {
                 .collect())
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn delete(&self, _id: u32) -> Result<(), Error> {
             unimplemented!()
         }
         async fn reload(&self, sheep: &str) -> Result<(), Error> {

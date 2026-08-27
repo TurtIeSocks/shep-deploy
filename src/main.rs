@@ -16,12 +16,18 @@
 //! ```text
 //! shep-deploy deploy <sheep>
 //! shep-deploy deploy <sheep> --watch auto|manual
+//! shep-deploy setup <sheep>
 //! shep-deploy survey
 //! ```
 //!
 //! `--watch` changes one setting and returns without deploying. See
 //! [`deploy::set_watch`]. `survey` reports where every registered sheep
-//! stands and touches nothing; see [`survey::survey`].
+//! stands and touches nothing; see [`survey::survey`]. `setup` takes a
+//! sheep over: it builds the deploy tree and its first release, then
+//! re-registers the sheep against `current` and removes the instances it
+//! replaced. See [`optin::prepare`] and [`optin::cut_over`] - and note that
+//! it is the one deploy that may have downtime, and the one that is not
+//! verified against the app's readiness probe.
 
 #![forbid(unsafe_code)]
 
@@ -98,6 +104,8 @@ enum Route<'a> {
     Survey,
     /// Deploy the named sheep.
     Deploy(&'a str),
+    /// Take the named sheep over, up to and including the cutover.
+    Setup(&'a str),
     /// Set the named sheep's watch mode.
     Watch { sheep: &'a str, mode: &'a str },
     /// Nothing above matched; print [`USAGE`] and exit on the usage code.
@@ -116,6 +124,7 @@ fn route<'a>(args: &[&'a str]) -> Route<'a> {
     match args {
         [] => Route::Poll,
         ["survey"] => Route::Survey,
+        ["setup", sheep] => Route::Setup(sheep),
         ["deploy", sheep] => Route::Deploy(sheep),
         ["deploy", sheep, "--watch", mode] => Route::Watch { sheep, mode },
         // Reached only through `shep deploy <sheep>`: the passthrough
@@ -140,6 +149,7 @@ async fn main() -> ExitCode {
         }
         Route::Survey => survey_once().await,
         Route::Deploy(sheep) => deploy_once(sheep).await,
+        Route::Setup(sheep) => setup_once(sheep).await,
         Route::Watch { sheep, mode } => set_watch(sheep, mode),
         Route::Usage => {
             eprintln!("{USAGE}");
@@ -201,6 +211,31 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
     }
 
     Ok(code_for_outcome(&outcome))
+}
+
+/// Takes `sheep` over: builds its deploy tree and first release, then cuts
+/// it over to `current`.
+///
+/// Prints where the sheep now deploys from, because that path is the one
+/// thing an operator has no other way to learn - nothing in `shep flock`
+/// names it, and it is where every later release lands.
+///
+/// # Errors
+/// [`Error::Io`] if `$SHEP_HOME` cannot be resolved, [`Error::Connect`] if
+/// the shepherd's socket cannot be reached, and whatever
+/// [`optin::prepare`] or [`optin::cut_over`] return.
+async fn setup_once(sheep: &str) -> Result<u8, Error> {
+    let client = Client::connect(&socket()?).await?;
+    let daemon = Live::new(client);
+
+    let prepared = optin::prepare(&daemon, &shep_home()?, sheep).await?;
+    // Read before `cut_over` consumes `prepared`.
+    let current = prepared.tree.current();
+
+    let sha = optin::cut_over(&daemon, prepared).await?;
+    println!("{sheep} now deploys from {}, at {sha}", current.display());
+
+    Ok(0)
 }
 
 /// Reports where every registered sheep stands, and touches nothing.
@@ -378,6 +413,7 @@ mod tests {
         assert_eq!(route(&["koji"]), Route::Deploy("koji"));
         assert_eq!(route(&["deploy", "koji"]), Route::Deploy("koji"));
         assert_eq!(route(&["survey"]), Route::Survey);
+        assert_eq!(route(&["setup", "koji"]), Route::Setup("koji"));
         // The escape hatch for a sheep whose name is a verb.
         assert_eq!(route(&["deploy", "survey"]), Route::Deploy("survey"));
         assert_eq!(route(&[]), Route::Poll);

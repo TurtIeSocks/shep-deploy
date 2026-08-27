@@ -43,10 +43,15 @@ The sheep's `cwd` is `current`, permanently. Set it explicitly when you register
 ```sh
 shep-deploy deploy <sheep>
 shep-deploy deploy <sheep> --watch auto|manual
+shep-deploy setup <sheep>
 shep-deploy survey
 ```
 
 `--watch` changes the setting and returns without deploying. `survey` reports where every registered sheep stands and starts, registers and writes nothing.
+
+`setup` takes a sheep over: it builds the tree, fetches the repository, links the shared files in, builds the first release, and re-registers the sheep with its `cwd` set to `current`. **The first cutover is the one deploy that may have downtime.** It runs two instances at once, so an app that does not bind with `SO_REUSEPORT` cannot take its own port while the original still holds it, and the new instance is then removed and the original left serving. Every deploy after the first replaces the instance rather than joining it, and does not meet this.
+
+**It is also the one deploy that is not verified against the readiness probe.** shep reports a freshly started process `Online` once its `listen_timeout` elapses, whatever the probe said, and only aborts a *reload* whose replacement was not ready. So `setup` checks what it can: a new process started and was still the same process, not errored and not restarted, ten seconds later. A release that starts, stays up and serves nothing passes that. Every deploy after the first is verified properly, against the probe, with automatic rollback.
 
 Exit codes follow [shep's own taxonomy](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md): `0` deployed or already up to date, `2` bad arguments, `4` bad configuration, `5` no daemon answered, `1` anything else. **`12` is this dog's own: the deploy was rejected and the previous release was put back.** A script that treats any nonzero code as "the deploy broke" will be wrong about `12`, where the flock is healthy on the old release.
 
@@ -70,7 +75,7 @@ Unix only. This is deliberate, not a gap waiting to be filled by accident: the d
 
 ## Status
 
-The deploy sequence and the operator command work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, opt-in (surveying the flock and cutting a sheep over for the first time), release retention, and Windows.
+The deploy sequence, the operator commands and opt-in all work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, removing the dog and putting a sheep back, and Windows.
 
 See [docs/writing-plans/plans/2026-08-26-deploy-engine.md](docs/writing-plans/plans/2026-08-26-deploy-engine.md) for what was built, and the [design spec](docs/brainstorming/specs/2026-08-26-deploy-dog-design.md) for what it is for.
 

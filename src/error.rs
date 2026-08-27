@@ -151,6 +151,30 @@ pub enum Error {
         /// What went wrong, as a clause that follows the sheep's name.
         why: String,
     },
+    /// A sheep's first cutover did not come up, and the sheep it was
+    /// replacing is still serving.
+    ///
+    /// Its own variant rather than a reuse of [`Self::Unverified`] because
+    /// the situation is different in the way that matters to an operator:
+    /// nothing was swapped and nothing was rolled back. What has to be said
+    /// instead is the likeliest cause, which is specific to this one moment
+    /// in a target's life, and whether the shepherd's persisted record
+    /// could be put back.
+    ///
+    /// `repaired` is not a detail. An accepted `Start` records its config
+    /// against the sheep's NAME, and deleting the instance it spawned does
+    /// not undo that while the original keeps the name alive, so an
+    /// unrepaired roll means a reboot silently brings the sheep back on the
+    /// release that was just rejected. That is invisible in `shep flock`,
+    /// which is why it is named here rather than left to be discovered.
+    CutOver {
+        /// The sheep whose cutover was abandoned.
+        sheep: String,
+        /// Why the newcomer was rejected.
+        why: String,
+        /// Whether the shepherd's persisted roll was put back.
+        repaired: bool,
+    },
     /// A release's build command exited without succeeding.
     ///
     /// Deliberately carries only the exit status, not captured output the
@@ -223,6 +247,37 @@ impl fmt::Display for Error {
                  current nor deploy.toml names one that is still on disk - so it is still \
                  pointed at {sha}"
             ),
+            Self::CutOver {
+                sheep,
+                why,
+                repaired,
+            } => {
+                write!(
+                    f,
+                    "{sheep}'s first cutover did not come up ({why}), so it was removed and the \
+                     original is still running. The first cutover is the one deploy that runs two \
+                     instances at once, so an app that does not bind with SO_REUSEPORT cannot take \
+                     its own port while the original still holds it. Every deploy after the first \
+                     replaces the instance rather than joining it and does not meet this. The \
+                     deploy tree is left in place with {sheep}'s first release already built, so \
+                     nothing has to be rebuilt to try again."
+                )?;
+                if !repaired {
+                    // The half an operator cannot see. `shep flock` shows a
+                    // healthy sheep either way; only the persisted roll is
+                    // wrong, and only a restart reveals it.
+                    write!(
+                        f,
+                        " One thing is NOT back as it was: the shepherd recorded the new release \
+                         against {sheep} when it accepted the start, and that record could not be \
+                         put back. It is correct in the running process and wrong on disk, so a \
+                         daemon restart followed by `shep muster` would bring {sheep} back on the \
+                         release that was just rejected. Re-register it from its own Flockfile to \
+                         correct the record before restarting the shepherd."
+                    )?;
+                }
+                Ok(())
+            }
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
@@ -245,6 +300,7 @@ impl core::error::Error for Error {
             | Self::Git { .. }
             | Self::Raced { .. }
             | Self::Unverified { .. }
+            | Self::CutOver { .. }
             | Self::Build { .. } => None,
         }
     }
