@@ -64,11 +64,27 @@ pub enum Restored {
         /// Where it is still running from.
         from: PathBuf,
     },
-    /// Nothing was changed. The sheep is still registered and running.
+    /// Nothing was changed. The sheep is still registered and running,
+    /// exactly as it was before this call.
     Failed {
         /// The sheep that could not be restored.
         sheep: String,
         /// Why.
+        why: String,
+    },
+    /// The restore itself was refused, but the fallback put the shepherd's
+    /// own previous config back.
+    ///
+    /// Distinct from [`Self::Failed`] because it is NOT "left as it is":
+    /// the delete already ran and `start(vec![current])` then succeeded, so
+    /// the sheep was stopped and a fresh instance started. The registered
+    /// config an operator reads in `shep flock` now matches what it was a
+    /// moment ago, but nothing mid-flight survived the restart to get
+    /// there.
+    Reset {
+        /// The sheep that could not be restored, but was put back running.
+        sheep: String,
+        /// Why the restore itself failed.
         why: String,
     },
     /// The delete succeeded, both the restore and the fallback failed, and
@@ -162,6 +178,10 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
                     sheep,
                     why: err.to_string(),
                 },
+                PutBack::Reset(err) => Restored::Reset {
+                    sheep,
+                    why: err.to_string(),
+                },
                 PutBack::Deleted(err) => Restored::Lost {
                     sheep,
                     why: err.to_string(),
@@ -187,9 +207,14 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
 enum PutBack {
     /// Re-registered at its own checkout.
     Done,
-    /// The sheep is still registered, either because nothing was deleted
-    /// yet, or because the fallback re-registered what the shepherd had.
+    /// Nothing happened: the restore was never attempted, or was refused
+    /// before anything about the sheep changed.
     Untouched(Error),
+    /// The restore was refused, but the fallback re-registered the config
+    /// the shepherd already had. NOT the same claim as `Untouched`: the
+    /// delete already ran, so the sheep was stopped and a fresh instance
+    /// started to get back to that config.
+    Reset(Error),
     /// The delete landed and neither the restore nor the fallback did.
     Deleted(Error),
 }
@@ -253,7 +278,7 @@ async fn put_back<D: Daemon>(
             // no longer resolves, and the config that was working a moment
             // ago still is.
             if daemon.start(vec![current]).await.is_ok() {
-                PutBack::Untouched(err)
+                PutBack::Reset(err)
             } else {
                 PutBack::Deleted(err)
             }
@@ -282,6 +307,15 @@ pub fn report(results: &[Restored]) -> String {
             Restored::Failed { sheep, why } => {
                 format!("{sheep} could not be restored and was left as it is: {why}\n")
             }
+            // NOT the same wording as `Failed`: this sheep was stopped and
+            // a fresh instance started to get its own previous config back,
+            // so nothing mid-flight survived even though the config an
+            // operator reads now matches what it was a moment ago.
+            Restored::Reset { sheep, why } => format!(
+                "{sheep} could not be restored ({why}), so its previous configuration was put \
+                 back instead - doing that stopped it and started it again, so it is running \
+                 with the same config as before but nothing mid-flight survived\n"
+            ),
             // The row an operator must not misread. Every other outcome
             // leaves a running app; this one does not, and "could not be
             // restored" would have them assume it did.
@@ -578,12 +612,12 @@ mod tests {
         let results = all(&daemon, home.path()).await;
 
         assert_eq!(results.len(), 2);
-        // `Failed`, not `Lost`: the fallback re-registered what the shepherd
+        // `Reset`, not `Lost`: the fallback re-registered what the shepherd
         // already had, so "aaa" is still running. A double that refused
         // EVERY start would give `Lost` here, which is a different claim and
         // has its own test below.
         assert!(
-            matches!(results[0], Restored::Failed { .. }),
+            matches!(results[0], Restored::Reset { .. }),
             "{:?}",
             results[0]
         );
@@ -607,7 +641,7 @@ mod tests {
         let results = all(&daemon, home.path()).await;
 
         assert!(
-            matches!(results[0], Restored::Failed { .. }),
+            matches!(results[0], Restored::Reset { .. }),
             "{:?}",
             results[0]
         );
@@ -617,6 +651,25 @@ mod tests {
             Some("/srv/deploy-tree/current"),
             "the fallback re-registers what the shepherd had, not the restore"
         );
+    }
+
+    /// fails if a rescued restore is reported with wording that claims
+    /// nothing happened. The delete already ran and `start(vec![current])`
+    /// then succeeded, so the sheep was stopped and a fresh instance
+    /// started - not "left as it is" in any sense an operator would
+    /// recognise, even though the registered config now matches what it
+    /// was a moment ago.
+    #[tokio::test]
+    async fn a_rescued_restore_is_worded_as_a_reset_not_left_alone() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
+        let daemon = Recording::refusing_first_start_only(&["bpm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        let text = report(&results);
+        assert!(!text.contains("left as it is"), "{text}");
+        assert!(text.contains("stopped it and started it again"), "{text}");
     }
 
     /// fails if a sheep that really has been deleted is reported as merely
