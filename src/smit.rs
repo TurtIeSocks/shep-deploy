@@ -164,6 +164,32 @@ mod tests {
         assert!(shortened.parse::<Smit>().is_ok(), "{shortened}");
     }
 
+    /// fails if `fit` and `Smit::from_str` ever disagree about where the
+    /// limit is. Both count `char`s today, so a string of exactly
+    /// `MAX_CHARS` is accepted and one char more is refused. `fit` takes
+    /// `MAX_CHARS`, which is only correct while that boundary is shared:
+    /// were upstream to start counting bytes or display columns, a
+    /// hundred-character branch would still shorten to something valid and
+    /// this test is what would notice.
+    #[test]
+    fn fit_agrees_with_smit_about_where_the_limit_is() {
+        let at = "x".repeat(Smit::MAX_CHARS);
+        let under = "x".repeat(Smit::MAX_CHARS - 1);
+        let over = "x".repeat(Smit::MAX_CHARS + 1);
+
+        assert!(under.parse::<Smit>().is_ok(), "one under must be accepted");
+        assert!(at.parse::<Smit>().is_ok(), "exactly at must be accepted");
+        assert!(over.parse::<Smit>().is_err(), "one over must be refused");
+
+        assert_eq!(fit(under.clone()), under, "under the limit is untouched");
+        assert_eq!(fit(at.clone()), at, "at the limit is untouched");
+        assert_eq!(
+            fit(over).chars().count(),
+            Smit::MAX_CHARS,
+            "one over is shortened to exactly the limit"
+        );
+    }
+
     /// A [`Daemon`] whose only working method is `set_smit`, recording
     /// what it was asked to paint.
     struct Recording(std::cell::RefCell<Vec<(String, String)>>);
