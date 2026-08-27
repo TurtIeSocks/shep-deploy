@@ -324,6 +324,9 @@ mod tests {
         async fn restart(&self, _sheep: &str) -> Result<(), Error> {
             unimplemented!()
         }
+        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
+            unimplemented!()
+        }
     }
 
     /// fails if the process that was already serving passes for the one the

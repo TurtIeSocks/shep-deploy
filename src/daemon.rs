@@ -46,6 +46,8 @@
 //! reads an empty section, which looks exactly like a dog correctly running
 //! on defaults - there is no error to notice.
 
+use std::path::PathBuf;
+
 use shep_client::{
     Client,
     shep_core::config::AppConfig,
@@ -111,6 +113,24 @@ pub trait Daemon {
     // caller at all - see `crate::deploy`'s own doc for the reasoning.
     #[expect(dead_code)]
     async fn restart(&self, sheep: &str) -> Result<(), Error>;
+
+    /// Ask the shepherd to write its muster roll now, and answer with the
+    /// path it wrote.
+    ///
+    /// The snapshot writer debounces, so the roll on disk can lag reality;
+    /// `SaveRoll` is documented as bypassing that. The path comes back from
+    /// the daemon rather than being rebuilt from
+    /// [`ShepPaths`](shep_client::shep_core::paths::ShepPaths) so the dog
+    /// agrees with the daemon about where the file is even when the two
+    /// resolved `$SHEP_HOME` differently.
+    ///
+    /// # Errors
+    /// As [`Self::dog_config`].
+    // Called by `crate::roll::registered`, which reads the file this
+    // writes. That function itself has no caller yet - the survey and
+    // opt-in are plan two - so this is dead until one of them lands.
+    #[expect(dead_code)]
+    async fn save_roll(&self) -> Result<PathBuf, Error>;
 }
 
 /// A [`Client`] behind the [`Daemon`] trait - the only implementation this
@@ -183,6 +203,13 @@ impl Daemon for Live {
             other => Err(unexpected("Restart", &other)),
         }
     }
+
+    async fn save_roll(&self) -> Result<PathBuf, Error> {
+        match self.0.request(Request::SaveRoll).await? {
+            Response::RollSaved { path, .. } => Ok(PathBuf::from(path)),
+            other => Err(unexpected("SaveRoll", &other)),
+        }
+    }
 }
 
 /// The shepherd answered something this dog cannot use.
@@ -204,6 +231,7 @@ fn named(response: &Response) -> String {
         Response::Reloading(flock) => format!("a Reloading of {}", flock.len()),
         Response::Restarted(flock) => format!("a Restarted of {}", flock.len()),
         Response::DogSection { .. } => "a DogSection".to_owned(),
+        Response::RollSaved { .. } => "a RollSaved".to_owned(),
         // `Response` is `#[non_exhaustive]`, so this arm is not optional. A
         // variant added to the protocol after this dog was written is
         // exactly the one worth naming, and only `Debug` can name it.
@@ -276,6 +304,9 @@ mod tests {
         async fn restart(&self, _sheep: &str) -> Result<(), Error> {
             unimplemented!()
         }
+        async fn save_roll(&self) -> Result<PathBuf, Error> {
+            unimplemented!()
+        }
     }
 
     /// A [`Daemon`] that cannot be reached at all - every method answers
@@ -302,6 +333,9 @@ mod tests {
         async fn restart(&self, _sheep: &str) -> Result<(), Error> {
             Err(Error::Protocol("no session".to_owned()))
         }
+        async fn save_roll(&self) -> Result<PathBuf, Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
     }
 
     /// fails if `named` starts printing a `DogSection`'s body. That
@@ -320,6 +354,19 @@ mod tests {
             toml: secret.to_owned().into(),
         };
         assert_eq!(named(&response), "a DogSection");
+    }
+
+    /// fails if a roll's own absolute path starts showing up in an error
+    /// message by way of the `#[non_exhaustive]` `Debug` fallback. There is
+    /// nothing secret in a roll's path, but naming it by hand keeps this
+    /// response in the same "named, not printed" family as the others.
+    #[test]
+    fn a_roll_saved_is_named_and_never_printed() {
+        let response = Response::RollSaved {
+            path: "/srv/shep/flock.json".to_owned(),
+            apps: 3,
+        };
+        assert_eq!(named(&response), "a RollSaved");
     }
 
     /// fails if a response stops being named by what it is and how much of

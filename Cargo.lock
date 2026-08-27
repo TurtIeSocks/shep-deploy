@@ -675,9 +675,9 @@ dependencies = [
 
 [[package]]
 name = "shep-client"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b98c6779c787ea54f6ba54b3d091f6ce09fdb910a10aae32729623b292c8281"
+checksum = "91ad70f14243ab40e03110c39d164c915f7e6f376e474936aea0f9fccd665f1d"
 dependencies = [
  "futures-util",
  "shep-core",
@@ -688,9 +688,9 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e7412a1a7454d58d7d5c03264896bac43e5103f5081e224fc94835b9605bdad"
+checksum = "b7074da91a07046a1f9e80979f39640a5b93eaca91daf6d41c8ea1ab31a69d58"
 dependencies = [
  "annotate-snippets",
  "anstyle",
@@ -719,6 +719,7 @@ name = "shep-deploy"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "shep-client",
  "tempfile",
  "tokio",

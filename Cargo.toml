@@ -10,10 +10,11 @@ keywords = ["shep", "process-manager", "deploy", "git"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-shep-client = "0.1.0"
+shep-client = "0.1.2"
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "process", "signal"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

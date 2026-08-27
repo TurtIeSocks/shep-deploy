@@ -40,6 +40,7 @@ mod flockfile;
 mod git;
 mod paths;
 mod retention;
+mod roll;
 mod shared;
 mod state;
 mod swap;

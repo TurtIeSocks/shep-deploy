@@ -1362,6 +1362,9 @@ mod tests {
         async fn restart(&self, _sheep: &str) -> Result<(), Error> {
             unimplemented!()
         }
+        async fn save_roll(&self) -> Result<PathBuf, Error> {
+            unimplemented!()
+        }
     }
 
     /// fails if a deploy that never comes up leaves the new release live.
