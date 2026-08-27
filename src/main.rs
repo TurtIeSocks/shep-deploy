@@ -40,6 +40,7 @@ mod deploy;
 mod error;
 mod flockfile;
 mod git;
+mod optin;
 mod paths;
 mod retention;
 mod roll;

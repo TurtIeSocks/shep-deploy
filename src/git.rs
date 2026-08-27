@@ -68,6 +68,25 @@ fn path_str(path: &Path) -> Result<&str, Error> {
     })
 }
 
+/// Creates an empty bare repository at `git_dir`, making its parents.
+///
+/// Empty and then fetched, rather than cloned. [`fetch`] is anonymous by
+/// URL with a mirror refspec and `--prune` and needs no configured remote,
+/// so an empty repository plus that same fetch reaches exactly the state a
+/// clone would, through the one code path the poll loop already runs every
+/// thirty seconds instead of a second one that would only ever run once.
+///
+/// # Errors
+/// [`Error::Io`], naming `git_dir`, if it cannot be created or is not
+/// valid UTF-8. [`Error::Git`] if `git init` refuses.
+pub fn init_bare(git_dir: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(git_dir).map_err(|source| Error::Io {
+        path: git_dir.to_owned(),
+        source,
+    })?;
+    run_git(git_dir, &["init", "-q", "--bare"]).map(|_| ())
+}
+
 /// The URL configured for `checkout`'s `origin` remote.
 ///
 /// `origin` is the assumption, not a discovered name: every checkout this
@@ -79,14 +98,7 @@ fn path_str(path: &Path) -> Result<&str, Error> {
 /// # Errors
 /// [`Error::Git`] if `checkout` has no `origin` remote, or is not a git
 /// repository at all. [`Error::Io`] if `git` itself cannot be launched.
-// Read once at opt-in, to learn what to track. Opt-in is Task 7.
-//
-// `cfg_attr(not(test))` because the tests below DO call this, so the
-// expectation only holds for the shipping binary. `expect` rather than
-// `allow` so the day Task 7 gives it a real caller, this line becomes an
-// unfulfilled-expectation error and has to go, instead of sitting here
-// describing a future that already arrived.
-#[cfg_attr(not(test), expect(dead_code))]
+// Opt-in is `crate::optin::prepare`, its real caller as of Task 7.
 pub fn remote_url(checkout: &Path) -> Result<String, Error> {
     run_git(checkout, &["remote", "get-url", "origin"]).map(|stdout| stdout.trim().to_owned())
 }
@@ -115,9 +127,8 @@ pub fn remote_url(checkout: &Path) -> Result<String, Error> {
 /// [`Error::Git`] if `HEAD` is detached (message names "detached"), or for
 /// any other reason `symbolic-ref` fails. [`Error::Io`] if `git` itself
 /// cannot be launched.
-// Read once at opt-in, alongside `remote_url`. Opt-in is Task 7. Scoped
-// and `expect`ed for the same reasons as `remote_url` above.
-#[cfg_attr(not(test), expect(dead_code))]
+// Opt-in is `crate::optin::prepare`, its real caller as of Task 7, called
+// alongside `remote_url`.
 pub fn current_branch(checkout: &Path) -> Result<String, Error> {
     match run_git(checkout, &["symbolic-ref", "--short", "HEAD"]) {
         Ok(stdout) => Ok(stdout.trim().to_owned()),
