@@ -64,7 +64,7 @@ Every tick also paints each target's smit, so `shep flock` shows which branch an
 
 ```text
 ▲ main@a1b2c3      watched
-⏸ main@a1b2c3      manual
+⏸ main@f6e5d4      manual
 ```
 
 Republished every tick rather than on change: shep holds a smit in memory only for as long as the connection that painted it stays open, so a dog that only published on change would show nothing at all after a daemon restart until its next deploy. A refused smit is logged and otherwise ignored - it is cosmetic, never worth failing a deploy over.
