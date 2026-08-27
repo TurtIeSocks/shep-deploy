@@ -676,27 +676,30 @@ async fn roll_back<D: Daemon>(
 /// concluded that `previous == attempted` meant a first deploy with nothing
 /// to roll back to, and left a release that would not come up serving.
 ///
-/// The record's release has to still be on disk to be a candidate.
-/// Retention removes old worktrees, so a sha in `deploy.toml` is not a
-/// promise that anything is there to point at, and a rollback onto a path
-/// that does not exist would swap `current` to a dangling link.
+/// A candidate has to name a release other than the one that just failed,
+/// and it has to still be on disk. Both conditions apply to both sources,
+/// which they did not at first: retention removes old worktrees, so neither
+/// a sha in `deploy.toml` nor the target of `current` is a promise that
+/// anything is there to point at, and a rollback onto a path that does not
+/// exist would swap `current` to a dangling link - a sheep whose `cwd`
+/// resolves to nothing, which is worse than the release that would not come
+/// up. Guarding only the record's branch left the first source able to do
+/// exactly the harm the guard was added for.
 fn rollback_target(
     tree: &Tree,
     state: &State,
     previous: Option<&Path>,
     attempted: &str,
 ) -> Option<PathBuf> {
-    if let Some(path) = previous.filter(|path| sha_of(path) != attempted) {
-        return Some(path.to_owned());
+    let usable =
+        |release: PathBuf| (sha_of(&release) != attempted && release.exists()).then_some(release);
+
+    if let Some(release) = previous.map(Path::to_path_buf).and_then(usable) {
+        return Some(release);
     }
 
     let recorded = state.deployed.as_deref()?;
-    if recorded == attempted {
-        return None;
-    }
-
-    let release = tree.release(recorded);
-    release.exists().then_some(release)
+    usable(tree.release(recorded))
 }
 
 /// Points `current` back at `previous`, corrects the record to match, and
@@ -2068,6 +2071,42 @@ mod tests {
         // The deploy's own reload, and the rollback's onto the recorded
         // release. The second is the one the old code never sent.
         assert_eq!(daemon.attempt_count(), 2);
+    }
+
+    /// fails if the release `current` names is trusted to exist. The
+    /// existence guard was added for the record's branch and not for this
+    /// one, which left the first source able to do the exact harm the guard
+    /// was added for: `current` naming a release that retention has swept
+    /// is a dangling link, and rolling back "onto" it repoints `current` at
+    /// a path that is not there.
+    ///
+    /// The sheep's `cwd` is `current`, permanently, so that is not a
+    /// cosmetic failure - it is an app that cannot start at all, which is
+    /// worse than the release that would not come up.
+    #[tokio::test(start_paused = true)]
+    async fn a_current_naming_a_swept_release_is_not_a_rollback_target() {
+        let mut fixture = fixture_with_previous_release();
+        let live = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+
+        // Retention swept the release `current` still points at, so the
+        // link is there and its target is not.
+        crate::git::worktree_remove(&fixture.tree.git(), &fixture.tree.release(&live))
+            .expect("retention removes the worktree");
+        assert!(swap::resolve(&fixture.tree.current()).unwrap().is_some());
+        assert!(!fixture.tree.release(&live).exists());
+
+        let err = deploy(&Shepherd::never_ready(), &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("nothing usable to roll back to");
+
+        assert!(matches!(err, Error::Unverified { .. }), "{err:?}");
+        assert!(
+            swap::resolve(&fixture.tree.current())
+                .unwrap()
+                .is_some_and(|path| path.exists()),
+            "current must never be repointed at a release that is not there"
+        );
     }
 
     /// fails if a sha in `deploy.toml` is treated as a release that is
