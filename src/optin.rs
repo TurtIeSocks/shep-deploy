@@ -254,9 +254,9 @@ pub async fn prepare<D: Daemon>(
 ///
 /// A refused `Start` is different in kind and is returned unchanged.
 /// Nothing was spawned and, just as importantly, nothing was recorded, so
-/// the machine really is exactly as it was. The two [`Daemon::describe`]
-/// calls before the `Start` are in the same position, and their errors are
-/// passed through for the same reason.
+/// the machine really is exactly as it was. The [`Daemon::describe`] before
+/// the `Start` is in the same position, and its error is passed through for
+/// the same reason.
 ///
 /// Two steps run only once the newcomer has been accepted, and they are
 /// not alike.
@@ -981,8 +981,11 @@ mod tests {
         script: Vec<(Duration, Shape)>,
         /// Which `start` call, counting from zero, the shepherd refuses.
         refuses: Option<usize>,
-        /// Whether the shepherd refuses every `delete`.
-        refuses_deletes: bool,
+        /// Which `delete` call, counting from zero, the shepherd starts
+        /// refusing at. Every one from there on is refused.
+        refuses_deletes_from: Option<usize>,
+        /// How many `delete` calls have arrived, refused ones included.
+        deletes_seen: Cell<usize>,
         /// How long after the `Start` every `describe` starts failing.
         mute_after: Option<Duration>,
         /// Every `start` the shepherd accepted, in order.
@@ -1004,7 +1007,8 @@ mod tests {
                 original_script: originals_stay_online(),
                 script,
                 refuses,
-                refuses_deletes: false,
+                refuses_deletes_from: None,
+                deletes_seen: Cell::new(0),
                 mute_after: None,
                 starts: RefCell::new(Vec::new()),
                 deletes: RefCell::new(Vec::new()),
@@ -1022,8 +1026,17 @@ mod tests {
         }
 
         /// The same double, with every `delete` refused.
-        fn refusing_deletes(mut self) -> Self {
-            self.refuses_deletes = true;
+        fn refusing_deletes(self) -> Self {
+            self.refusing_deletes_from(0)
+        }
+
+        /// The same double, refusing every `delete` from the `from`th on.
+        ///
+        /// `undo_start` drains twice - once for what the cutover's own
+        /// `Start` spawned, once for what the repair `Start` did - and only
+        /// the second failing is a shape no other fixture reaches.
+        fn refusing_deletes_from(mut self, from: usize) -> Self {
+            self.refuses_deletes_from = Some(from);
             self
         }
 
@@ -1140,7 +1153,9 @@ mod tests {
             Ok(())
         }
         async fn delete(&self, id: u32) -> Result<(), Error> {
-            if self.refuses_deletes {
+            let seen = self.deletes_seen.get();
+            self.deletes_seen.set(seen + 1);
+            if self.refuses_deletes_from.is_some_and(|from| seen >= from) {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: format!("instance {id} cannot be deleted"),
@@ -1347,6 +1362,21 @@ mod tests {
     async fn cutover_fixture_shepherd_goes_quiet() -> (CutOverDouble, Prepared, Dirs) {
         let (daemon, prepared, dirs) = cutover_fixture_of(&[7], comes_up(), None).await;
         (daemon.going_quiet_after(Duration::ZERO), prepared, dirs)
+    }
+
+    /// The port-collision shape, with only the SECOND `delete` refused:
+    /// the one that removes the instance the repair `Start` spawned.
+    ///
+    /// The roll is recorded, so `repaired` is true, and an instance is
+    /// still left registered, so `removed` is false. No other fixture
+    /// reaches that combination, and it is the one where a cwd-based hint
+    /// would point at the wrong instance: the repair `Start` carries the
+    /// ORIGINAL config, so what it spawned has the operator's own checkout
+    /// as its cwd, exactly like the survivor.
+    async fn cutover_fixture_dies_and_refuses_the_second_delete() -> (CutOverDouble, Prepared, Dirs)
+    {
+        let (daemon, prepared, dirs) = cutover_fixture_of(&[7], dies_during_dwell(), None).await;
+        (daemon.refusing_deletes_from(1), prepared, dirs)
     }
 
     /// The port-collision shape, with every `delete` refused as well.
@@ -1737,6 +1767,69 @@ mod tests {
         let shown = err.to_string();
         assert!(!shown.contains("SO_REUSEPORT"), "{shown}");
         assert!(shown.contains("No new instance appeared"), "{shown}");
+    }
+
+    /// fails if a cutover that never started anything says it removed
+    /// something. With this fixture the shepherd accepts the `Start` and
+    /// produces no row at all, so the first drain finds nothing and
+    /// succeeds vacuously - and the sentence after `why` used to read "The
+    /// instance it added has been removed" directly beneath "No new
+    /// instance appeared". Two adjacent sentences contradicting each other
+    /// is how an operator decides a message is boilerplate and stops
+    /// reading it, which matters because the paragraph after them is the
+    /// one that keeps them off `shep deploy`.
+    #[tokio::test(start_paused = true)]
+    async fn a_cutover_that_added_nothing_does_not_claim_to_have_removed_it() {
+        let (daemon, prepared, _dirs) = cutover_fixture_never_appears().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        let shown = err.to_string();
+        assert!(shown.contains("No new instance appeared"), "{shown}");
+        assert!(
+            !shown.contains("instance it added has been removed"),
+            "it cannot have removed what it never added: {shown}"
+        );
+        assert!(
+            shown.contains("Nothing this cutover started is left registered"),
+            "{shown}"
+        );
+    }
+
+    /// fails if a repair instance that could not be deleted is described as
+    /// the one under the deploy tree. `undo_start` drains twice and only
+    /// the first drain removes something started from the deploy tree: the
+    /// repair `Start` re-registers the ORIGINAL config, so the instance it
+    /// spawns has the operator's own checkout as its cwd, identical to the
+    /// survivor's. A hint keyed on cwd is then wrong, and wrong in the
+    /// direction that has the operator hunting for a row that does not
+    /// exist while a duplicate of their app keeps running.
+    ///
+    /// `removed: false` with `repaired: true` is also a combination no
+    /// other fixture produces.
+    #[tokio::test(start_paused = true)]
+    async fn a_repair_instance_left_behind_is_not_described_by_its_cwd() {
+        let (daemon, prepared, _dirs) = cutover_fixture_dies_and_refuses_the_second_delete().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        assert!(
+            matches!(
+                err,
+                Error::CutOver {
+                    removed: false,
+                    repaired: true,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("cwd under the deploy tree"),
+            "the hint would point at the wrong instance: {shown}"
+        );
+        assert!(shown.contains("shep delete <id>"), "{shown}");
     }
 
     /// fails if an abandoned cutover claims to have removed an instance it

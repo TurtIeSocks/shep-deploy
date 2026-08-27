@@ -310,21 +310,34 @@ impl fmt::Display for Error {
                     write!(f, " ({source})")?;
                 }
                 if *removed {
+                    // Not "the instance it added has been removed": a `why`
+                    // of "no new instance appeared" means none was ever
+                    // added, and the two sentences then contradicted each
+                    // other one after the other. This is true either way.
                     write!(
                         f,
-                        " The instance it added has been removed, and the original is still \
-                         running on the release it was already serving."
+                        " Nothing this cutover started is left registered, and the original is \
+                         still running on the release it was already serving."
                     )?;
                 } else {
                     // `undo_start` swallows each delete so the operator gets
                     // the reason they are here rather than a second error
                     // about the cleanup, which means this is the only place
                     // a failed one is ever mentioned.
+                    //
+                    // No cwd hint. Two different instances can fail to be
+                    // deleted here and only one of them is under the deploy
+                    // tree: the repair `Start` re-registers the ORIGINAL
+                    // config, so the instance it spawns has the operator's
+                    // own checkout as its cwd, identical to the survivor's.
+                    // A hint that is wrong half the time sends an operator
+                    // looking for something that is not there.
                     write!(
                         f,
-                        " The instance it added could NOT be removed, so {sheep} may now be \
-                         running one instance more than it was: `shep describe {sheep}` lists \
-                         them, and the extra one is whichever has its cwd under the deploy tree."
+                        " An instance this cutover started could NOT be removed, so {sheep} may \
+                         now be running more instances than it was: `shep describe {sheep}` \
+                         lists them with their ids, and `shep delete <id>` removes one. Compare \
+                         the count against what {sheep} is configured to run."
                     )?;
                 }
                 // The half that turns a failed cutover into a false green.
