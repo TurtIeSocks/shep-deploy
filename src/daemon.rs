@@ -30,10 +30,9 @@
 //! exercised inside plan one (`adopted_name` below, probe-based
 //! verification, and the deploy sequence). `dog_config` reads the
 //! `[dog.<name>]` section that names the poll loop's interval and
-//! retention, and that poll loop is deferred to plan two - see the plan's
-//! "What this plan does NOT cover" - so it has no caller until then.
+//! retention, via `crate::config::read` and `adopted_name` below.
 //! `restart` has no caller in plan one either; Task 10 chose `Reload` for
-//! the whole deploy sequence. Both stay because this task's own brief named
+//! the whole deploy sequence. It stays because this task's own brief named
 //! all six up front, not because a caller can be pointed at today.
 //!
 //! # Self-identification
@@ -71,18 +70,16 @@ pub trait Daemon {
     /// [`Error::Connect`] or [`Error::Request`] if the shepherd cannot be
     /// reached or refuses, and [`Error::Protocol`] if it answers with
     /// something other than a dog section.
-    // No caller until the poll loop reads its own `[dog.<name>]` section;
-    // see this module's own doc for why all six methods stay anyway.
-    #[allow(dead_code)]
+    // Called by `crate::config::read`, which reads the `[dog.<name>]`
+    // section the poll loop needs.
     async fn dog_config(&self, name: &str) -> Result<String, Error>;
 
     /// Every supervised entry, dogs included.
     ///
     /// # Errors
     /// As [`Self::dog_config`].
-    // Called only by `adopted_name`, which the supervised mode needs and
-    // nothing else does yet.
-    #[allow(dead_code)]
+    // Called only by `adopted_name`, which `crate::config::read` needs to
+    // find its own `[dog.<name>]` section.
     async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error>;
 
     /// Detailed info for one sheep, by exact name.
@@ -225,8 +222,7 @@ fn named(response: &Response) -> String {
 /// because the shepherd would not answer is in the same position as one
 /// adopted under a name the listing does not carry, and has nothing more
 /// useful to do with the distinction.
-// The supervised mode is the only caller, and its poll loop is plan two.
-#[allow(dead_code)]
+// Called by `crate::config::read`, to find its own `[dog.<name>]` section.
 pub async fn adopted_name<D: Daemon>(daemon: &D) -> Option<String> {
     let me = std::process::id();
     daemon

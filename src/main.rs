@@ -32,6 +32,7 @@ compile_error!(
 );
 
 mod build;
+mod config;
 mod daemon;
 mod deploy;
 mod error;
