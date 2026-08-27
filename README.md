@@ -33,7 +33,7 @@ Everything lives under `$SHEP_HOME/deploy/<sheep>/`:
 git/                 one bare clone, shared by every release
 releases/<sha>/      a worktree per release
 current -> releases/<sha>
-deploy.toml          remote, branch, deployed sha, verify mode, watch mode
+deploy.toml          remote, branch, deployed sha, held sha, verify mode, watch mode
 ```
 
 The sheep's `cwd` is `current`, permanently. Set it explicitly when you register the app: a Flockfile `cwd` left to default is resolved at registration, which pins the sheep to one release and makes every later swap invisible to it.
@@ -56,7 +56,7 @@ interval = "30s"
 retention = 5
 ```
 
-`retention` is how many releases each target keeps. It cannot be below 2: the release a failed deploy rolls back to is the second newest, so anything lower would silently disable rollback, and it is refused rather than clamped.
+Both are read once, when the dog starts, so changing either takes a `shep restart deploy`. `retention` is how many releases each target keeps. It cannot be below 2: the release a failed deploy rolls back to is the second newest, so anything lower would silently disable rollback, and it is refused rather than clamped.
 
 One target's failure never stops the others, and never stops the dog. Each target's outcome is reported on its own and the loop carries on. `up to date` prints nothing at all, which is the answer to almost every tick of almost every target, and a line that repeats is said once rather than every interval.
 
