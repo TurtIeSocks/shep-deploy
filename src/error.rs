@@ -181,6 +181,16 @@ pub enum Error {
         removed: bool,
         /// Whether the shepherd's persisted roll was put back.
         repaired: bool,
+        /// The shepherd's own failure, when that is what ended the cutover.
+        ///
+        /// `None` for the ordinary case, a release that did not come up
+        /// with a healthy shepherd. `Some` when a request failed mid-watch,
+        /// which is the arm most likely to leave a poisoned roll AND least
+        /// able to repair it, since [`crate::optin`]'s `undo_start` opens
+        /// with a `describe` of its own. That combination is exactly why it
+        /// is reported here rather than returned bare: a socket error on
+        /// its own says nothing about the record left behind.
+        source: Option<Box<Error>>,
     },
     /// A release's build command exited without succeeding.
     ///
@@ -259,8 +269,12 @@ impl fmt::Display for Error {
                 why,
                 removed,
                 repaired,
+                source,
             } => {
                 write!(f, "{sheep}'s first cutover did not come up. {why}")?;
+                if let Some(source) = source {
+                    write!(f, " ({source})")?;
+                }
                 if *removed {
                     write!(
                         f,
@@ -325,12 +339,14 @@ impl core::error::Error for Error {
             Self::RollbackFailed { source, .. }
             | Self::RolledBack { source, .. }
             | Self::Split { source, .. } => Some(&**source),
+            Self::CutOver { source, .. } => source
+                .as_deref()
+                .map(|err| err as &(dyn core::error::Error + 'static)),
             Self::Protocol(_)
             | Self::Config(_)
             | Self::Git { .. }
             | Self::Raced { .. }
             | Self::Unverified { .. }
-            | Self::CutOver { .. }
             | Self::Build { .. } => None,
         }
     }

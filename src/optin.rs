@@ -295,11 +295,24 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
                 why,
                 removed: undone.removed,
                 repaired: undone.recorded,
+                source: None,
             })
         }
+        // Reported the same way rather than returned bare. This arm is
+        // reached because a request failed, which means the shepherd went
+        // quiet, which is exactly when `undo_start`'s own opening
+        // `describe` fails too. So it is the arm most likely to leave a
+        // poisoned roll and the least able to repair one, and a bare
+        // transport error would tell the operator nothing about that.
         CutOver::Failed(source) => {
-            undo_start(daemon, &sheep, &previous, previous_config).await;
-            Err(source)
+            let undone = undo_start(daemon, &sheep, &previous, previous_config).await;
+            Err(Error::CutOver {
+                sheep,
+                why: SHEPHERD_QUIET.to_owned(),
+                removed: undone.removed,
+                repaired: undone.recorded,
+                source: Some(Box::new(source)),
+            })
         }
     }
 }
@@ -332,6 +345,11 @@ const PORT_COLLISION: &str = "The first cutover is the one deploy that runs two 
      once, so an app that does not bind with SO_REUSEPORT cannot take its own port while the \
      original still holds it. Every deploy after the first replaces the instance rather than \
      joining it, and does not meet this.";
+
+/// The `why` for a cutover that ended because the shepherd stopped
+/// answering, rather than because the release failed.
+const SHEPHERD_QUIET: &str = "The shepherd stopped answering while the new instance was being \
+     watched, so nothing was established about it either way.";
 
 /// How long a newcomer gets to APPEAR before the cutover gives up on it.
 ///
@@ -558,6 +576,8 @@ async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -
 
 #[cfg(test)]
 mod tests {
+    // For `Error::source` on the variant the quiet-shepherd path returns.
+    use core::error::Error as _;
     use std::cell::{Cell, RefCell};
     use std::process::Command;
     use std::time::Duration;
@@ -908,6 +928,8 @@ mod tests {
         refuses: Option<usize>,
         /// Whether the shepherd refuses every `delete`.
         refuses_deletes: bool,
+        /// How long after the `Start` every `describe` starts failing.
+        mute_after: Option<Duration>,
         /// Every `start` the shepherd accepted, in order.
         starts: RefCell<Vec<AppConfig>>,
         /// Every id passed to `delete`, in order.
@@ -928,12 +950,20 @@ mod tests {
                 script,
                 refuses,
                 refuses_deletes: false,
+                mute_after: None,
                 starts: RefCell::new(Vec::new()),
                 deletes: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
                 accepted_at: Cell::new(None),
                 repairs: Cell::new(0),
             }
+        }
+
+        /// The same double, with every `describe` failing from `after`
+        /// onwards - a shepherd that stops answering mid-cutover.
+        fn going_quiet_after(mut self, after: Duration) -> Self {
+            self.mute_after = Some(after);
+            self
         }
 
         /// The same double, with every `delete` refused.
@@ -987,6 +1017,15 @@ mod tests {
                 .accepted_at
                 .get()
                 .map_or(Duration::ZERO, |accepted_at| Instant::now() - accepted_at);
+
+            if self.accepted_at.get().is_some()
+                && self.mute_after.is_some_and(|after| elapsed >= after)
+            {
+                return Err(Error::Request(RequestError::Rpc(RpcError {
+                    code: RpcErrorCode::Internal,
+                    message: "the shepherd is not answering".to_owned(),
+                })));
+            }
 
             if let Shape::Up {
                 status,
@@ -1239,6 +1278,16 @@ mod tests {
         cutover_fixture_of(&[7], vec![(Duration::ZERO, Shape::Absent)], None).await
     }
 
+    /// A shepherd that accepts the `Start` and then stops answering.
+    ///
+    /// Muted from the instant the `Start` lands, which is the worst
+    /// version: the roll has been poisoned and every request that could
+    /// read or repair it fails.
+    async fn cutover_fixture_shepherd_goes_quiet() -> (CutOverDouble, Prepared, Dirs) {
+        let (daemon, prepared, dirs) = cutover_fixture_of(&[7], comes_up(), None).await;
+        (daemon.going_quiet_after(Duration::ZERO), prepared, dirs)
+    }
+
     /// The port-collision shape, with every `delete` refused as well.
     async fn cutover_fixture_dies_and_refuses_deletes() -> (CutOverDouble, Prepared, Dirs) {
         let (daemon, prepared, dirs) = cutover_fixture_of(&[7], dies_during_dwell(), None).await;
@@ -1455,6 +1504,41 @@ mod tests {
         assert!(
             shown.contains("shep-deploy setup bpm"),
             "it says how to try again: {shown}"
+        );
+    }
+
+    /// fails if a cutover ended by a shepherd that went quiet reports the
+    /// transport error and nothing else. This is the arm most likely to
+    /// leave the roll poisoned and the least able to repair it: it is
+    /// reached BECAUSE a request failed, and `undo_start` opens with a
+    /// `describe` of its own, so the repair almost always fails too. The
+    /// benign case, a release that did not come up with a healthy shepherd,
+    /// gets careful `repaired` reporting; this one used to get a bare
+    /// socket error saying nothing about the record left behind. The
+    /// shepherd's own failure still has to reach the operator, so it is
+    /// carried as a source rather than dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_shepherd_that_goes_quiet_still_reports_the_repair_it_could_not_make() {
+        let (daemon, prepared, _dirs) = cutover_fixture_shepherd_goes_quiet().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        assert!(
+            matches!(
+                err,
+                Error::CutOver {
+                    repaired: false,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.source().is_some(), "the shepherd's own error is kept");
+        let shown = err.to_string();
+        assert!(shown.contains("stopped answering"), "{shown}");
+        assert!(
+            shown.contains("muster"),
+            "the roll paragraph fires: {shown}"
         );
     }
 
