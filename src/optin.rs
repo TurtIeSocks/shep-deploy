@@ -116,11 +116,28 @@ pub async fn prepare<D: Daemon>(
         // `shep deploy` on it builds, swaps and reloads the sheep at its
         // own checkout, sees a full pid turnover because the reload really
         // did replace that instance, and reports success for a release
-        // nothing ever ran. `deployed` is what separates them, and an
-        // unreadable record falls to the cautious side.
-        let cut_over_already =
-            State::read(&tree.state_file()).is_ok_and(|state| state.deployed.is_some());
-        return Err(Error::Config(if cut_over_already {
+        // nothing ever ran. `deployed` is what separates them.
+        //
+        // A record that cannot be READ is neither, and guessing has no
+        // cautious side: the two branches give opposite advice and one of
+        // them says to remove the tree. A cut-over sheep's cwd is inside
+        // that tree, so following it on a live target destroys a running
+        // service's working directory, which is the one thing here that
+        // cannot be undone. So this refuses instead.
+        let state = State::read(&tree.state_file()).map_err(|source| {
+            Error::Config(format!(
+                "{sheep} has a deploy tree at {} and its record at {} cannot be read: \
+                 {source}. Refusing rather than guessing. That record is the only thing that \
+                 says whether {sheep} was ever cut over, and the two answers need opposite \
+                 handling. Do NOT remove the tree until you know which it is: if {sheep} WAS \
+                 cut over, its working directory is inside it and removing it takes a running \
+                 service's cwd with it. Restore or repair that file first - `shep describe \
+                 {sheep}` shows whether the sheep is running from inside this tree.",
+                tree.root().display(),
+                tree.state_file().display()
+            ))
+        })?;
+        return Err(Error::Config(if state.deployed.is_some() {
             format!(
                 "{sheep} is already a deploy target: its tree is at {}. Deploy it with \
                  `shep deploy {sheep}`, or change how it is watched with \
@@ -1536,6 +1553,42 @@ mod tests {
         // was ever begun.
         assert!(matches!(err, Error::Request(_)), "{err}");
         assert!(daemon.deleted().is_empty());
+    }
+
+    /// fails if a record that cannot be READ is treated as evidence of
+    /// anything. The two branches below give opposite advice and one of
+    /// them says to remove the tree, so a guess has no cautious side: a
+    /// live, cut-over sheep's working directory is `<tree>/current`, and an
+    /// operator who follows that instruction on one deletes a running
+    /// service's cwd. Permissions, a hand-edit typo and corruption all
+    /// reach here, and none of them is an abandoned cutover.
+    ///
+    /// It is the only irreversible thing this crate can tell somebody to
+    /// do, which is why it refuses rather than picking the branch that
+    /// looked safer in the direction it was thought about.
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_refuses_rather_than_guessing() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout_with_commit();
+        write_target(home.path(), "bpm", Watch::Auto, Some("old"));
+        let tree = Tree::for_sheep(home.path(), "bpm");
+        std::fs::write(tree.state_file(), "this is not toml = = =").expect("corrupt the record");
+        let daemon = RollOf(&[("bpm", checkout.path())]);
+
+        let err = prepare(&daemon, home.path(), "bpm")
+            .await
+            .expect_err("refuses");
+
+        let shown = err.to_string();
+        assert!(shown.contains("cannot be read"), "{shown}");
+        assert!(
+            shown.contains("Do NOT remove the tree"),
+            "the irreversible instruction is withheld: {shown}"
+        );
+        assert!(
+            !shown.contains("was never cut over"),
+            "it must not claim the cutover was abandoned: {shown}"
+        );
     }
 
     /// fails if a target whose cutover was ABANDONED is pointed at
