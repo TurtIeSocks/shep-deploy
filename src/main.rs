@@ -74,7 +74,7 @@ usage: shep-deploy <verb> [args]
 
   deploy <sheep> [--watch auto|manual]   deploy one sheep, or set how it is watched
   setup <sheep>                          take a sheep over
-  survey                                 report where every sheep stands
+  survey                                 report where every registered sheep stands
   on-remove                              lifecycle hook; shep runs this itself
 
 Adopted as `deploy`, the same verbs run as `shep deploy <verb> [args]`, and
@@ -100,7 +100,7 @@ const ROLLED_BACK: u8 = 12;
 enum Route<'a> {
     /// No argv at all: the supervised poll loop, per the dog contract.
     Poll,
-    /// Report where every sheep stands.
+    /// Report where every registered sheep stands.
     Survey,
     /// Deploy the named sheep.
     Deploy(&'a str),

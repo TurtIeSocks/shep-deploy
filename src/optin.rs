@@ -125,7 +125,7 @@ pub async fn prepare<D: Daemon>(
     let previous_config = registered.get(sheep).cloned().ok_or_else(|| {
         Error::Config(format!(
             "the shepherd has no sheep named {sheep:?} registered, so there is nothing to take \
-             over: `shep-deploy survey` lists every sheep and where it stands"
+             over: `shep-deploy survey` lists every registered sheep and where it stands"
         ))
     })?;
     let checkout = PathBuf::from(previous_config.cwd.as_deref().ok_or_else(|| {
