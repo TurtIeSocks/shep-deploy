@@ -240,6 +240,22 @@ mod tests {
             .status()
             .expect("git is on PATH");
         assert!(status.success(), "git init failed");
+        // An identity, because a commit without one fails. A developer's
+        // machine has a global `user.email` and a CI runner does not, so
+        // leaving this out makes the fixture pass locally and fail only on
+        // CI, which is where this test failed on the repository's very first
+        // push. `deploy.rs` and `optin.rs`'s own fixtures already set one.
+        for (key, value) in [("user.email", "test@example.com"), ("user.name", "test")] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .arg("config")
+                .arg(key)
+                .arg(value)
+                .status()
+                .expect("git is on PATH");
+            assert!(status.success(), "git config {key} failed");
+        }
         for (name, contents) in files {
             std::fs::write(dir.path().join(name), contents).expect("write fixture file");
         }
