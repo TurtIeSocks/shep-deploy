@@ -34,7 +34,8 @@
 //! refusal is there for a second OPERATOR invocation - it never has to hold
 //! the loop off itself.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::Path;
 
 use tokio::time::sleep;
@@ -106,26 +107,103 @@ async fn tick<D: Daemon>(
     results
 }
 
-/// Whether this outcome is worth saying, given what has already been said
-/// about this target.
+/// What one target's outcome is worth saying, and which log it belongs in.
 ///
-/// Everything is, except a repeat of the one refusal that cannot clear on
-/// its own. A tree the cutover never landed on is refused identically every
-/// interval - no fetch, no commit and no retry changes it, only an operator
-/// removing the tree and running `setup` again - and at thirty seconds that
-/// is 2,880 identical lines a day with everything the dog really has to say
-/// buried in between them. So it is said once, and again if the target ever
-/// does anything else first: a target that was repaired and then broke the
-/// same way again is news.
-fn worth_saying(
-    said: &mut BTreeSet<String>,
-    sheep: &str,
-    outcome: &Result<Outcome, Error>,
-) -> bool {
-    if matches!(outcome, Err(Error::NotCutOver { .. })) {
-        return said.insert(sheep.to_owned());
+/// Split from the writing so that both halves can be checked: what a tick
+/// says is the only observable this module has, and a loop whose prints
+/// were all deleted passed the suite that came before this type existed.
+#[derive(Debug, PartialEq, Eq)]
+enum Said {
+    /// Something that happened, for stdout.
+    Note(String),
+    /// Something that did not, for stderr.
+    Complaint(String),
+}
+
+impl Said {
+    /// The line itself, without the stream it goes to.
+    fn text(&self) -> &str {
+        match self {
+            Self::Note(text) | Self::Complaint(text) => text,
+        }
     }
-    said.remove(sheep);
+}
+
+/// What to say about one target's outcome, or `None` for silence.
+///
+/// `UpToDate` says nothing at all, deliberately: it is the answer to almost
+/// every tick of almost every target, and a dog that logged a line per
+/// target per thirty seconds would bury the deploys nobody wants to miss
+/// under its own heartbeat.
+///
+/// A rollback is a complaint even though it arrives as an `Ok`. The machine
+/// is healthy, which is why it is not an error - and the deploy did not
+/// land, which is why it does not belong in the log an operator reads to
+/// see what shipped.
+fn report(sheep: &str, outcome: &Result<Outcome, Error>) -> Option<Said> {
+    match outcome {
+        Ok(Outcome::UpToDate) => None,
+        Ok(Outcome::Deployed { sha }) => Some(Said::Note(format!("{sheep} deployed {sha}"))),
+        Ok(Outcome::RolledBack { to, why }) => Some(Said::Complaint(format!(
+            "{sheep} rolled back to {to}: {why}"
+        ))),
+        Err(err) => Some(Said::Complaint(format!("{sheep}: {err}"))),
+    }
+}
+
+/// How many ticks a target's repeated line is muted for before it is said
+/// again.
+///
+/// Counted in ticks rather than in time, so a loop that polls less often
+/// says it less often - 120 is an hour at the default interval. It is not
+/// zero, because the alternative is a condition that is mentioned once and
+/// then never again: a dog running for months would have its only
+/// explanation in a log that has since rotated, and a target removed and
+/// recreated would have its first refusal swallowed by the entry left over
+/// from its predecessor.
+const RESAY: u32 = 120;
+
+/// One target's last line, and how many ticks it has been muted for.
+struct Repeat {
+    /// The line as it was said.
+    line: String,
+    /// Ticks since it was last said.
+    muted: u32,
+}
+
+/// Whether `line` is worth saying, given what was last said about this
+/// target.
+///
+/// A line that differs from the last one is always worth saying, and a
+/// repeat of the same line is not, until [`RESAY`] ticks have gone by.
+///
+/// The criterion is the line rather than a list of error variants, and that
+/// is the whole of the fix it replaces. "The refusals that cannot clear on
+/// their own" is not a set anybody can enumerate correctly - a tree the
+/// cutover never landed on, a `deploy.toml` that will not parse, a deploy
+/// directory that cannot be listed, a remote that no longer resolves and a
+/// build that fails on a committed typo are all permanent until somebody
+/// acts - and an enumeration that misses one prints 2,880 identical lines a
+/// day. A condition that really can clear on its own says something
+/// different the moment it does, which re-arms the target without anything
+/// having to know which conditions those are.
+fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str) -> bool {
+    if let Some(seen) = previous.get_mut(sheep)
+        && seen.line == line
+    {
+        seen.muted += 1;
+        if seen.muted < RESAY {
+            return false;
+        }
+    }
+
+    previous.insert(
+        sheep.to_owned(),
+        Repeat {
+            line: line.to_owned(),
+            muted: 0,
+        },
+    );
     true
 }
 
@@ -135,10 +213,8 @@ fn worth_saying(
 /// dog is doing its job immediately rather than looking broken for an
 /// interval first.
 ///
-/// `Outcome::UpToDate` prints nothing at all, deliberately: it is the
-/// answer to almost every tick of almost every target, and a dog that
-/// logged a line per target per thirty seconds would bury the deploys
-/// nobody wants to miss under its own heartbeat.
+/// What it says per target is [`report`]'s, and how often it repeats itself
+/// is [`worth_saying`]'s.
 ///
 /// # Errors
 /// Never returns `Ok`, and in practice never returns at all: a target's
@@ -149,32 +225,77 @@ fn worth_saying(
 /// something in here can fail outward.
 ///
 /// # Cancellation
-/// Stopping mid-deploy is not interrupted anywhere in particular. A
-/// `tokio::select!` around this future cancels it at its next await point,
-/// which can be inside a deploy, and that is acceptable: every step is
-/// either before the swap, where nothing has been disturbed, or inside the
-/// reload, where the shepherd already has its instructions and finishes on
-/// its own. What a cancellation can lose is the record write after a
-/// verified deploy, which leaves `deploy.toml` naming the previous release
-/// and the next tick deploying the same sha again. That costs one rebuild
-/// and repairs itself, which is the right shape of failure for a signal
-/// that means "stop now".
+/// Stopping mid-deploy is not interrupted at a step of this loop's
+/// choosing. A `tokio::select!` around this future cancels it at its next
+/// await point, which can be inside a deploy, and that is acceptable: every
+/// step is either before the swap, where nothing has been disturbed, or
+/// inside the reload, where the shepherd already has its instructions and
+/// finishes on its own. What a cancellation can lose is the record write
+/// after a verified deploy, which leaves `deploy.toml` naming the previous
+/// release and the next tick deploying the same sha again. That costs one
+/// rebuild and repairs itself, which is the right shape of failure for a
+/// signal that means "stop now".
+///
+/// It can also be deferred, which is a separate matter and not this
+/// module's to fix: `git` runs through blocking `std::process::Command` on
+/// a current-thread runtime, so nothing else is polled while a fetch is in
+/// flight, and a fetch against a host that is not answering is not a
+/// bounded wait.
 pub async fn run<D: Daemon>(daemon: &D, shep_home: &Path, config: DogConfig) -> Result<(), Error> {
-    let mut said = BTreeSet::new();
+    run_with(
+        daemon,
+        shep_home,
+        config,
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+    .await
+}
+
+/// [`run`], writing to somewhere a test can read.
+///
+/// The whole of what this loop does that anybody sees is what it writes, so
+/// the two streams are arguments rather than macros: with `println!` baked
+/// in, deleting every line of output left the suite green.
+///
+/// # Errors
+/// As [`run`]. A write that fails is NOT one of them: a dog whose log pipe
+/// has gone should carry on deploying rather than die of it, so a failed
+/// write is passed over, exactly as `println!` would have carried on after
+/// a full disk.
+async fn run_with<D: Daemon, O: Write, E: Write>(
+    daemon: &D,
+    shep_home: &Path,
+    config: DogConfig,
+    out: &mut O,
+    err: &mut E,
+) -> Result<(), Error> {
+    let mut previous: BTreeMap<String, Repeat> = BTreeMap::new();
     loop {
-        for (sheep, outcome) in tick(daemon, shep_home, config).await {
-            if !worth_saying(&mut said, &sheep, &outcome) {
+        let results = tick(daemon, shep_home, config).await;
+
+        // A target that is gone stops muting anything. Otherwise a target
+        // deleted and recreated has its first line swallowed by the entry
+        // its predecessor left behind.
+        previous.retain(|name, _| results.iter().any(|(seen, _)| seen == name));
+
+        for (sheep, outcome) in results {
+            let Some(said) = report(&sheep, &outcome) else {
+                // Nothing to say means nothing to repeat: a target that is
+                // up to date has put whatever it was complaining about
+                // behind it.
+                previous.remove(&sheep);
+                continue;
+            };
+            if !worth_saying(&mut previous, &sheep, said.text()) {
                 continue;
             }
-            match outcome {
-                Ok(Outcome::UpToDate) => {}
-                Ok(Outcome::Deployed { sha }) => println!("{sheep} deployed {sha}"),
-                Ok(Outcome::RolledBack { to, why }) => {
-                    println!("{sheep} rolled back to {to}: {why}");
-                }
-                Err(err) => eprintln!("{sheep}: {err}"),
-            }
+            let _ = match &said {
+                Said::Note(text) => writeln!(out, "{text}"),
+                Said::Complaint(text) => writeln!(err, "{text}"),
+            };
         }
+
         sleep(config.interval).await;
     }
 }
@@ -208,6 +329,19 @@ mod tests {
         )
     }
 
+    /// `dir`'s current `HEAD` sha.
+    fn head_of(dir: &Path) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        String::from_utf8(out.stdout)
+            .expect("utf-8 sha")
+            .trim()
+            .to_owned()
+    }
+
     /// Runs a git subcommand for fixture setup, panicking if it fails.
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -232,6 +366,7 @@ mod tests {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
             deployed: Some("a1b2c3".to_owned()),
+            failed: None,
             verify: Verify::default(),
             watch,
             origin_cwd: None,
@@ -279,6 +414,7 @@ mod tests {
             remote,
             branch: "main".to_owned(),
             deployed: Some(first),
+            failed: None,
             verify: Verify::Probed,
             watch,
             origin_cwd: None,
@@ -583,52 +719,187 @@ mod tests {
         assert_eq!(counter.ticks(), 1);
     }
 
-    /// fails if a refusal that cannot clear on its own is repeated every
-    /// interval. A tree the cutover never landed on is refused identically
-    /// forever, and at thirty seconds that is 2,880 identical lines a day
-    /// with everything else the dog has to say in between them.
+    /// fails if a target that keeps failing the same way keeps saying so.
+    /// At thirty seconds, a line an interval is 2,880 identical lines a day
+    /// with everything the dog really has to say buried in between them.
     #[test]
-    fn a_refusal_that_cannot_clear_is_said_once() {
-        let mut said = BTreeSet::new();
-        let refused = || {
-            Err(Error::NotCutOver {
-                sheep: "web".to_owned(),
-                tree: PathBuf::from("/srv/shep/deploy/web"),
-            })
-        };
+    fn a_line_that_repeats_is_said_once() {
+        let mut previous = BTreeMap::new();
 
-        assert!(worth_saying(&mut said, "web", &refused()));
-        assert!(!worth_saying(&mut said, "web", &refused()));
+        assert!(worth_saying(
+            &mut previous,
+            "web",
+            "web: the remote is gone"
+        ));
+        assert!(!worth_saying(
+            &mut previous,
+            "web",
+            "web: the remote is gone"
+        ));
+        assert!(!worth_saying(
+            &mut previous,
+            "web",
+            "web: the remote is gone"
+        ));
         // A different target is a different line.
-        assert!(worth_saying(&mut said, "koji", &refused()));
+        assert!(worth_saying(
+            &mut previous,
+            "koji",
+            "koji: the remote is gone"
+        ));
     }
 
-    /// fails if a target that was refused once is muted after it starts
-    /// working again, or if an ordinary failure is ever muted. Only the one
-    /// refusal that cannot clear is said once; everything else is said
-    /// every time it happens, because everything else can be new
-    /// information.
+    /// fails if the mute is keyed on anything narrower than the line. The
+    /// criterion it replaced was one error variant, and every other
+    /// permanent condition - an unparseable record, a deploy directory that
+    /// cannot be listed, a remote that no longer resolves, a build that
+    /// fails on a committed typo - went on saying so every interval. There
+    /// is no correct list of those, which is the argument for the line.
     #[test]
-    fn everything_else_is_said_every_time() {
-        let mut said = BTreeSet::new();
-        let refused = Err(Error::NotCutOver {
-            sheep: "web".to_owned(),
-            tree: PathBuf::from("/srv/shep/deploy/web"),
-        });
-        let ordinary: Result<Outcome, Error> = Err(Error::Build { status: Some(1) });
+    fn every_repeated_line_is_muted_not_one_chosen_kind() {
+        let mut previous = BTreeMap::new();
+        let lines = [
+            "web: bad deploy configuration: /srv/deploy/web/deploy.toml: expected an equals",
+            "web: `git fetch origin` exited with status 128: could not resolve host",
+            "web: the build command exited with status 1",
+        ];
 
-        assert!(worth_saying(&mut said, "web", &refused));
-        assert!(worth_saying(&mut said, "web", &ordinary));
-        assert!(worth_saying(&mut said, "web", &ordinary));
-        // The tree was fixed and the target deployed, so the refusal is
-        // worth hearing about again if it ever comes back.
-        assert!(worth_saying(
-            &mut said,
-            "web",
-            &Ok(Outcome::Deployed {
-                sha: "abc".to_owned()
-            })
-        ));
-        assert!(worth_saying(&mut said, "web", &refused));
+        for line in lines {
+            assert!(worth_saying(&mut previous, "web", line), "{line}");
+            assert!(!worth_saying(&mut previous, "web", line), "{line}");
+        }
+    }
+
+    /// fails if a condition that cleared stays muted, so that its coming
+    /// back is never mentioned. A line that differs is new information, and
+    /// a target that has started working again is the clearest case of it.
+    #[test]
+    fn a_line_that_changes_is_said_again() {
+        let mut previous = BTreeMap::new();
+        let broken = "web: the remote is gone";
+
+        assert!(worth_saying(&mut previous, "web", broken));
+        assert!(!worth_saying(&mut previous, "web", broken));
+        assert!(worth_saying(&mut previous, "web", "web deployed abc1234"));
+        assert!(worth_saying(&mut previous, "web", broken));
+    }
+
+    /// fails if a muted line is muted forever. A dog runs for months, and a
+    /// condition mentioned once in a log that has since rotated is a
+    /// condition nobody can find. Said again every `RESAY` ticks, which is
+    /// an hour at the default interval.
+    #[test]
+    fn a_muted_line_is_said_again_eventually() {
+        let mut previous = BTreeMap::new();
+        let line = "web: the remote is gone";
+
+        assert!(worth_saying(&mut previous, "web", line));
+        let said = (0..RESAY * 2)
+            .filter(|_| worth_saying(&mut previous, "web", line))
+            .count();
+
+        assert_eq!(said, 2, "once every RESAY ticks, not once ever");
+    }
+
+    /// fails if what a tick did stops reaching the log, or reaches the
+    /// wrong one. This is the whole of what an operator sees of the poll
+    /// loop: nothing else about it is observable at all.
+    #[test]
+    fn each_outcome_says_what_it_did_and_where() {
+        assert_eq!(report("web", &Ok(Outcome::UpToDate)), None, "the heartbeat");
+        assert_eq!(
+            report(
+                "web",
+                &Ok(Outcome::Deployed {
+                    sha: "a1b2c3".to_owned()
+                })
+            ),
+            Some(Said::Note("web deployed a1b2c3".to_owned()))
+        );
+        // A rollback arrives as an `Ok` because the machine is healthy, and
+        // is still a complaint because the deploy did not land.
+        assert_eq!(
+            report(
+                "web",
+                &Ok(Outcome::RolledBack {
+                    to: "old".to_owned(),
+                    why: "it did not come up".to_owned()
+                })
+            ),
+            Some(Said::Complaint(
+                "web rolled back to old: it did not come up".to_owned()
+            ))
+        );
+        let err = report("web", &Err(Error::Build { status: Some(1) }));
+        let Some(Said::Complaint(text)) = err else {
+            panic!("a failure is a complaint: {err:?}");
+        };
+        assert!(text.starts_with("web: "), "{text}");
+    }
+
+    /// fails if a deploy the loop made never reaches the log. The whole
+    /// output block could be deleted and every test above still passes:
+    /// `report` and `worth_saying` are pure, and nothing else pins that
+    /// their verdict is what actually gets written, or that it goes to
+    /// stdout where an operator looks for what shipped.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_is_written_to_the_log_it_belongs_in() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin = write_target_ready(home.path(), "fine", Watch::Auto);
+        let head = head_of(origin.path());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_with(
+                &Ready::new(),
+                home.path(),
+                DogConfig {
+                    interval: Duration::from_secs(600),
+                    retention: 5,
+                },
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            String::from_utf8(out).expect("utf-8"),
+            format!("fine deployed {head}\n")
+        );
+        assert!(err.is_empty(), "nothing failed");
+    }
+
+    /// fails if a failure never reaches the error log, or reaches it once
+    /// per tick. Both halves matter and neither is pinned by the pure
+    /// tests: this is the only thing that says `worth_saying`'s verdict
+    /// actually gates a write.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_is_written_once_however_many_ticks_repeat_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target(home.path(), "broken", Watch::Auto, Some("old"));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+
+        // Three ticks' worth, as the interval test above.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(305),
+            run_with(
+                &Ready::new(),
+                home.path(),
+                DogConfig {
+                    interval: Duration::from_secs(150),
+                    retention: 5,
+                },
+                &mut out,
+                &mut err,
+            ),
+        )
+        .await;
+
+        let complained = String::from_utf8(err).expect("utf-8");
+        assert_eq!(complained.lines().count(), 1, "{complained}");
+        assert!(complained.starts_with("broken: "), "{complained}");
+        assert!(out.is_empty(), "nothing deployed");
     }
 }
