@@ -569,10 +569,31 @@ fn undo_swap(tree: &Tree, previous: Option<&Path>, why: &Error) -> Result<(), Er
 /// what somebody sets in the middle of an incident, and a deploy firing at
 /// that moment is the exact opposite of what they asked for.
 ///
+/// `auto` is refused on a tree the cutover never landed on, and `manual` is
+/// allowed in every state. The asymmetry is the same one [`deploy`] draws
+/// at the top of this file: such a target has served nothing, a deploy
+/// against it would report success for a release nothing ran, and `auto` is
+/// the setting that asks for that deploy unattended, once an interval,
+/// forever.
+///
 /// # Errors
-/// [`Error::Io`] if `deploy.toml` cannot be written - see
-/// [`State::write`]. `state` is updated in memory either way.
+/// [`Error::Config`] if `watch` is `auto` and the target's record names no
+/// released sha. [`Error::Io`] if `deploy.toml` cannot be written - see
+/// [`State::write`]. `state` is left alone when the refusal fires, and
+/// updated in memory whether or not the write succeeds.
 pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Error> {
+    if watch == Watch::Auto && state.deployed.is_none() {
+        return Err(Error::Config(format!(
+            "{} has a deploy tree but was never cut over to it, so there is nothing for the \
+             poll loop to deploy: its record names no released sha, and nothing has ever been \
+             served from that tree. Watching it would deploy at every interval and each of \
+             those would be refused. Finish the cutover instead - remove {} and run \
+             `shep-deploy setup {}`.",
+            tree.sheep(),
+            tree.root().display(),
+            tree.sheep()
+        )));
+    }
     state.watch = watch;
     state.write(&tree.state_file())
 }
@@ -1026,7 +1047,9 @@ mod tests {
             branch: "main".to_owned(),
             deployed: None,
             verify: crate::state::Verify::Probed,
-            watch: crate::state::Watch::Auto,
+            // What `crate::optin::prepare` writes: a tree nothing has
+            // been served from yet is not the poll loop's.
+            watch: crate::state::Watch::Manual,
             origin_cwd: None,
             origin_script: None,
             checkout: origin.path().to_owned(),
@@ -2493,6 +2516,33 @@ mod tests {
             Some(fixture.tree.release(&previous))
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a tree the cutover never landed on can be put under the
+    /// poll loop. `deploy` refuses such a target, so `auto` here arms a
+    /// target that can only be refused, once an interval, for as long as
+    /// the abandoned tree sits there - and it is the last verb that
+    /// treated one as ordinary. `manual` stays allowed in every state,
+    /// because it is the direction out.
+    #[tokio::test]
+    async fn a_tree_the_cutover_never_landed_on_cannot_be_watched() {
+        let mut fixture = fixture_before_any_release();
+
+        let err = set_watch(&fixture.tree, &mut fixture.state, Watch::Auto).expect_err("refuses");
+
+        let shown = err.to_string();
+        assert!(shown.contains("never cut over"), "{shown}");
+        assert!(shown.contains("shep-deploy setup web"), "{shown}");
+        assert_eq!(fixture.state.watch, Watch::Manual, "unchanged in memory");
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("deploy.toml still reads")
+                .watch,
+            Watch::Manual,
+            "and unchanged on disk"
+        );
+
+        set_watch(&fixture.tree, &mut fixture.state, Watch::Manual).expect("manual is allowed");
     }
 
     /// fails if a prune failure fails the deploy that triggered it. The

@@ -323,8 +323,10 @@ async fn on_remove() -> ExitCode {
 /// Sets `sheep`'s watch mode and returns, without deploying.
 ///
 /// # Errors
-/// [`Error::Config`] if `mode` is neither `auto` nor `manual`,
-/// [`Error::Io`] if `deploy.toml` cannot be read or written.
+/// [`Error::Config`] if `mode` is neither `auto` nor `manual`, or if `auto`
+/// was asked for on a tree the cutover never landed on - see
+/// [`deploy::set_watch`]. [`Error::Io`] if `deploy.toml` cannot be read or
+/// written.
 fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
     let watch = match mode {
         "auto" => Watch::Auto,
