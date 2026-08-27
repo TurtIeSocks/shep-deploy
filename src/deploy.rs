@@ -194,6 +194,12 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// [`core::error::Error::source`]. The deploy still failed, so it is still
 /// an error, but an operator reading it can tell a rollback happened.
 ///
+/// A failure BEFORE the shepherd accepted the reload - the generation
+/// capture, or the reload itself being refused - means nothing was ever
+/// started on the new release, so `current` is put back and that failure is
+/// returned as it arrived, unwrapped. The machine is left exactly as it was
+/// before the deploy, which is why there is nothing extra to say about it.
+///
 /// A rollback that itself fails gives one of three errors, and a caller
 /// that wants to detect "the rollback did not work" has to accept all of
 /// them rather than matching [`Error::RollbackFailed`] alone:
@@ -204,9 +210,13 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// - [`Error::RollbackFailed`], wrapping anything else the rollback met -
 ///   a swap that could not be made, a record that could not be written, a
 ///   reload refused for a reason that can never clear.
-/// - [`Error::Unverified`], bare, when there was no previous release to
-///   return to at all - a target's very first deploy. No rollback was
-///   attempted, so nothing frames it as one that failed.
+/// - [`Error::Unverified`], bare, when there was no earlier release to
+///   return to at all. No rollback was attempted, so nothing frames it as
+///   one that failed.
+///
+/// [`Error::RollbackFailed`] is also what a failed `undo_swap` gives, for
+/// the same reason it wraps a failed `restore`: `current` is left naming a
+/// release nothing is running.
 pub async fn deploy<D: Daemon>(
     daemon: &D,
     tree: &Tree,
@@ -252,33 +262,24 @@ pub async fn deploy<D: Daemon>(
     }
     swap::point_at(&tree.current(), &release)?;
 
-    // Captured here, before the reload, for two reasons at once: `wait`
-    // needs to know which processes were already serving, and `budget`
-    // needs to know how many of them there are. See
-    // [`crate::verify::Generation`] for the first and [`budget`] for the
-    // second.
-    let before = Generation::of(daemon, sheep).await?;
-    let budget = budget(&app, before.instances());
-
-    // Named for the reload because that is what the operator's message
-    // talks about, and taken a round trip early: `settle`'s first act is
-    // the reload RPC, so this leads it by one request rather than by any
-    // of the work the deploy did before it.
-    let reloaded_at = Instant::now();
-    match settle(daemon, sheep, state.verify, &before, budget).await {
-        Ok(true) => {
+    // THE BOUNDARY. Every fallible step from here on lives inside `land`,
+    // so that this one `match` is the only place that decides what to undo.
+    // It used to sit around a `settle` call with the generation capture
+    // outside it, and that one line outside was enough to leave `current`
+    // on a release nothing had verified: see [`land`].
+    match land(daemon, sheep, &app, state.verify).await {
+        Landed::Verified => {
             state.deployed = Some(head.clone());
             state.write(&tree.state_file())?;
             Ok(Outcome::Deployed { sha: head })
         }
-        Ok(false) => {
-            // What actually elapsed, not the budget. An `Alive` verdict
-            // takes its turnover wait PLUS the dwell, so quoting the budget
-            // understated the wait every time that mode failed.
-            let why = format!(
-                "it did not come up and stay up, {}s after the reload",
-                reloaded_at.elapsed().as_secs()
-            );
+        // Nothing was ever started on the new release, so there is nothing
+        // to reload onto the old one - only a symlink to put back.
+        Landed::NotStarted(source) => {
+            undo_swap(tree, previous.as_deref(), &source)?;
+            Err(source)
+        }
+        Landed::NotVerified { why, patience } => {
             let to = roll_back(
                 daemon,
                 tree,
@@ -286,35 +287,154 @@ pub async fn deploy<D: Daemon>(
                 previous.as_deref(),
                 &head,
                 &why,
-                budget,
+                patience,
             )
             .await?;
             Ok(Outcome::RolledBack { to, why })
         }
-        // The same rollback as above, not a lesser one. `settle` reloads
-        // before it verifies, so an error here can arrive with the new
-        // release already running: shep has spawned it, waited for it, and
-        // drained the old instance, and only then did a `describe` fail.
-        // Moving a symlink does not move a running process, so a swap
-        // without a reload would leave the daemon on the new code while
-        // `current` and `deploy.toml` both name the old one.
-        Err(err) => {
+        // The same rollback as above, not a lesser one. This error arrived
+        // after a reload the shepherd accepted, so the new release may be
+        // running: shep spawns the replacement, waits for it, and drains
+        // the old instance, and only then did a `describe` fail. Moving a
+        // symlink does not move a running process, so a swap without a
+        // reload would leave the daemon on the new code while `current`
+        // and `deploy.toml` both name the old one.
+        Landed::Failed { source, patience } => {
             let to = roll_back(
                 daemon,
                 tree,
                 state,
                 previous.as_deref(),
                 &head,
-                &err.to_string(),
-                budget,
+                &source.to_string(),
+                patience,
             )
             .await?;
             Err(Error::RolledBack {
                 to,
-                source: Box::new(err),
+                source: Box::new(source),
             })
         }
     }
+}
+
+/// What became of a release between the swap and the verdict.
+///
+/// The distinction the whole enum exists for is whether the shepherd ever
+/// ACCEPTED the reload, because that is what decides how much has to be
+/// undone. Before it, the swap is the only thing that moved and putting
+/// `current` back restores the machine exactly. After it, a process may be
+/// running the new release, and a symlink moving back does not move a
+/// running process.
+enum Landed {
+    /// The flock turned over and the new release is serving.
+    Verified,
+    /// The reload was never issued at all, so nothing was started on the
+    /// new release.
+    NotStarted(Error),
+    /// The reload was issued, and the release did not come up.
+    NotVerified {
+        /// What to tell an operator, measured rather than budgeted.
+        why: String,
+        /// How long the rollback's own reload may keep retrying.
+        patience: Duration,
+    },
+    /// The reload was issued, and something failed after it.
+    Failed {
+        /// What failed.
+        source: Error,
+        /// As [`Self::NotVerified::patience`].
+        patience: Duration,
+    },
+}
+
+/// Reloads `sheep` onto the release that has just been swapped in, and
+/// waits for the verdict `mode` asks for.
+///
+/// Every fallible thing a deploy does after the swap happens here, and that
+/// is the point rather than tidiness. This function cannot return an error:
+/// each failure is a [`Landed`] variant, so the caller's `match` is
+/// exhaustive over "what has to be undone" instead of over "what went
+/// wrong", and a step added here later cannot quietly escape the rollback
+/// decision the way `Generation::of` did - one `?` outside the boundary
+/// left `current` on a release nothing had verified, `deploy.toml` on the
+/// old one, no reload ever sent, and any later restart bringing the sheep
+/// up on the unverified release.
+///
+/// The generation is captured before the reload, and both readings of it
+/// matter: [`crate::verify::wait`] needs to know which processes were
+/// already serving, and [`budget`] needs to know how many of them there
+/// are.
+async fn land<D: Daemon>(daemon: &D, sheep: &str, app: &AppConfig, mode: Verify) -> Landed {
+    let before = match Generation::of(daemon, sheep).await {
+        Ok(before) => before,
+        Err(source) => return Landed::NotStarted(source),
+    };
+    let patience = budget(app, before.instances());
+
+    if let Err(source) = daemon.reload(sheep).await {
+        return Landed::NotStarted(source);
+    }
+    // After the RPC returns, so "{n}s after the reload" is measured from
+    // the reload rather than from a request before it.
+    let reloaded_at = Instant::now();
+
+    match verify::wait(daemon, sheep, mode, &before, patience).await {
+        Ok(true) => Landed::Verified,
+        // What actually elapsed, not the budget. An `Alive` verdict takes
+        // its turnover wait PLUS the dwell, so quoting the budget
+        // understated the wait every time that mode failed.
+        Ok(false) => Landed::NotVerified {
+            why: format!(
+                "it did not come up and stay up, {}s after the reload",
+                reloaded_at.elapsed().as_secs()
+            ),
+            patience,
+        },
+        Err(source) => Landed::Failed { source, patience },
+    }
+}
+
+/// Puts `current` back after a deploy that never started anything.
+///
+/// No reload, deliberately, and no [`Error::Split`]. Nothing was spawned on
+/// the release this swap installed, so the running process is the one that
+/// was already there and the symlink is the only thing out of step; once it
+/// is back, `current`, `deploy.toml` and the process all agree again and
+/// there is nothing left for an operator to do. Sending a reload here would
+/// restart a healthy sheep for no reason, and reporting a split state would
+/// describe a machine that is not split - the variant reserved for what this
+/// crate cannot repair, spent on something it just did.
+///
+/// `previous` of `None` is a target's first deploy: `current` names the new
+/// release and there is nothing earlier to name instead, so it is left
+/// where it is.
+///
+/// # Residual, and it is the same one the module doc names for
+/// `current.tmp`
+///
+/// Between the swap and the reload there is a window a handful of syscalls
+/// and one RPC wide. A reload started by somebody else inside it would spawn
+/// from the new `current`, and undoing the swap would then leave that
+/// process on a release `current` no longer names. Nothing here detects
+/// that. The check it would take - re-reading the flock and comparing pids -
+/// cannot tell that case apart from an ordinary crash restart, so it would
+/// report a split state for a healthy machine, which is the defect this
+/// function exists to stop rather than a cure for it.
+///
+/// # Errors
+/// [`Error::RollbackFailed`] carrying `why` if `current` cannot be put back,
+/// which is the one case here that does leave something for an operator:
+/// `current` naming a release nothing is running.
+fn undo_swap(tree: &Tree, previous: Option<&Path>, why: &Error) -> Result<(), Error> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+
+    swap::point_at(&tree.current(), previous).map_err(|source| Error::RollbackFailed {
+        why: why.to_string(),
+        source: Box::new(source),
+    })
 }
 
 /// Sets `watch` on the target and records it, without deploying.
@@ -416,25 +536,6 @@ fn refuse_ungated_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Re
         )));
     }
     Ok(())
-}
-
-/// Reloads `sheep` and waits for the verdict its `mode` asks for, against
-/// the generation that was serving before it.
-///
-/// `before` is the caller's to capture, and it has to have been captured
-/// before this is called: `Request::Reload` is an acceptance rather than a
-/// completion, so a check made after it that does not know which process
-/// was already there reads the old one and passes. See [`crate::verify`]'s
-/// module doc.
-async fn settle<D: Daemon>(
-    daemon: &D,
-    sheep: &str,
-    mode: Verify,
-    before: &Generation,
-    budget: Duration,
-) -> Result<bool, Error> {
-    daemon.reload(sheep).await?;
-    verify::wait(daemon, sheep, mode, before, budget).await
 }
 
 /// Puts `previous` back after `attempted` was rejected, and answers with
@@ -824,14 +925,15 @@ mod tests {
         /// old instance serving, so the listing settles back to one
         /// `Online` entry under the pid that was already there.
         replaces: bool,
-        /// Whether `describe` fails outright, once the reload has been
-        /// sent. That is a different path through `deploy` from a sheep
-        /// that will not come up: one is a verdict, the other an error
-        /// arriving after the reload has already drained the old instance.
-        /// It answers normally before the reload, because the generation
-        /// capture reads it too and a failure there would never reach the
-        /// path this models.
-        describe_fails: bool,
+        /// From which reload count `describe` starts failing outright, or
+        /// `None` for never.
+        ///
+        /// `Some(1)` is a shepherd that answers the generation capture and
+        /// then stops: an error arriving after the reload has already
+        /// drained the old instance, which is a different path from a sheep
+        /// that will not come up. `Some(0)` fails the capture itself, which
+        /// is the step that used to sit outside the rollback boundary.
+        describe_fails_from: Option<u32>,
         /// Created just before answering the first `describe`, standing in
         /// for another process leaving a stale `current.tmp` behind at the
         /// worst possible moment - after the swap, before the rollback.
@@ -845,6 +947,9 @@ mod tests {
         /// `ReloadInFlight` arrives as; `NotFound` is the one that can
         /// never clear.
         refusal_code: RpcErrorCode,
+        /// Whether the deploy's OWN reload is refused too, rather than only
+        /// the rollback's.
+        refuse_from_the_first: Cell<bool>,
         /// Every `reload` call, refused ones included - which is how a test
         /// can see whether something was retried.
         attempts: Cell<u32>,
@@ -874,10 +979,11 @@ mod tests {
             Self {
                 settles_to: ProcStatus::Online,
                 replaces: true,
-                describe_fails: false,
+                describe_fails_from: None,
                 plant: None,
                 refusals: Cell::new(0),
                 refusal_code: RpcErrorCode::Internal,
+                refuse_from_the_first: Cell::new(false),
                 attempts: Cell::new(0),
                 flapping: false,
                 instances: 1,
@@ -907,13 +1013,34 @@ mod tests {
             }
         }
 
-        /// Fails every `describe`, the transient error `verify::wait`'s own
-        /// doc anticipates.
+        /// Answers the generation capture and then fails every `describe`
+        /// after the reload - the transient error `verify::wait`'s own doc
+        /// anticipates.
         fn describe_fails() -> Self {
             Self {
-                describe_fails: true,
+                describe_fails_from: Some(1),
                 ..Self::ready()
             }
+        }
+
+        /// Fails every `describe`, starting with the generation capture
+        /// itself. A real shepherd does neither on command, which is why
+        /// the only place this can be exercised is here.
+        fn unreachable() -> Self {
+            Self {
+                describe_fails_from: Some(0),
+                ..Self::ready()
+            }
+        }
+
+        /// A shepherd too busy to accept even the deploy's own reload -
+        /// an operator's `shep reload web` landing first, which shep
+        /// refuses for as long as it is in flight.
+        fn too_busy_to_start() -> Self {
+            let shepherd = Self::ready();
+            shepherd.refusals.set(u32::MAX);
+            shepherd.refuse_from_the_first.set(true);
+            shepherd
         }
 
         /// As [`Self::never_ready`], but leaves a stale `current.tmp` at
@@ -1032,7 +1159,10 @@ mod tests {
                 std::os::unix::fs::symlink("somewhere", plant).expect("plant a stale tmp link");
             }
             self.describes.set(self.describes.get() + 1);
-            if self.describe_fails && self.reloads.get() > 0 {
+            if self
+                .describe_fails_from
+                .is_some_and(|from| self.reloads.get() >= from)
+            {
                 return Err(Error::Protocol("the shepherd stopped answering".to_owned()));
             }
             Ok((0..self.instances)
@@ -1049,7 +1179,7 @@ mod tests {
         async fn reload(&self, sheep: &str) -> Result<(), Error> {
             self.attempts.set(self.attempts.get() + 1);
             let refusals = self.refusals.get();
-            if self.reloads.get() > 0 && refusals > 0 {
+            if (self.reloads.get() > 0 || self.refuse_from_the_first.get()) && refusals > 0 {
                 if refusals != u32::MAX {
                     self.refusals.set(refusals - 1);
                 }
@@ -1521,6 +1651,70 @@ mod tests {
         // stop early never see it.
         assert!(shown.contains("nothing to deploy"), "{shown}");
         assert!(!shown.contains('\\'), "{shown}");
+    }
+
+    /// fails if a failure between the swap and the reload escapes the
+    /// rollback boundary. The generation capture is a real request and can
+    /// fail like any other; when it did, `deploy` returned the bare error
+    /// with `current` still naming the new release, `deploy.toml` naming
+    /// the old one, and no reload ever sent. Any later restart of that
+    /// sheep - a crash restart included - would have brought it up on a
+    /// release nothing verified. It was the only fallible call past the
+    /// swap that sat outside the arm that owns rollback.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_before_the_reload_puts_current_back() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+        let daemon = Shepherd::unreachable();
+
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("the shepherd cannot be asked anything");
+
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+        assert_eq!(daemon.attempt_count(), 0, "no reload may be sent");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous)),
+            "current must not be left on a release nothing verified"
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a refusal of the deploy's OWN reload is treated as though
+    /// the release had been started. An operator running `shep reload web`
+    /// by hand during a poll-loop deploy produces exactly this: the
+    /// shepherd refuses a second reload while one is in flight, so nothing
+    /// was ever spawned on the new release.
+    ///
+    /// What the post-reload rollback did with it was swap back, correct the
+    /// record, retry the reload for the whole budget, get refused
+    /// throughout, and report `Error::Split` - the variant reserved for a
+    /// state this crate cannot repair - about a machine that was entirely
+    /// consistent, telling the operator to finish a rollback that had
+    /// already finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_reload_is_not_a_split_state() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+        let daemon = Shepherd::too_busy_to_start();
+
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state)
+            .await
+            .expect_err("the shepherd would not take the reload");
+
+        assert!(!matches!(err, Error::Split { .. }), "{err:?}");
+        assert!(err.to_string().contains("already being reloaded"), "{err}");
+        // One attempt, not a budget's worth of retries: there is nothing to
+        // retry towards when nothing was started.
+        assert_eq!(daemon.attempt_count(), 1);
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
     }
 
     /// fails if a rollback moves the symlink and never reloads. Moving a
