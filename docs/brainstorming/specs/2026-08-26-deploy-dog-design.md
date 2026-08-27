@@ -377,10 +377,10 @@ than an opt-out that silently checks nothing.
 
 Two fields on the Flockfile's build block, both driven by Koji:
 
-- **`build.env`** — environment for the build. `CARGO_TARGET_DIR` pointed at a
+- **`build.env`**, environment for the build. `CARGO_TARGET_DIR` pointed at a
   shared cache keeps Rust compilation warm across releases, which matters
   because a from-scratch Koji build per deploy is not acceptable.
-- **`build.artifacts`** — paths copied out of the build environment into the
+- **`build.artifacts`**, paths copied out of the build environment into the
   release afterwards. With a shared `CARGO_TARGET_DIR` the binary lands outside
   the release, so `script = ./target/release/koji` needs it copied back for the
   script to resolve and for rollback to have a real artifact.
@@ -423,8 +423,8 @@ Worktrees are removed after a **successful** deploy, keeping N releases
 Never removed: the current release, the previous release (it is the rollback
 target), or any release a running instance still points at.
 
-Removal is `git worktree remove --force` — a built tree is always dirty, so
-plain `remove` always refuses — followed by `git worktree prune`.
+Removal is `git worktree remove --force`, because a built tree is always
+dirty and plain `remove` always refuses, followed by `git worktree prune`.
 
 ## Security posture
 
@@ -433,14 +433,14 @@ postinstall scripts are the most common supply-chain vector in the Node
 ecosystem.
 
 **Builds run as the target sheep's `user` and primary group, never as the
-shepherd's — when the app sets one.** shep already resolves `user`/`group`
+shepherd's, when the app sets one.** shep already resolves `user`/`group`
 per app, so the machinery exists. A compromised ReactMap build gets
 ReactMap's privileges and nothing more.
 
 **An app with no `user` gets no drop, and the dog does not refuse it.** This
 was left open when the section was written and is now decided: the build then
-runs as whatever the shepherd runs as, which where the shepherd is root — the
-arrangement recommended below — means repository-supplied build code
+runs as whatever the shepherd runs as, which where the shepherd is root (the
+arrangement recommended below) means repository-supplied build code
 executing as root on every deploy. Refusing those deploys was considered and
 rejected: an app without `user` is a configuration shep itself accepts, and a
 deploy dog is not the place to start declining it. So this is a control an
@@ -517,7 +517,7 @@ in the bootstrap case a running app is still pointing into it.
 ## Concurrency
 
 A push landing mid-deploy aborts the in-flight deploy and starts again at the
-newer commit — **but only before the swap**. Once `current` has moved, the
+newer commit, **but only before the swap**. Once `current` has moved, the
 deploy finishes and verifies, and the newer commit deploys after. Tearing down
 mid-cutover is how you end up with nothing running.
 
