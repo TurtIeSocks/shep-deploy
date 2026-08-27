@@ -243,6 +243,33 @@ pub async fn deploy<D: Daemon>(
     keep: usize,
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
+
+    // The one state where a deploy is not merely wrong but silently
+    // convincing, and the reason it is refused in code rather than in prose.
+    //
+    // `deployed` is None on an existing tree only when the cutover never
+    // landed: `prepare` writes the record with None and `cut_over` is what
+    // fills it in, so nothing else produces this. The sheep is therefore
+    // still registered at the operator's OWN checkout. A deploy from here
+    // builds, swaps `current`, and reloads the sheep BY NAME - which really
+    // does replace that instance, so `crate::verify::wait` sees a full pid
+    // turnover, the deploy reports success for a release nothing ever
+    // served, and the sha is written into the record.
+    //
+    // Three messages already tell an operator not to do this, and a fourth
+    // would not help: `prepare` writes `watch = "auto"`, so once the poll
+    // loop lands this runs with no operator involved at all.
+    if state.deployed.is_none() {
+        return Err(Error::Config(format!(
+            "{sheep} has a deploy tree but was never cut over to it, so there is nothing to \
+             deploy: its record names no released sha, and nothing has ever been served from \
+             that tree. Deploying now would reload {sheep} at its own checkout and report \
+             success for a release nothing ran. Finish the cutover instead - remove {} and run \
+             `shep-deploy setup {sheep}`.",
+            tree.root().display()
+        )));
+    }
+
     let started_at = swap::resolve(&tree.current())?;
 
     git::fetch(&tree.git(), &state.remote)?;
@@ -964,6 +991,15 @@ mod tests {
     /// a bare clone fetched from it - but no release built and no
     /// `current` at all, which is a target the moment before its first
     /// deploy.
+    /// A sha whose release directory is not on disk.
+    ///
+    /// What a record naming a release retention has already reclaimed looks
+    /// like, and the only way a real target reaches "there is nothing to
+    /// roll back to" now that `deploy` refuses a tree the cutover never
+    /// landed on. A `deployed` of `None` used to stand in for this, and no
+    /// longer can.
+    const RECLAIMED: &str = "0000000000000000000000000000000000000000";
+
     fn fixture_before_any_release() -> Fixture {
         let home = tempfile::tempdir().expect("tempdir");
         let origin = tempfile::tempdir().expect("tempdir");
@@ -2206,15 +2242,60 @@ mod tests {
         );
     }
 
-    /// fails if a first deploy that never comes up is reported as a
-    /// rollback that failed. Nothing was rolled back, because there was
-    /// nothing to roll back to, and the wrapped form said "no previous
-    /// release" and "still pointed at" once each in both of its layers.
-    /// This is the failure a new user is most likely to meet, so it gets
-    /// one sentence that knows the case exists.
+    /// fails if a tree the cutover never landed on can be deployed. This is
+    /// the deploy that does not merely go wrong, it goes wrong
+    /// convincingly. `deployed` is `None` on an existing tree only when
+    /// `cut_over` never ran, so the sheep is still registered at the
+    /// operator's OWN checkout: a deploy builds, swaps `current`, and
+    /// reloads the sheep BY NAME, which really does replace that instance,
+    /// so verification sees a full pid turnover, the run prints
+    /// `deployed <sha>` and exits 0, and the sha is written into the
+    /// record. Measured against a real shepherd on a release whose script
+    /// is `exit 1`.
+    ///
+    /// Three messages already tell an operator not to do this and none of
+    /// them refused it. Prose is also the wrong instrument here: `prepare`
+    /// writes `watch = "auto"`, so once the poll loop lands this runs with
+    /// no operator involved at all.
     #[tokio::test(start_paused = true)]
-    async fn a_first_deploy_that_never_comes_up_has_nothing_to_roll_back_to() {
+    async fn a_tree_the_cutover_never_landed_on_is_refused_before_anything_happens() {
         let mut fixture = fixture_before_any_release();
+
+        let err = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect_err("refuses");
+
+        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        let shown = err.to_string();
+        assert!(shown.contains("never cut over"), "{shown}");
+        assert!(shown.contains("shep-deploy setup web"), "{shown}");
+        assert_eq!(fixture.state.deployed, None, "nothing was recorded");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).expect("reads"),
+            None,
+            "and nothing was swapped: the refusal is before any of it"
+        );
+    }
+
+    /// fails if a deploy that never comes up with nothing to fall back to
+    /// is reported as a rollback that failed. Nothing was rolled back,
+    /// because there was nothing to roll back to, and the wrapped form said
+    /// "no previous release" and "still pointed at" once each in both of
+    /// its layers.
+    ///
+    /// The record names a release retention has already reclaimed, which is
+    /// how a real target reaches this. It used to name nothing at all, and
+    /// that shape is now refused before the deploy starts: a tree whose
+    /// cutover never landed has no business being deployed.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_with_nothing_left_to_fall_back_to_says_so_plainly() {
+        let mut fixture = fixture_before_any_release();
+        fixture.state.deployed = Some(RECLAIMED.to_owned());
         let first = crate::git::remote_head(&fixture.tree.git(), "main").expect("head");
 
         let err = deploy(
@@ -2243,7 +2324,7 @@ mod tests {
         assert!(shown.contains("deploy.toml"), "{shown}");
         assert!(!shown.contains("first deploy"), "{shown}");
         // The record never advanced, because nothing verified.
-        assert_eq!(fixture.state.deployed, None);
+        assert_eq!(fixture.state.deployed.as_deref(), Some(RECLAIMED));
     }
 
     /// fails if "is there anything to roll back to" is decided by comparing
@@ -2263,8 +2344,9 @@ mod tests {
         crate::git::fetch(&fixture.tree.git(), &fixture.state.remote).expect("fetch");
         install_release(&fixture, &second);
         // What an interrupted deploy leaves: `current` is on `second` and
-        // the record has never heard of it.
-        fixture.state.deployed = None;
+        // the record still names an older release, one retention has since
+        // reclaimed, so `current` is the only candidate left.
+        fixture.state.deployed = Some(RECLAIMED.to_owned());
 
         // The same directory, spelled through a symlink - one process's
         // $SHEP_HOME, another process's.
@@ -2289,9 +2371,10 @@ mod tests {
     async fn a_rollback_corrects_a_stale_deployed_record() {
         let mut fixture = fixture_with_previous_release();
         let live = fixture.state.deployed.clone().expect("a previous release");
-        // What an interrupted deploy leaves behind: `current` names a
-        // release the record has never heard of.
-        fixture.state.deployed = None;
+        // What an interrupted deploy leaves behind: `current` names the
+        // live release and the record still names an older one, since
+        // reclaimed.
+        fixture.state.deployed = Some(RECLAIMED.to_owned());
         commit_on_origin(&fixture, "second.txt");
 
         deploy(

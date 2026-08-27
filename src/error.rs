@@ -135,14 +135,18 @@ pub enum Error {
     /// release to fall back to.
     ///
     /// Not a failed rollback: no rollback was attempted, because there was
-    /// nothing to attempt one against. Usually that is a target's first
-    /// deploy, which is the failure a new user is most likely to meet - but
-    /// not always, so the message says what was looked at rather than
-    /// asserting which case it is. A retry after an interrupted deploy
-    /// reaches this too, when `current` already names the release being
-    /// attempted and `deploy.toml`'s own release has been swept up by
-    /// retention. It says the whole thing in one sentence rather than being
-    /// wrapped in another.
+    /// nothing to attempt one against. That means both candidates are
+    /// unusable - `current` already names the release being attempted, and
+    /// `deploy.toml`'s own release is no longer on disk, usually because
+    /// retention reclaimed it. A retry after an interrupted deploy is the
+    /// ordinary way to arrive.
+    ///
+    /// It used to say "usually a target's first deploy". That is no longer
+    /// reachable: `crate::deploy::deploy` refuses a tree whose cutover
+    /// never landed, and a cutover that DID land wrote a sha into the
+    /// record, so by the time any deploy runs there is always a previous
+    /// release named. The message still says what it looked at rather than
+    /// asserting which case it is.
     Unverified {
         /// The sheep that did not come up.
         sheep: String,
