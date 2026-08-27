@@ -40,6 +40,20 @@ const DEPLOY_BIN: &str = env!("CARGO_BIN_EXE_shep-deploy");
 /// up and fails the test.
 const PATIENCE: Duration = Duration::from_secs(60);
 
+/// How long the poll test gives the supervised dog to notice a branch that
+/// moved between two of its own ticks.
+///
+/// This number is an assertion rather than a safety margin, and it is
+/// bracketed on both sides. Below it: the test configures
+/// `interval = "1s"`, and the deploy it triggers is a local fetch, a
+/// worktree, a swap and a reload, which the rest of this file does in about
+/// two seconds. Above it: `crate::config`'s `DEFAULT_INTERVAL` is thirty
+/// seconds, so a dog that never found its own `[dog.deploy]` section cannot
+/// get inside this however healthy it is. That gap is the only thing making
+/// the section's interval observable at all - see
+/// [`the_supervised_dog_deploys_a_moved_branch_without_being_asked`].
+const POLL_WINDOW: Duration = Duration::from_secs(20);
+
 /// `src/main.rs`'s `ROLLED_BACK`, restated because a test binary cannot see
 /// a binary crate's internals. A change to one without the other fails this
 /// test, which is the point.
@@ -455,7 +469,18 @@ fn last_line(path: &Path) -> Option<String> {
 
 /// Poll `ready` until it answers true, or fail with `what`.
 fn wait_until(what: &str, ready: impl Fn() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
+    wait_within(what, PATIENCE, ready);
+}
+
+/// As [`wait_until`], but with a budget the caller chose because the budget
+/// is itself the assertion.
+///
+/// [`PATIENCE`] is generous on purpose - it exists so a slow machine does
+/// not turn a passing test red. A wait that is measuring HOW LONG something
+/// took needs the opposite, so it gets its own number and a comment saying
+/// what the number is against.
+fn wait_within(what: &str, budget: Duration, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
         if ready() {
             return;
@@ -989,29 +1014,53 @@ fn a_sheep_taken_over_by_setup_follows_a_later_swap() {
     });
 }
 
-/// fails if the supervised mode does not deploy on its own.
+/// fails if the supervised mode does not deploy on its own, or does it on a
+/// configuration it never read.
 ///
 /// `watch = "auto"` means nothing until the binary, given NO ARGV AT ALL as
 /// the dog contract requires, connects, works out its own adopted name from
-/// its own pid in a real flock listing, reads its own `[dog.<name>]`
-/// section, finds its targets on disk and deploys one. Every one of those is
-/// stubbed in the unit tests, and the pid lookup in particular can only be
-/// wrong against a real daemon.
+/// its own pid in a real flock listing, reads the `[dog.<name>]` section
+/// that name selects, finds its targets on real disk and deploys one. Every
+/// one of those is stubbed in the unit tests, and the pid lookup in
+/// particular can only be wrong against a real daemon.
 ///
-/// `shep.toml` is written after the shepherd is already up, which is
-/// deliberate and safe: the daemon re-reads a dog's section per
-/// `Request::DogConfig` rather than caching one at boot.
+/// # The order of the last three steps is the whole test
 ///
-/// **The dog's own stdout is what settles who deployed**, and it is not
-/// belt and braces. `shep adopt` vets a candidate by spawning it with no
+/// An earlier version of this adopted the dog AFTER moving the branch, and
+/// it covered none of the self-identification it claimed to. `adopted_name`
+/// returning `None` unconditionally passed it in 1.25 seconds, because
+/// `crate::config` answers a nameless dog with the documented defaults, the
+/// loop ticks once before it ever sleeps, and by then the branch had already
+/// moved. Every observable was identical whether the section was read,
+/// misread, or never found - and the same blind spot swallowed
+/// `Request::DogConfig` and `DogConfig::parse` along with it.
+///
+/// So the branch moves LAST, strictly between two ticks, and the deploy is
+/// required inside [`POLL_WINDOW`]. That makes the interval the thing being
+/// measured: at the configured second the dog gets there with time to spare,
+/// and at the thirty-second default it cannot get there at all. A dog that
+/// never found its section now fails this rather than passing it.
+///
+/// Waiting for the tick before the branch moves is what makes that
+/// bracketing sound, and an up-to-date tick says nothing an operator or a
+/// test could read - `report` is silent on `UpToDate` by design. What it
+/// does leave is `FETCH_HEAD`: `deploy::go` fetches before it compares
+/// anything, so the file reappearing is a tick that ran to completion and
+/// found nothing to do.
+///
+/// `shep.toml` is written before the adopt, not after, because the dog reads
+/// its section once at startup rather than per tick.
+///
+/// # Why the dog's own stdout is asserted on as well
+///
+/// Not belt and braces. `shep adopt` vets a candidate by spawning it with no
 /// argv and the real `$SHEP_HOME` before it records anything, so for about
 /// fifty milliseconds a second copy of this binary is running the same poll
 /// loop against the same targets. That copy is killed with its stdio on
-/// `/dev/null`, so a line in `logs/deploy-0-out.log` can only have come from
-/// the instance the shepherd supervises. Asserting on the running release
-/// alone would not tell the two apart, and neither would the mutation this
-/// test is checked with, because the vetting spawn runs the mutated loop
-/// too.
+/// `/dev/null`, so a line in the dog's log can only have come from the
+/// instance the shepherd supervises. The running release alone would not
+/// tell the two apart, and neither would a mutation of the loop, which the
+/// vetting spawn runs too.
 #[test]
 fn the_supervised_dog_deploys_a_moved_branch_without_being_asked() {
     let shepherd = Shepherd::new();
@@ -1022,17 +1071,13 @@ fn the_supervised_dog_deploys_a_moved_branch_without_being_asked() {
     wait_until("web to come up", || described_online(&shepherd, "web"));
     let out_log = out_file(&shepherd, "web");
 
-    // A one-second interval, so a tick that finds nothing the first time
-    // round costs a second rather than the default half minute.
+    // A second rather than the default half minute, and the whole test is
+    // built to notice the difference.
     fs::write(
         shepherd.home().join("shep.toml"),
-        "[dog.deploy]\ninterval = \"1s\"\nretention = 5\n",
+        "[dog.deploy]\ninterval = \"1s\"\n",
     )
     .expect("write shep.toml");
-
-    write_run_script(origin.path(), "v2");
-    git(origin.path(), &["commit", "-qam", "v2"]);
-    let second = head_of(origin.path());
 
     // Adopted and supervised, with no argv, exactly as the contract says.
     // The name is the binary's own stem with `shep-` stripped, which is what
@@ -1043,12 +1088,31 @@ fn the_supervised_dog_deploys_a_moved_branch_without_being_asked() {
     });
     let dog_log = out_file(&shepherd, "deploy");
 
-    wait_until("the poll loop to deploy v2 on its own", || {
-        last_line(&out_log).as_deref() == Some("v2")
+    // Removed after the dog is up, so the vetting spawn is long dead and
+    // cannot be what puts it back.
+    let fetch_head = shepherd.home().join("deploy/web/git/FETCH_HEAD");
+    fs::remove_file(&fetch_head).expect("remove FETCH_HEAD");
+    wait_until("a tick that looked at the remote and found nothing", || {
+        fetch_head.is_file()
     });
-    wait_until("the supervised dog to report the deploy as its own", || {
-        fs::read_to_string(&dog_log)
-            .unwrap_or_default()
-            .contains(&format!("web deployed {second}"))
-    });
+
+    // Only now, so the next tick is one configured interval away.
+    write_run_script(origin.path(), "v2");
+    git(origin.path(), &["commit", "-qam", "v2"]);
+    let second = head_of(origin.path());
+
+    wait_within(
+        "the poll loop to deploy v2 on its own, within one configured interval",
+        POLL_WINDOW,
+        || last_line(&out_log).as_deref() == Some("v2"),
+    );
+    wait_within(
+        "the supervised dog to report the deploy as its own",
+        POLL_WINDOW,
+        || {
+            fs::read_to_string(&dog_log)
+                .unwrap_or_default()
+                .contains(&format!("web deployed {second}"))
+        },
+    );
 }
