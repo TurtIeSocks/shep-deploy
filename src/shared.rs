@@ -229,6 +229,12 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// does not exist, or a component of it cannot be resolved. Otherwise
 /// [`Error::Io`], naming the release-side path that failed, if a parent
 /// directory cannot be created or the symlink itself cannot be made.
+///
+/// One collision is not an [`Error::Io`] at all. A release-side path that
+/// already exists gives [`Error::Config`] instead, because the cause is a
+/// `.shepignore` that shares something the release builds for itself, which
+/// the operator fixes by editing that file rather than by looking at the
+/// filesystem. The message names the colliding path and the file to edit.
 pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(), Error> {
     let checkout = fs::canonicalize(checkout).map_err(|source| Error::Io {
         path: checkout.to_owned(),

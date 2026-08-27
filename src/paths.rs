@@ -9,6 +9,9 @@
 //! ├── git/                 one bare clone; object store shared by every
 //! │                        worktree release
 //! ├── releases/<sha>/      a git worktree per built release
+//! ├── cache/target/        the dog's build cache, symlinked into every
+//! │                        release as `target` so builds stay warm and a
+//! │                        hardcoded `./target/release/x` still resolves
 //! ├── current -> releases/<sha>   swapped with rename(2) at cutover
 //! └── deploy.toml          the sheep's `State` - see `crate::state`
 //! ```

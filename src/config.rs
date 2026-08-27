@@ -83,9 +83,13 @@ impl DogConfig {
     /// # Errors
     /// [`Error::Config`] if the text is not valid TOML, carries a key this
     /// dog does not know, gives a value of the wrong type, asks for a
-    /// retention below two, or asks for a zero interval. The message names
-    /// the key in every case, because the section is one an operator edited
-    /// by hand.
+    /// retention below two, or asks for a zero interval.
+    ///
+    /// Every case except the first names the offending key, because the
+    /// section is one an operator edited by hand and a complaint they cannot
+    /// locate is nearly as bad as none. A plain syntax error is the
+    /// exception and names a line and column instead, because at that point
+    /// the parser has no key to name.
     pub fn parse(toml: &str) -> Result<Self, Error> {
         let raw: Raw = toml::from_str(toml)
             .map_err(|source| Error::Config(format!("[dog.<name>]: {source}")))?;
@@ -125,9 +129,6 @@ impl DogConfig {
 /// # Errors
 /// Whatever [`Daemon::dog_config`] returns, plus [`Error::Config`] from
 /// [`DogConfig::parse`].
-// The poll loop that calls this is not wired into `main` until a later
-// task; this is that caller's target, not a caller itself yet.
-#[allow(dead_code)]
 pub async fn read<D: Daemon>(daemon: &D) -> Result<DogConfig, Error> {
     let Some(name) = adopted_name(daemon).await else {
         return DogConfig::parse("");

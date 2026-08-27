@@ -93,7 +93,7 @@ pub trait Daemon {
     /// # Errors
     /// As [`Self::dog_config`].
     // Opt-in registers the sheep it is taking over; opt-in is plan two.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error>;
 
     /// Replace one sheep, by exact name, with a fresh instance of the same
@@ -109,7 +109,7 @@ pub trait Daemon {
     /// As [`Self::dog_config`].
     // The deploy sequence reloads rather than restarts, so this has no
     // caller at all - see `crate::deploy`'s own doc for the reasoning.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     async fn restart(&self, sheep: &str) -> Result<(), Error>;
 }
 
