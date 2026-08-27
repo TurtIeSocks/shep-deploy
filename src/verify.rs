@@ -115,6 +115,11 @@ impl Generation {
     /// wants to freeze, and asking again would both cost a round trip and
     /// risk freezing a DIFFERENT set of pids than the one it just decided
     /// on, which is the sort of gap a crash-looping release fits through.
+    ///
+    /// `crate::optin`'s cutover uses it twice for that reason: once on the
+    /// listing it reads before the `Start`, whose ids it also keeps, so the
+    /// ids to delete and the pids to compare against describe one instant
+    /// rather than two.
     pub(crate) fn of_infos(infos: &[&ProcessInfo]) -> Self {
         Self {
             pids: infos.iter().filter_map(|info| info.pid).collect(),

@@ -269,9 +269,17 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
     // afterwards two rows share this name and nothing on the wire says
     // which of them was already here. Reading it later would risk deleting
     // the release that was just deployed.
+    //
+    // One read, not two. The ids to delete and the pids to compare against
+    // have to describe the same instant: asking twice would let an instance
+    // restart between them, so the generation would be frozen against a set
+    // of pids the id list never named. That is the whole argument
+    // `Generation::of_infos` was added for, and it applies to its own
+    // caller first.
     let before = daemon.describe(&sheep).await?;
-    let previous: Vec<u32> = before.iter().map(|info| info.id).collect();
-    let generation = Generation::of(daemon, &sheep).await?;
+    let rows: Vec<&ProcessInfo> = before.iter().collect();
+    let previous: Vec<u32> = rows.iter().map(|info| info.id).collect();
+    let generation = Generation::of_infos(&rows);
 
     // THE line this task exists for. Over the socket a `cwd` of None stays
     // None and the child inherits the SHEPHERD's working directory, and a
