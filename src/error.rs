@@ -170,8 +170,15 @@ pub enum Error {
     CutOver {
         /// The sheep whose cutover was abandoned.
         sheep: String,
-        /// Why the newcomer was rejected.
+        /// Why the newcomer was rejected, as one or more whole sentences.
+        ///
+        /// Whole sentences because only the cutover knows which causes are
+        /// plausible: a `Start` the shepherd accepted that produced no row
+        /// at all cannot be a port collision, and a message that blamed one
+        /// anyway would send an operator after the wrong thing.
         why: String,
+        /// Whether every instance the cutover added was removed again.
+        removed: bool,
         /// Whether the shepherd's persisted roll was put back.
         repaired: bool,
     },
@@ -250,17 +257,40 @@ impl fmt::Display for Error {
             Self::CutOver {
                 sheep,
                 why,
+                removed,
                 repaired,
             } => {
+                write!(f, "{sheep}'s first cutover did not come up. {why}")?;
+                if *removed {
+                    write!(
+                        f,
+                        " The instance it added has been removed, and the original is still \
+                         running on the release it was already serving."
+                    )?;
+                } else {
+                    // `undo_start` swallows each delete so the operator gets
+                    // the reason they are here rather than a second error
+                    // about the cleanup, which means this is the only place
+                    // a failed one is ever mentioned.
+                    write!(
+                        f,
+                        " The instance it added could NOT be removed, so {sheep} may now be \
+                         running one instance more than it was: `shep describe {sheep}` lists \
+                         them, and the extra one is whichever has its cwd under the deploy tree."
+                    )?;
+                }
+                // The half that turns a failed cutover into a false green.
+                // `deploy` does not short-circuit on a record naming no
+                // release, so it would build, swap, reload the sheep at its
+                // own checkout, see a real pid turnover and print success.
                 write!(
                     f,
-                    "{sheep}'s first cutover did not come up ({why}), so it was removed and the \
-                     original is still running. The first cutover is the one deploy that runs two \
-                     instances at once, so an app that does not bind with SO_REUSEPORT cannot take \
-                     its own port while the original still holds it. Every deploy after the first \
-                     replaces the instance rather than joining it and does not meet this. The \
-                     deploy tree is left in place with {sheep}'s first release already built, so \
-                     nothing has to be rebuilt to try again."
+                    " {sheep} is NOT a deploy target: its record names no deployed release and \
+                     nothing has ever been served from its tree. Do NOT run `shep deploy \
+                     {sheep}` against it - that would reload the sheep at its own checkout and \
+                     report success for a release nothing served. Fix what this message names, \
+                     remove the tree under $SHEP_HOME/deploy/{sheep}, and run `shep-deploy setup \
+                     {sheep}` again."
                 )?;
                 if !repaired {
                     // The half an operator cannot see. `shep flock` shows a

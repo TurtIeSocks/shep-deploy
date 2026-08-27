@@ -109,12 +109,36 @@ pub async fn prepare<D: Daemon>(
 ) -> Result<Prepared, Error> {
     let tree = Tree::for_sheep(shep_home, sheep);
     if tree.state_file().is_file() {
-        return Err(Error::Config(format!(
-            "{sheep} is already a deploy target: its tree is at {}. Deploy it with \
-             `shep deploy {sheep}`, or change how it is watched with \
-             `shep deploy {sheep} --watch auto|manual`.",
-            tree.releases().display()
-        )));
+        // Two very different situations share this one condition, and
+        // telling them apart is not a nicety. A target that was cut over
+        // has served from its tree and `shep deploy` is exactly right for
+        // it. A target whose cutover was ABANDONED has served nothing, and
+        // `shep deploy` on it builds, swaps and reloads the sheep at its
+        // own checkout, sees a full pid turnover because the reload really
+        // did replace that instance, and reports success for a release
+        // nothing ever ran. `deployed` is what separates them, and an
+        // unreadable record falls to the cautious side.
+        let cut_over_already =
+            State::read(&tree.state_file()).is_ok_and(|state| state.deployed.is_some());
+        return Err(Error::Config(if cut_over_already {
+            format!(
+                "{sheep} is already a deploy target: its tree is at {}. Deploy it with \
+                 `shep deploy {sheep}`, or change how it is watched with \
+                 `shep deploy {sheep} --watch auto|manual`.",
+                tree.releases().display()
+            )
+        } else {
+            format!(
+                "{sheep} has a deploy tree at {} but was never cut over to it: its record names \
+                 no deployed release, so nothing has ever been served from that tree. An \
+                 abandoned first cutover leaves exactly this. Do NOT run `shep deploy {sheep}` \
+                 against it - that would reload the sheep at its own checkout and report success \
+                 for a release nothing served. Remove {} and run `shep-deploy setup {sheep}` \
+                 again once the cause of the first failure is fixed.",
+                tree.releases().display(),
+                tree.root().display()
+            )
+        }));
     }
 
     // Cloned rather than borrowed, and named `previous_config` rather than
@@ -265,11 +289,12 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
         // to clean up and nothing to say beyond what the shepherd said.
         CutOver::NotStarted(source) => Err(source),
         CutOver::NotVerified(why) => {
-            let repaired = undo_start(daemon, &sheep, &previous, previous_config).await;
+            let undone = undo_start(daemon, &sheep, &previous, previous_config).await;
             Err(Error::CutOver {
                 sheep,
                 why,
-                repaired,
+                removed: undone.removed,
+                repaired: undone.recorded,
             })
         }
         CutOver::Failed(source) => {
@@ -297,6 +322,16 @@ enum CutOver {
     /// The `Start` was accepted and something failed while watching.
     Failed(Error),
 }
+
+/// What a first cutover most often runs into, said once.
+///
+/// Appended to every `why` where it could be the cause, and deliberately not
+/// to the one where it cannot: a `Start` the shepherd accepted that then
+/// produced no row at all never got as far as binding anything.
+const PORT_COLLISION: &str = "The first cutover is the one deploy that runs two instances at \
+     once, so an app that does not bind with SO_REUSEPORT cannot take its own port while the \
+     original still holds it. Every deploy after the first replaces the instance rather than \
+     joining it, and does not meet this.";
 
 /// How long a newcomer gets to APPEAR before the cutover gives up on it.
 ///
@@ -379,13 +414,13 @@ async fn attempt<D: Daemon>(
             break Generation::of_infos(&newcomers);
         }
         if newcomers.iter().any(|info| !is_alive(info)) {
-            return CutOver::NotVerified(
-                "the new instance failed before it finished starting".to_owned(),
-            );
+            return CutOver::NotVerified(format!(
+                "The new instance failed before it finished starting. {PORT_COLLISION}"
+            ));
         }
         if Instant::now() >= deadline {
             return CutOver::NotVerified(format!(
-                "no new instance appeared within {}s",
+                "No new instance appeared within {}s, although the shepherd accepted the start.",
                 started_at.elapsed().as_secs()
             ));
         }
@@ -407,7 +442,7 @@ async fn attempt<D: Daemon>(
     if survivors.len() != arrived.instances() as usize {
         // A different pid means shep respawned it, which means it died.
         return CutOver::NotVerified(format!(
-            "the new instance did not stay up for {}s after starting",
+            "The new instance did not stay up for {}s after starting. {PORT_COLLISION}",
             DWELL.as_secs()
         ));
     }
@@ -426,9 +461,11 @@ async fn attempt<D: Daemon>(
     // is the side that can lose. Pinned by
     // `an_original_that_respawns_is_not_mistaken_for_the_newcomer`.
     if survivors.iter().any(|info| info.restarts > 0) {
-        return CutOver::NotVerified(
-            "the new instance restarted while it was being watched".to_owned(),
-        );
+        return CutOver::NotVerified(format!(
+            "The instance this cutover adopted had already restarted {}s later, so what is \
+             running is not the process the start spawned. {PORT_COLLISION}",
+            DWELL.as_secs()
+        ));
     }
 
     CutOver::Done
@@ -453,36 +490,70 @@ async fn attempt<D: Daemon>(
 /// muster uses and is not on the wire. The cost is a second instance of the
 /// app alive for as long as those two calls take.
 ///
-/// Answers whether the record was restored, because the error text differs:
-/// a repair that failed leaves something an operator cannot see in
-/// `shep flock` and has to be told about by name.
+/// Answers both halves separately, because the error text needs both and
+/// they fail independently: a newcomer left registered is visible in
+/// `shep flock`, and a roll left poisoned is not.
 async fn undo_start<D: Daemon>(
     daemon: &D,
     sheep: &str,
     previous: &[u32],
     original: AppConfig,
-) -> bool {
+) -> Undone {
     let Ok(flock) = daemon.describe(sheep).await else {
-        return false;
+        // Nothing is known about what needs removing, so nothing is
+        // claimed. The error text sends the operator to `shep describe`.
+        return Undone {
+            removed: false,
+            recorded: false,
+        };
     };
-    for info in flock.iter().filter(|info| !previous.contains(&info.id)) {
-        // Failures dropped: this path is already failing, and an operator
-        // needs the reason they got here rather than a second error about
-        // the cleanup. What a failure leaves is a newcomer beside the
-        // original, which `shep flock` shows plainly.
-        let _ = daemon.delete(info.id).await;
-    }
+    // Individual failures are recorded rather than returned: this path is
+    // already failing, and an operator needs the reason they got here
+    // rather than a second error about the cleanup.
+    let mut removed = drain(daemon, &flock, previous).await;
 
     if daemon.start(vec![original]).await.is_err() {
-        return false;
+        return Undone {
+            removed,
+            recorded: false,
+        };
     }
     let Ok(flock) = daemon.describe(sheep).await else {
-        return false;
+        return Undone {
+            removed,
+            recorded: false,
+        };
     };
-    for info in flock.iter().filter(|info| !previous.contains(&info.id)) {
-        let _ = daemon.delete(info.id).await;
+    removed &= drain(daemon, &flock, previous).await;
+
+    Undone {
+        removed,
+        recorded: true,
     }
-    true
+}
+
+/// What [`undo_start`] managed to put back.
+///
+/// Two bools rather than one, because the `Start` did two things and either
+/// repair can fail on its own. Folding them together would make the error
+/// text claim one when only the other held.
+struct Undone {
+    /// Whether every instance this cutover added was removed.
+    removed: bool,
+    /// Whether the shepherd's persisted roll was re-recorded.
+    recorded: bool,
+}
+
+/// Deletes every row in `flock` whose id is not in `previous`, answering
+/// whether all of them went.
+async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -> bool {
+    let mut all = true;
+    for info in flock.iter().filter(|info| !previous.contains(&info.id)) {
+        if daemon.delete(info.id).await.is_err() {
+            all = false;
+        }
+    }
+    all
 }
 
 #[cfg(test)]
@@ -835,6 +906,8 @@ mod tests {
         script: Vec<(Duration, Shape)>,
         /// Which `start` call, counting from zero, the shepherd refuses.
         refuses: Option<usize>,
+        /// Whether the shepherd refuses every `delete`.
+        refuses_deletes: bool,
         /// Every `start` the shepherd accepted, in order.
         starts: RefCell<Vec<AppConfig>>,
         /// Every id passed to `delete`, in order.
@@ -854,12 +927,19 @@ mod tests {
                 original_script: originals_stay_online(),
                 script,
                 refuses,
+                refuses_deletes: false,
                 starts: RefCell::new(Vec::new()),
                 deletes: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
                 accepted_at: Cell::new(None),
                 repairs: Cell::new(0),
             }
+        }
+
+        /// The same double, with every `delete` refused.
+        fn refusing_deletes(mut self) -> Self {
+            self.refuses_deletes = true;
+            self
         }
 
         /// The same double, with the originals doing something other than
@@ -966,6 +1046,12 @@ mod tests {
             Ok(())
         }
         async fn delete(&self, id: u32) -> Result<(), Error> {
+            if self.refuses_deletes {
+                return Err(Error::Request(RequestError::Rpc(RpcError {
+                    code: RpcErrorCode::Internal,
+                    message: format!("instance {id} cannot be deleted"),
+                })));
+            }
             self.deletes.borrow_mut().push(id);
             Ok(())
         }
@@ -1153,6 +1239,12 @@ mod tests {
         cutover_fixture_of(&[7], vec![(Duration::ZERO, Shape::Absent)], None).await
     }
 
+    /// The port-collision shape, with every `delete` refused as well.
+    async fn cutover_fixture_dies_and_refuses_deletes() -> (CutOverDouble, Prepared, Dirs) {
+        let (daemon, prepared, dirs) = cutover_fixture_of(&[7], dies_during_dwell(), None).await;
+        (daemon.refusing_deletes(), prepared, dirs)
+    }
+
     /// An original that crashes and respawns a second into the cutover,
     /// with no real newcomer ever arriving.
     ///
@@ -1332,6 +1424,92 @@ mod tests {
         let (daemon, prepared, _dirs) = cutover_fixture_refusing_start().await;
         cut_over(&daemon, prepared).await.expect_err("refused");
         assert!(daemon.deleted().is_empty());
+    }
+
+    /// fails if a target whose cutover was ABANDONED is pointed at
+    /// `shep deploy`. Both situations trip the same `deploy.toml` check,
+    /// and they need opposite advice. A target that was cut over serves
+    /// from its tree, so `shep deploy` is exactly right. A target whose
+    /// cutover was abandoned has served nothing from it, and its record
+    /// names no release, so `deploy` does not short-circuit: it builds,
+    /// points `current` at the same release, and reloads the sheep BY NAME
+    /// at the operator's own checkout. shep replaces that instance from its
+    /// own spec, `verify::wait` sees a full pid turnover, and the deploy
+    /// prints success for a release nothing ever served. That is the exact
+    /// class the engine plan spent five rounds removing, reachable through
+    /// one sentence of advice.
+    #[tokio::test]
+    async fn an_abandoned_target_is_not_pointed_at_shep_deploy() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout_with_commit();
+        write_target(home.path(), "bpm", Watch::Auto, None);
+        let daemon = RollOf(&[("bpm", checkout.path())]);
+
+        let err = prepare(&daemon, home.path(), "bpm")
+            .await
+            .expect_err("refuses");
+
+        let shown = err.to_string();
+        assert!(shown.contains("never cut over"), "{shown}");
+        assert!(shown.contains("Do NOT run `shep deploy bpm`"), "{shown}");
+        assert!(
+            shown.contains("shep-deploy setup bpm"),
+            "it says how to try again: {shown}"
+        );
+    }
+
+    /// fails if an abandoned cutover leaves the operator thinking the
+    /// target is deployable. `deploy` does not short-circuit on a record
+    /// naming no release, so `shep deploy` here reloads the sheep at its
+    /// own checkout, sees a real pid turnover, and prints success for a
+    /// release nothing served. The failure that produces the false green is
+    /// the operator following ordinary advice, so this message has to say
+    /// which command NOT to run, not merely omit it.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_cutover_says_the_target_is_not_deployable_yet() {
+        let (daemon, prepared, _dirs) = cutover_fixture_dies_during_dwell().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        let shown = err.to_string();
+        assert!(shown.contains("is NOT a deploy target"), "{shown}");
+        assert!(shown.contains("Do NOT run `shep deploy bpm`"), "{shown}");
+        assert!(shown.contains("shep-deploy setup bpm"), "{shown}");
+    }
+
+    /// fails if a cutover that never spawned anything blames the port. The
+    /// SO_REUSEPORT paragraph is the likeliest cause of a newcomer that
+    /// came up and died, and it is impossible for one the shepherd accepted
+    /// and never produced a row for: nothing ever got as far as binding.
+    /// An operator sent after a port that was never contended is an
+    /// operator who stops reading at the first plausible sentence.
+    #[tokio::test(start_paused = true)]
+    async fn a_cutover_that_spawned_nothing_does_not_blame_the_port() {
+        let (daemon, prepared, _dirs) = cutover_fixture_never_appears().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        let shown = err.to_string();
+        assert!(!shown.contains("SO_REUSEPORT"), "{shown}");
+        assert!(shown.contains("No new instance appeared"), "{shown}");
+    }
+
+    /// fails if an abandoned cutover claims to have removed an instance it
+    /// could not remove. `undo_start` swallows each failed delete so the
+    /// operator gets the reason they are here rather than a second error
+    /// about the cleanup, which makes this message the only place a failed
+    /// one is ever mentioned. An operator told the newcomer is gone has no
+    /// reason to look for it, and what is left behind is a second instance
+    /// of their app running the release that was just rejected.
+    #[tokio::test(start_paused = true)]
+    async fn a_newcomer_that_could_not_be_removed_is_named_not_claimed_gone() {
+        let (daemon, prepared, _dirs) = cutover_fixture_dies_and_refuses_deletes().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        let shown = err.to_string();
+        assert!(shown.contains("could NOT be removed"), "{shown}");
+        assert!(shown.contains("shep describe bpm"), "{shown}");
     }
 
     /// fails if the ORIGINAL, respawned, is mistaken for the release this

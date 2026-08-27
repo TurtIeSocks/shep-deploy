@@ -94,6 +94,15 @@ impl Tree {
         &self.sheep
     }
 
+    /// The tree's own directory: everything below is inside this.
+    ///
+    /// Named because an abandoned cutover has to tell an operator which
+    /// directory to remove before trying again, and `releases()` is not it.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// The bare clone and its object store, shared by every release's
     /// worktree.
     #[must_use]
