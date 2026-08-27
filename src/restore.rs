@@ -402,19 +402,31 @@ mod tests {
     /// [`Self::with_unreadable_roll`], which writes a roll no shepherd of
     /// this crate's `shep-core` could have written, so `roll::registered`
     /// fails with its own real, crafted cause rather than this double
-    /// inventing one. `describe` answers one running instance for whichever
-    /// name is asked. `calls()` records only `delete` and `start`, in
-    /// order: those are the two that change the flock, and the ordering
-    /// this pins is between them. `save_roll` and `describe` are reads and
-    /// are not recorded, so a reordering of those does not break the
-    /// assertion.
+    /// inventing one.
+    ///
+    /// `describe` answers [`Self::instances`] running instances for
+    /// whichever name is asked, refusing outright if
+    /// [`Self::describe_fails`]. `delete` succeeds until the
+    /// [`Self::delete_fails_at`]th call, then refuses every one after -
+    /// `Some(1)` refuses the very first delete; a higher number lets some
+    /// instances go before one fails partway through.
+    ///
+    /// `calls()` records only `delete` and `start` calls that actually
+    /// landed, in order: those are the two that change the flock, and the
+    /// ordering this pins is between them. `save_roll` and `describe` are
+    /// reads and are not recorded, so a reordering of those does not break
+    /// the assertion.
     struct Recording {
         sheep: Vec<&'static str>,
         refuse: Refuse,
+        instances: u32,
+        describe_fails: bool,
+        delete_fails_at: Option<u32>,
         unreadable_roll: bool,
         calls: RefCell<Vec<&'static str>>,
         starts: RefCell<Vec<AppConfig>>,
         attempts: Cell<usize>,
+        delete_attempts: Cell<u32>,
     }
 
     impl Recording {
@@ -422,10 +434,14 @@ mod tests {
             Self {
                 sheep: sheep.to_vec(),
                 refuse,
+                instances: 1,
+                describe_fails: false,
+                delete_fails_at: None,
                 unreadable_roll: false,
                 calls: RefCell::new(Vec::new()),
                 starts: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
+                delete_attempts: Cell::new(0),
             }
         }
 
@@ -454,6 +470,27 @@ mod tests {
             this
         }
 
+        /// `describe` refuses outright, for every sheep. `put_back` cannot
+        /// learn what to delete without it, so nothing is ever deleted or
+        /// started.
+        fn refusing_describe(sheep: &[&'static str]) -> Self {
+            let mut this = Self::new(sheep, Refuse::Never);
+            this.describe_fails = true;
+            this
+        }
+
+        /// Two instances are described; the first `delete` lands, the
+        /// second refuses. This is the only shape any test here gives more
+        /// than one instance, deliberately: it is what exercises the branch
+        /// where a delete fails PARTWAY through, with some instances
+        /// already gone and others still live.
+        fn refusing_delete_partway(sheep: &[&'static str]) -> Self {
+            let mut this = Self::new(sheep, Refuse::Never);
+            this.instances = 2;
+            this.delete_fails_at = Some(2);
+            this
+        }
+
         fn calls(&self) -> Vec<&'static str> {
             self.calls.borrow().clone()
         }
@@ -471,11 +508,19 @@ mod tests {
             unimplemented!()
         }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            Ok(vec![
-                ProcessInfo::builder(1, sheep, ProcStatus::Online)
-                    .pid(Some(1000))
-                    .build(),
-            ])
+            if self.describe_fails {
+                return Err(Error::Request(RequestError::Rpc(RpcError {
+                    code: RpcErrorCode::Internal,
+                    message: "describe refused".to_owned(),
+                })));
+            }
+            Ok((0..self.instances)
+                .map(|offset| {
+                    ProcessInfo::builder(offset + 1, sheep, ProcStatus::Online)
+                        .pid(Some(1000 + offset))
+                        .build()
+                })
+                .collect())
         }
         async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
             let attempt = self.attempts.get();
@@ -501,6 +546,14 @@ mod tests {
             Ok(())
         }
         async fn delete(&self, _id: u32) -> Result<(), Error> {
+            let attempt = self.delete_attempts.get() + 1;
+            self.delete_attempts.set(attempt);
+            if self.delete_fails_at == Some(attempt) {
+                return Err(Error::Request(RequestError::Rpc(RpcError {
+                    code: RpcErrorCode::Internal,
+                    message: "delete refused".to_owned(),
+                })));
+            }
             self.calls.borrow_mut().push("delete");
             Ok(())
         }
@@ -734,6 +787,56 @@ mod tests {
         assert!(
             daemon.calls().is_empty(),
             "nothing was deleted or started without a readable roll"
+        );
+    }
+
+    /// fails if a shepherd that refuses `describe` outright is reported as
+    /// anything other than `Failed`, or if the refusal is silently
+    /// swallowed into `Done`. `put_back` cannot learn what to delete
+    /// without this call, so nothing about the sheep changes.
+    #[tokio::test]
+    async fn a_describe_that_is_refused_leaves_the_sheep_untouched() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
+        let daemon = Recording::refusing_describe(&["bpm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(results[0], Restored::Failed { .. }),
+            "{:?}",
+            results[0]
+        );
+        assert!(daemon.calls().is_empty(), "nothing was deleted or started");
+    }
+
+    /// fails if a `delete` that fails PARTWAY through a multi-instance
+    /// sheep is reported as anything other than `Failed`, or if the loop
+    /// keeps deleting instances after one refuses. This is the single most
+    /// dangerous path in the file: some instances may already be gone and
+    /// others still live, and the sheep's true state is only visible in
+    /// `shep flock`, which the report says explicitly.
+    #[tokio::test]
+    async fn a_delete_that_fails_partway_through_is_reported_as_failed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
+        let daemon = Recording::refusing_delete_partway(&["bpm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(results[0], Restored::Failed { .. }),
+            "{:?}",
+            results[0]
+        );
+        assert_eq!(
+            daemon.calls(),
+            vec!["delete"],
+            "the first delete lands before the second refuses, and nothing after it runs"
+        );
+        assert!(
+            daemon.started().is_empty(),
+            "start is never reached once a delete fails"
         );
     }
 
