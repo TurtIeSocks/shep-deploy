@@ -185,6 +185,24 @@ async fn effective_uid() -> Option<u32> {
 }
 
 /// The warning to print before running `sheep`'s build, or `None` when
+/// there is nothing to warn about: [`effective_uid`] and
+/// [`root_build_warning`] composed, which is everything [`run`] does with
+/// them besides printing.
+///
+/// The split is where testability runs out and it is worth being exact
+/// about where. The decision below is tested at every combination of uid
+/// and `user`; this composition is tested against the uid the test host
+/// actually has; the `eprintln!` in [`run`] is tested by nothing, because
+/// capturing another function's stderr in-process is not something this
+/// crate has a harness for. What stands in for a test there is the compile
+/// gate: delete the call and this function has no callers, which
+/// `-D warnings` refuses. That is weaker than a test and it is the reason
+/// this is one function rather than two lines inline.
+async fn root_warning(sheep: &str, as_user: Option<&str>) -> Option<String> {
+    root_build_warning(sheep, effective_uid().await?, as_user)
+}
+
+/// The warning to print before running `sheep`'s build, or `None` when
 /// there is nothing to warn about.
 ///
 /// Fires only when both halves are true: this process is root, and the app
@@ -387,9 +405,7 @@ pub async fn run(
     // Once, here, rather than at parse time or per instance: this is the
     // moment the exposure becomes real, and an absent command never reaches
     // it because there is nothing to run.
-    if let Some(euid) = effective_uid().await
-        && let Some(warning) = root_build_warning(sheep, euid, as_user)
-    {
+    if let Some(warning) = root_warning(sheep, as_user).await {
         eprintln!("{warning}");
     }
 
@@ -526,6 +542,24 @@ mod tests {
     #[tokio::test]
     async fn the_effective_uid_can_be_read() {
         assert!(effective_uid().await.is_some());
+    }
+
+    /// fails if reading the uid and deciding on it stop being wired
+    /// together. It asserts against whatever uid this host runs tests as
+    /// rather than against a fixed answer, so it says the same thing as
+    /// root and as anybody else: an app that names a `user` is never warned
+    /// about, and an app that does not is warned about exactly when this
+    /// process is root.
+    #[tokio::test]
+    async fn the_warning_reads_this_process_and_agrees_with_the_decision() {
+        let euid = effective_uid().await.expect("a uid");
+
+        assert!(root_warning("web", Some("reactmap")).await.is_none());
+        assert_eq!(
+            root_warning("web", None).await.is_some(),
+            euid == 0,
+            "warned about as uid {euid}"
+        );
     }
 
     /// fails if a failing build is treated as success. This is the guard
