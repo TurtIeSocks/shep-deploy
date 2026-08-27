@@ -87,6 +87,22 @@ pub enum Restored {
         /// Why the restore itself failed.
         why: String,
     },
+    /// A delete landed for some but not all of this sheep's instances
+    /// before one of them refused.
+    ///
+    /// Its own variant because neither of the other failure shapes is true
+    /// of it: `Failed`'s "left as it is" is false - some instances really
+    /// are gone - and `Lost`'s "gone from the flock" is false too, since
+    /// the registered config was never touched (the loop only calls
+    /// `Delete`, never `Start`) and instances that were never reached may
+    /// still be serving. The sheep's real state now disagrees with
+    /// `deploy.toml`, and only `shep describe` can say by how much.
+    PartlyDeleted {
+        /// The sheep left in this state.
+        sheep: String,
+        /// Why the delete that stopped partway failed.
+        why: String,
+    },
     /// The delete succeeded, both the restore and the fallback failed, and
     /// the sheep is now gone from the flock AND from the roll.
     Lost {
@@ -182,6 +198,10 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
                     sheep,
                     why: err.to_string(),
                 },
+                PutBack::PartlyDeleted(err) => Restored::PartlyDeleted {
+                    sheep,
+                    why: err.to_string(),
+                },
                 PutBack::Deleted(err) => Restored::Lost {
                     sheep,
                     why: err.to_string(),
@@ -215,6 +235,11 @@ enum PutBack {
     /// delete already ran, so the sheep was stopped and a fresh instance
     /// started to get back to that config.
     Reset(Error),
+    /// A delete landed for some but not all instances before one refused.
+    /// NOT `Untouched` (some instances really are gone) and NOT `Deleted`
+    /// (the registered config was never touched, and the name may still be
+    /// live) - the sheep's real state and `deploy.toml` now disagree.
+    PartlyDeleted(Error),
     /// The delete landed and neither the restore nor the fallback did.
     Deleted(Error),
 }
@@ -261,11 +286,11 @@ async fn put_back<D: Daemon>(
     };
     for info in &live {
         if let Err(err) = daemon.delete(info.id).await {
-            // Partway through: some instances may be gone. Not `Untouched`,
-            // and not `Deleted` either, since the name may still be live.
-            // Reported as a failure that names the sheep, and the operator
-            // sees the truth in `shep flock`.
-            return PutBack::Untouched(err);
+            // Partway through: some instances are gone, others may not be
+            // reached at all, and the registered config was never touched.
+            // Neither `Untouched` nor `Deleted` is true of that, so this
+            // gets its own variant - see `PutBack::PartlyDeleted`'s doc.
+            return PutBack::PartlyDeleted(err);
         }
     }
 
@@ -315,6 +340,16 @@ pub fn report(results: &[Restored]) -> String {
                 "{sheep} could not be restored ({why}), so its previous configuration was put \
                  back instead - doing that stopped it and started it again, so it is running \
                  with the same config as before but nothing mid-flight survived\n"
+            ),
+            // Neither "left as it is" nor "gone from the flock" is true
+            // here, so this gets wording that says exactly that, and sends
+            // the operator to the one place that can say what is really
+            // running: `shep describe`.
+            Restored::PartlyDeleted { sheep, why } => format!(
+                "{sheep}: only SOME of its instances could be stopped before a delete failed \
+                 ({why}), so it is neither fully running nor fully removed and its registered \
+                 config was never touched. Run `shep describe {sheep}` to see what is actually \
+                 still there before assuming either.\n"
             ),
             // The row an operator must not misread. Every other outcome
             // leaves a running app; this one does not, and "could not be
@@ -811,13 +846,14 @@ mod tests {
     }
 
     /// fails if a `delete` that fails PARTWAY through a multi-instance
-    /// sheep is reported as anything other than `Failed`, or if the loop
-    /// keeps deleting instances after one refuses. This is the single most
-    /// dangerous path in the file: some instances may already be gone and
-    /// others still live, and the sheep's true state is only visible in
-    /// `shep flock`, which the report says explicitly.
+    /// sheep is reported as anything other than its own `PartlyDeleted`, or
+    /// if the loop keeps deleting instances after one refuses. This is the
+    /// single most dangerous path in the file: some instances may already
+    /// be gone and others still live, and neither `Failed`'s "left as it
+    /// is" nor `Lost`'s "gone from the flock" is a true sentence about it -
+    /// only `shep describe` can say what is really there.
     #[tokio::test]
-    async fn a_delete_that_fails_partway_through_is_reported_as_failed() {
+    async fn a_delete_that_fails_partway_through_is_reported_as_partly_deleted() {
         let home = tempfile::tempdir().expect("tempdir");
         write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
         let daemon = Recording::refusing_delete_partway(&["bpm"]);
@@ -825,7 +861,7 @@ mod tests {
         let results = all(&daemon, home.path()).await;
 
         assert!(
-            matches!(results[0], Restored::Failed { .. }),
+            matches!(results[0], Restored::PartlyDeleted { .. }),
             "{:?}",
             results[0]
         );
@@ -838,6 +874,29 @@ mod tests {
             daemon.started().is_empty(),
             "start is never reached once a delete fails"
         );
+    }
+
+    /// fails if a partly-deleted sheep is worded as though it were either
+    /// fully running or fully removed. Neither `Failed`'s "left as it is"
+    /// nor `Lost`'s "gone from the flock" is true here, and this pins the
+    /// one true thing the report can say: check `shep describe` for what is
+    /// actually there.
+    #[tokio::test]
+    async fn a_partly_deleted_sheep_is_worded_as_neither_running_nor_removed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
+        let daemon = Recording::refusing_delete_partway(&["bpm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        let text = report(&results);
+        assert!(!text.contains("left as it is"), "{text}");
+        assert!(!text.contains("gone from the flock"), "{text}");
+        assert!(
+            text.contains("neither fully running nor fully removed"),
+            "{text}"
+        );
+        assert!(text.contains("shep describe bpm"), "{text}");
     }
 
     /// fails if `on-remove` ever turns a partial failure into a nonzero
