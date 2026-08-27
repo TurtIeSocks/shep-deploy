@@ -31,10 +31,11 @@
 //! That is a deliberate decision by this project's owner rather than an
 //! oversight, and it is stated here in full so an operator can act on it:
 //! **setting `user` on the app is what turns this module's bound on.**
-//! Without it the deploy still works and the failure modes above still hold
-//! - a failing build still never reaches the swap - but "a compromised build
-//! gets the app's privileges and nothing more" is not one of the guarantees
-//! in force.
+//! Without it the deploy still works and the failure modes above still
+//! hold, a failing build still never reaching the swap, but "a compromised
+//! build gets the app's privileges and nothing more" is not one of the
+//! guarantees in force. [`run`] warns when it is about to run a build as
+//! root with no `user` set; it never refuses one.
 //!
 //! Three behaviours worth knowing before reading [`run`]'s body:
 //!
@@ -161,6 +162,54 @@ async fn resolve_id(release: &Path, user: &str, flag: &str, kind: &str) -> Resul
         .trim()
         .parse()
         .map_err(|_| Error::Config(format!("`id {flag} {user}` did not print a {kind}")))
+}
+
+/// This process's own effective uid, or `None` if it cannot be read.
+///
+/// Asked of `id -u`, with no user named, for the same reason
+/// [`resolve_id`] asks it about somebody else: this crate is
+/// `#![forbid(unsafe_code)]`, which rules out `geteuid(2)` directly, and
+/// shelling out to the host needs no unsafe and no dependency added for one
+/// call.
+///
+/// `None` rather than an error, and it folds every failure into that: the
+/// only caller is a warning, and a deploy that cannot work out its own uid
+/// should still deploy. What it loses is the warning, which is the right
+/// thing to lose.
+async fn effective_uid() -> Option<u32> {
+    let output = Command::new("id").arg("-u").output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// The warning to print before running `sheep`'s build, or `None` when
+/// there is nothing to warn about.
+///
+/// Fires only when both halves are true: this process is root, and the app
+/// sets no `user` for the build to drop to. Then the build - a command the
+/// deployed repository chose - runs with the shepherd's own privilege,
+/// which is the exposure the module doc describes.
+///
+/// It warns and never refuses, which is this project owner's explicit
+/// decision. An app with no `user` is a configuration shep itself accepts,
+/// and a deploy dog is not the place to start declining it.
+///
+/// Split out from [`run`] so the decision can be tested at every
+/// combination without the test having to be root, which is the one thing a
+/// test of this cannot arrange.
+fn root_build_warning(sheep: &str, euid: u32, as_user: Option<&str>) -> Option<String> {
+    const ROOT: u32 = 0;
+
+    (euid == ROOT && as_user.is_none()).then(|| {
+        format!(
+            "shep-deploy: warning: {sheep}'s build is about to run as root, because its app sets \
+             no `user`. The build command comes from the deployed repository, so whatever that \
+             repository can be made to run, it runs as root. Set `user` on the app to build as \
+             that user instead."
+        )
+    })
 }
 
 /// Resolves `user` to a uid. See [`resolve_id`].
@@ -325,10 +374,24 @@ fn copy_artifact(
 /// copied - see [`copy_artifact`]. [`Error::Build`] if the command launches
 /// and exits non-zero, or is killed by a signal, naming the exit status
 /// when there is one.
-pub async fn run(release: &Path, spec: &BuildSpec, as_user: Option<&str>) -> Result<(), Error> {
+pub async fn run(
+    sheep: &str,
+    release: &Path,
+    spec: &BuildSpec,
+    as_user: Option<&str>,
+) -> Result<(), Error> {
     let Some(command) = spec.command.as_deref() else {
         return Ok(());
     };
+
+    // Once, here, rather than at parse time or per instance: this is the
+    // moment the exposure becomes real, and an absent command never reaches
+    // it because there is nothing to run.
+    if let Some(euid) = effective_uid().await
+        && let Some(warning) = root_build_warning(sheep, euid, as_user)
+    {
+        eprintln!("{warning}");
+    }
 
     let mut child = Command::new("sh");
     child.arg("-c").arg(command);
@@ -424,6 +487,47 @@ mod tests {
             .expect("id -g prints a number")
     }
 
+    /// fails if the root warning stops firing on the one combination that
+    /// warrants it, or starts firing on one that does not. Both halves have
+    /// to be true: this process is root, and the app names no `user` for
+    /// the build to drop to.
+    ///
+    /// Tested as a decision rather than through `run`, because the one
+    /// input that matters is this process's uid and a test cannot arrange
+    /// to be root.
+    #[test]
+    fn only_a_rootless_build_as_root_is_warned_about() {
+        assert!(root_build_warning("web", 0, None).is_some());
+
+        // Root, but the build drops to somebody: this is the configuration
+        // the warning exists to ask for.
+        assert!(root_build_warning("web", 0, Some("reactmap")).is_none());
+        // Not root: there is no shepherd privilege to hand a build.
+        assert!(root_build_warning("web", 501, None).is_none());
+        assert!(root_build_warning("web", 501, Some("reactmap")).is_none());
+    }
+
+    /// fails if the warning stops naming the sheep, what the exposure is,
+    /// or what to do about it. It is the only notice an operator gets, and
+    /// a warning that says "running as root" without saying whose code or
+    /// which knob is one they learn to skip.
+    #[test]
+    fn the_root_warning_names_the_sheep_and_the_way_out() {
+        let warning = root_build_warning("bpm", 0, None).expect("warns");
+        assert!(warning.contains("bpm"), "{warning}");
+        assert!(warning.contains("root"), "{warning}");
+        assert!(warning.contains("repository"), "{warning}");
+        assert!(warning.contains("`user`"), "{warning}");
+    }
+
+    /// fails if this process cannot read its own effective uid. The warning
+    /// above is skipped entirely when it cannot, so this is what says the
+    /// skip is not silently permanent.
+    #[tokio::test]
+    async fn the_effective_uid_can_be_read() {
+        assert!(effective_uid().await.is_some());
+    }
+
     /// fails if a failing build is treated as success. This is the guard
     /// that keeps a broken build from ever reaching the swap: current
     /// never moves and the running app is untouched, because it lives in a
@@ -435,7 +539,7 @@ mod tests {
             command: Some("exit 3".into()),
             ..Default::default()
         };
-        assert!(run(rel.path(), &spec, None).await.is_err());
+        assert!(run("web", rel.path(), &spec, None).await.is_err());
     }
 
     /// fails if an absent build command is an error rather than a no-op.
@@ -445,7 +549,7 @@ mod tests {
     async fn an_absent_build_command_is_not_an_error() {
         let rel = fixture_release(&[]);
         let spec = BuildSpec::default();
-        assert!(run(rel.path(), &spec, None).await.is_ok());
+        assert!(run("web", rel.path(), &spec, None).await.is_ok());
     }
 
     /// fails if declared artifacts are not copied into the release. With
@@ -467,7 +571,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/koji")],
         };
-        run(rel.path(), &spec, None).await.expect("builds");
+        run("web", rel.path(), &spec, None).await.expect("builds");
         assert!(rel.path().join("target/release/koji").exists());
     }
 
@@ -519,7 +623,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
-        assert!(run(rel.path(), &spec, None).await.is_ok());
+        assert!(run("web", rel.path(), &spec, None).await.is_ok());
     }
 
     /// fails if `as_user` is silently ignored on the accept side of the
@@ -537,7 +641,7 @@ mod tests {
             ..Default::default()
         };
         let user = current_username();
-        run(rel.path(), &spec, Some(&user))
+        run("web", rel.path(), &spec, Some(&user))
             .await
             .expect("dropping to one's own user and group is always permitted");
     }
@@ -566,9 +670,14 @@ mod tests {
             command: Some("true".into()),
             ..Default::default()
         };
-        let err = run(rel.path(), &spec, Some("shep-deploy-test-no-such-user"))
-            .await
-            .expect_err("no such user");
+        let err = run(
+            "web",
+            rel.path(),
+            &spec,
+            Some("shep-deploy-test-no-such-user"),
+        )
+        .await
+        .expect_err("no such user");
         assert!(matches!(err, Error::Config(_)));
         assert!(err.to_string().contains("does not resolve to a gid"));
     }
@@ -638,7 +747,7 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run(rel.path(), &spec, None).await.expect("builds");
+        run("web", rel.path(), &spec, None).await.expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
     }

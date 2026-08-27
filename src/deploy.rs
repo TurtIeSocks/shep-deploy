@@ -244,7 +244,7 @@ pub async fn deploy<D: Daemon>(
     let app = flockfile::app_config(&release, sheep)?;
     refuse_ungated_verification(sheep, &app, state.verify)?;
     let spec = flockfile::build_spec(&release)?;
-    build::run(&release, &spec, app.user.as_deref()).await?;
+    build::run(sheep, &release, &spec, app.user.as_deref()).await?;
 
     // Nothing above here has touched the running app. Everything below has.
     //

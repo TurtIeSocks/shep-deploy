@@ -49,6 +49,18 @@ shep-deploy deploy <sheep> --watch auto|manual
 
 `verify = "probed"` (the default) needs the app to have a `readiness_probe` or `wait_ready`; without one, shep reports a process `Online` for not having died yet, so there is nothing to verify against and the deploy is refused. `verify = "alive"` is the deliberate downgrade: a new process, still running ten seconds later.
 
+## Security
+
+A deploy runs the build command from the repository being deployed. That is the point of it, and it is also the whole of the risk: `bun install`'s postinstall scripts and `make build` are arbitrary code, chosen by whoever can land a commit on the branch you track.
+
+**That build runs as this process's uid unless the app sets `user`.** Supervised as a dog, this process is the shepherd's child and shares its uid, and shep's own docs recommend running the shepherd as root so it can drop privileges per app. So the default arrangement is a repository's build script running as root, once per deploy.
+
+Set `user` on the app and the build drops to that user's uid and primary group, with the shepherd's supplementary groups cleared, before it runs anything. A compromised build then gets that app's privileges and nothing more.
+
+shep-deploy warns when it is about to run a build as root with no `user` set. It does not refuse. Whether an app runs without a `user` is shep's call and the operator's, not a deploy dog's.
+
+Nothing else here handles credentials. Git auth is inherited from the user the build runs as, so a private repository works exactly as it does in that user's own shell, and no token passes through any URL or argument this crate builds.
+
 ## Status
 
 The deploy sequence and the operator command work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, opt-in (surveying the flock and cutting a sheep over for the first time), release retention, and Windows.
