@@ -229,10 +229,6 @@ mod tests {
         assert_eq!(doomed(&all, 2, None), vec!["older", "ancient"]);
     }
 
-    /// fails if a release still named by `current` can be pruned. Removing
-    /// it leaves the sheep with a `cwd` that resolves to nothing, so the
-    /// next restart cannot start it at all, and the deploy that caused it
-    /// reported success minutes earlier.
     /// fails if `prune` only clears git's stale worktree bookkeeping on
     /// cycles that removed something themselves. `worktree_prune` exists for
     /// the directory that vanished by some other means, an operator's own
@@ -256,6 +252,10 @@ mod tests {
         assert!(orphan.is_dir(), "the release is back on disk");
     }
 
+    /// fails if a release still named by `current` can be pruned. Removing
+    /// it leaves the sheep with a `cwd` that resolves to nothing, so the
+    /// next restart cannot start it at all, and the deploy that caused it
+    /// reported success minutes earlier.
     #[test]
     fn the_live_release_is_never_pruned_whatever_its_age() {
         let all = releases(&["new", "old", "older", "ancient"]);
