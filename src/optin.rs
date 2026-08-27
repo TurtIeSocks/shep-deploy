@@ -411,11 +411,20 @@ async fn attempt<D: Daemon>(
             DWELL.as_secs()
         ));
     }
-    // Belt and braces beside the pid check: a crash and respawn back onto a
-    // pid this generation already held is vanishingly unlikely, and this
-    // costs one comparison to rule out. No fixture arranges it, because a
-    // real shepherd does not do it and a test that staged it would be
-    // pinning fiction.
+    // NOT belt and braces, and an earlier comment here saying so was wrong
+    // in the direction that matters. `Generation::is_new` compares pids and
+    // nothing else, and the generation was captured before the `Start`, so
+    // an ORIGINAL that crashed and respawned before the real newcomer
+    // appeared reads as a newcomer: phase one adopts it, and the dwell
+    // finds that same pid still alive and not errored. The restart count is
+    // the only thing left that rejects it. Without this check the cutover
+    // returns `Done` having verified nothing, and then deletes the healthy
+    // original by id.
+    //
+    // Not an exotic shape either. The newcomer is fighting the original for
+    // its port, which is the premise of this whole task, and the original
+    // is the side that can lose. Pinned by
+    // `an_original_that_respawns_is_not_mistaken_for_the_newcomer`.
     if survivors.iter().any(|info| info.restarts > 0) {
         return CutOver::NotVerified(
             "the new instance restarted while it was being watched".to_owned(),
@@ -734,9 +743,13 @@ mod tests {
     /// The pid of that instance.
     const REPAIR_PID: u32 = 700;
 
-    /// What a newcomer looks like at some moment after the `Start`.
+    /// What one row looks like at some moment after the `Start`.
+    ///
+    /// Written for the newcomers and used for the originals too, because
+    /// the case that matters most is an original that stops looking like
+    /// itself: see `an_original_that_respawns_is_not_mistaken_for_the_newcomer`.
     #[derive(Debug, Clone, Copy)]
-    enum Newcomer {
+    enum Shape {
         /// No row at all. This is what the first poll or two really see: a
         /// `Start` is an acceptance, and the shepherd spawns afterwards.
         Absent,
@@ -748,36 +761,78 @@ mod tests {
         },
     }
 
-    /// The newcomer's state at `elapsed`, from a step function written as
-    /// `(from, state)` pairs in ascending order.
-    fn newcomer_at(script: &[(Duration, Newcomer)], elapsed: Duration) -> Newcomer {
+    /// A row's shape at `elapsed`, from a step function written as
+    /// `(from, shape)` pairs in ascending order.
+    fn shape_at(script: &[(Duration, Shape)], elapsed: Duration) -> Shape {
         script
             .iter()
             .rev()
             .find(|(from, _)| *from <= elapsed)
-            .map_or(Newcomer::Absent, |(_, state)| *state)
+            .map_or(Shape::Absent, |(_, shape)| *shape)
+    }
+
+    /// The ordinary original: `Online` at its own pid, never restarted,
+    /// for as long as the cutover runs.
+    fn originals_stay_online() -> Vec<(Duration, Shape)> {
+        vec![(
+            Duration::ZERO,
+            Shape::Up {
+                status: ProcStatus::Online,
+                pid: ORIGINAL_PID,
+                restarts: 0,
+            },
+        )]
+    }
+
+    /// An original that crashes and is respawned a second into the cutover:
+    /// same instance id, a new pid, `restarts` at one.
+    ///
+    /// The shape a port fight really produces on the losing side, and the
+    /// one that reads as a newcomer to a pid-only comparison.
+    fn originals_respawn_mid_cutover() -> Vec<(Duration, Shape)> {
+        vec![
+            (
+                Duration::ZERO,
+                Shape::Up {
+                    status: ProcStatus::Online,
+                    pid: ORIGINAL_PID,
+                    restarts: 0,
+                },
+            ),
+            (
+                Duration::from_secs(1),
+                Shape::Up {
+                    status: ProcStatus::Online,
+                    pid: ORIGINAL_PID + 50,
+                    restarts: 1,
+                },
+            ),
+        ]
     }
 
     /// A [`Daemon`] that answers `describe` the way a real shepherd does
     /// through a cutover, and records every `start` and `delete`.
     ///
-    /// The originals are `Online` throughout, which is not a convenience:
-    /// `Request::Start` on a registered name ADDS an instance beside them,
-    /// and a real shepherd keeps the old one serving until something
-    /// removes it. A double that turned the flock over instantly would be
-    /// the same fiction that let the engine plan's worst blocker survive
-    /// unit testing.
+    /// The originals stay `Online` unless a fixture says otherwise, which is
+    /// not a convenience: `Request::Start` on a registered name ADDS an
+    /// instance beside them, and a real shepherd keeps the old one serving
+    /// until something removes it. A double that turned the flock over
+    /// instantly would be the same fiction that let the engine plan's worst
+    /// blocker survive unit testing.
     ///
-    /// The newcomers are a function of elapsed time since the `Start`, so a
-    /// fixture says what the release DOES rather than counting polls: under
+    /// Both scripts are a function of elapsed time since the `Start`, so a
+    /// fixture says what the flock DOES rather than counting polls: under
     /// `start_paused` the clock moves only when the code under test sleeps,
     /// so `attempt`'s 100ms poll and its ten-second dwell land on the
     /// script's own thresholds deterministically.
     struct CutOverDouble {
         /// The ids the shepherd already has for this sheep.
         originals: Vec<u32>,
+        /// What every original looks like as time passes since the `Start`,
+        /// and before it.
+        original_script: Vec<(Duration, Shape)>,
         /// What each newcomer looks like as time passes since the `Start`.
-        script: Vec<(Duration, Newcomer)>,
+        script: Vec<(Duration, Shape)>,
         /// Which `start` call, counting from zero, the shepherd refuses.
         refuses: Option<usize>,
         /// Every `start` the shepherd accepted, in order.
@@ -793,13 +848,10 @@ mod tests {
     }
 
     impl CutOverDouble {
-        fn new(
-            originals: &[u32],
-            script: Vec<(Duration, Newcomer)>,
-            refuses: Option<usize>,
-        ) -> Self {
+        fn new(originals: &[u32], script: Vec<(Duration, Shape)>, refuses: Option<usize>) -> Self {
             Self {
                 originals: originals.to_vec(),
+                original_script: originals_stay_online(),
                 script,
                 refuses,
                 starts: RefCell::new(Vec::new()),
@@ -808,6 +860,13 @@ mod tests {
                 accepted_at: Cell::new(None),
                 repairs: Cell::new(0),
             }
+        }
+
+        /// The same double, with the originals doing something other than
+        /// sitting still.
+        fn while_the_originals(mut self, script: Vec<(Duration, Shape)>) -> Self {
+            self.original_script = script;
+            self
         }
 
         /// Every app the shepherd accepted a `Start` for, in order.
@@ -842,20 +901,33 @@ mod tests {
         }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let mut flock = Vec::new();
+            // Before the `Start` the originals are read at zero, which is
+            // where every script has them sitting still.
+            let elapsed = self
+                .accepted_at
+                .get()
+                .map_or(Duration::ZERO, |accepted_at| Instant::now() - accepted_at);
 
-            for (offset, id) in self.originals.iter().enumerate() {
-                let offset = u32::try_from(offset).expect("a handful of instances");
-                if !self.is_deleted(*id) {
-                    flock.push(self.row(*id, ProcStatus::Online, ORIGINAL_PID + offset, 0));
+            if let Shape::Up {
+                status,
+                pid,
+                restarts,
+            } = shape_at(&self.original_script, elapsed)
+            {
+                for (offset, id) in self.originals.iter().enumerate() {
+                    let offset = u32::try_from(offset).expect("a handful of instances");
+                    if !self.is_deleted(*id) {
+                        flock.push(self.row(*id, status, pid + offset, restarts));
+                    }
                 }
             }
 
-            if let Some(accepted_at) = self.accepted_at.get()
-                && let Newcomer::Up {
+            if self.accepted_at.get().is_some()
+                && let Shape::Up {
                     status,
                     pid,
                     restarts,
-                } = newcomer_at(&self.script, Instant::now() - accepted_at)
+                } = shape_at(&self.script, elapsed)
             {
                 for offset in 0..self.originals.len() {
                     let offset = u32::try_from(offset).expect("a handful of instances");
@@ -918,7 +990,7 @@ mod tests {
     /// A prepared tree for `bpm`, plus a double scripted with `script`.
     async fn cutover_fixture_of(
         originals: &[u32],
-        script: Vec<(Duration, Newcomer)>,
+        script: Vec<(Duration, Shape)>,
         refuses: Option<usize>,
     ) -> (CutOverDouble, Prepared, Dirs) {
         let home = tempfile::tempdir().expect("tempdir");
@@ -943,12 +1015,12 @@ mod tests {
     /// so a newcomer that only appears at 250ms is adopted on the fourth
     /// poll, which is what a shepherd that has accepted a `Start` and not
     /// yet spawned looks like.
-    fn comes_up() -> Vec<(Duration, Newcomer)> {
+    fn comes_up() -> Vec<(Duration, Shape)> {
         vec![
-            (Duration::ZERO, Newcomer::Absent),
+            (Duration::ZERO, Shape::Absent),
             (
                 Duration::from_millis(250),
-                Newcomer::Up {
+                Shape::Up {
                     status: ProcStatus::Starting,
                     pid: NEWCOMER_PID,
                     restarts: 0,
@@ -956,7 +1028,7 @@ mod tests {
             ),
             (
                 Duration::from_millis(450),
-                Newcomer::Up {
+                Shape::Up {
                     status: ProcStatus::Online,
                     pid: NEWCOMER_PID,
                     restarts: 0,
@@ -987,13 +1059,13 @@ mod tests {
             vec![
                 (
                     Duration::ZERO,
-                    Newcomer::Up {
+                    Shape::Up {
                         status: ProcStatus::Online,
                         pid: NEWCOMER_PID,
                         restarts: 0,
                     },
                 ),
-                (Duration::from_secs(5), Newcomer::Absent),
+                (Duration::from_secs(5), Shape::Absent),
             ],
             None,
         )
@@ -1010,10 +1082,10 @@ mod tests {
         cutover_fixture_of(
             &[7],
             vec![
-                (Duration::ZERO, Newcomer::Absent),
+                (Duration::ZERO, Shape::Absent),
                 (
                     Duration::from_millis(250),
-                    Newcomer::Up {
+                    Shape::Up {
                         status: ProcStatus::Online,
                         pid: NEWCOMER_PID,
                         restarts: 0,
@@ -1021,7 +1093,7 @@ mod tests {
                 ),
                 (
                     Duration::from_secs(5),
-                    Newcomer::Up {
+                    Shape::Up {
                         status: ProcStatus::Online,
                         pid: NEWCOMER_PID + 50,
                         restarts: 1,
@@ -1035,12 +1107,12 @@ mod tests {
 
     /// A newcomer that comes up and is `Errored` by the dwell: the
     /// port-collision shape, where the original still holds the port.
-    fn dies_during_dwell() -> Vec<(Duration, Newcomer)> {
+    fn dies_during_dwell() -> Vec<(Duration, Shape)> {
         vec![
-            (Duration::ZERO, Newcomer::Absent),
+            (Duration::ZERO, Shape::Absent),
             (
                 Duration::from_millis(250),
-                Newcomer::Up {
+                Shape::Up {
                     status: ProcStatus::Online,
                     pid: NEWCOMER_PID,
                     restarts: 0,
@@ -1048,7 +1120,7 @@ mod tests {
             ),
             (
                 Duration::from_secs(5),
-                Newcomer::Up {
+                Shape::Up {
                     status: ProcStatus::Errored,
                     pid: NEWCOMER_PID,
                     restarts: 0,
@@ -1078,7 +1150,23 @@ mod tests {
     /// whole `listen_timeout` and that is not a failure. What the budget
     /// bounds is a newcomer APPEARING.
     async fn cutover_fixture_never_appears() -> (CutOverDouble, Prepared, Dirs) {
-        cutover_fixture_of(&[7], vec![(Duration::ZERO, Newcomer::Absent)], None).await
+        cutover_fixture_of(&[7], vec![(Duration::ZERO, Shape::Absent)], None).await
+    }
+
+    /// An original that crashes and respawns a second into the cutover,
+    /// with no real newcomer ever arriving.
+    ///
+    /// The two halves are both needed. The respawn gives the original a pid
+    /// the pre-`Start` generation never had, which is all `is_new` looks
+    /// at; the absent newcomer is what leaves it as the only candidate.
+    async fn cutover_fixture_original_respawns() -> (CutOverDouble, Prepared, Dirs) {
+        let (daemon, prepared, dirs) =
+            cutover_fixture_of(&[7], vec![(Duration::ZERO, Shape::Absent)], None).await;
+        (
+            daemon.while_the_originals(originals_respawn_mid_cutover()),
+            prepared,
+            dirs,
+        )
     }
 
     /// A shepherd that refuses the cutover's `Start` outright.
@@ -1244,6 +1332,33 @@ mod tests {
         let (daemon, prepared, _dirs) = cutover_fixture_refusing_start().await;
         cut_over(&daemon, prepared).await.expect_err("refused");
         assert!(daemon.deleted().is_empty());
+    }
+
+    /// fails if the ORIGINAL, respawned, is mistaken for the release this
+    /// cutover just started. `Generation::is_new` compares pids and the
+    /// generation is captured before the `Start`, so an original that
+    /// crashes and comes back under a new pid looks exactly like a
+    /// newcomer: phase one adopts it, and the dwell finds the same pid
+    /// still alive. Only the restart count is left to reject it, which is
+    /// why that check is load-bearing rather than belt and braces.
+    ///
+    /// What is at stake is the whole of this task. Accept the respawned
+    /// original and the cutover reports `Done` having verified nothing,
+    /// then deletes that healthy original by id, leaving the sheep with no
+    /// instance at all. And the shape is the premise of the task rather
+    /// than a corner: the newcomer is fighting the original for its port.
+    #[tokio::test(start_paused = true)]
+    async fn an_original_that_respawns_is_not_mistaken_for_the_newcomer() {
+        let (daemon, prepared, _dirs) = cutover_fixture_original_respawns().await;
+
+        let err = cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        assert!(matches!(err, Error::CutOver { .. }), "{err}");
+        assert!(
+            !daemon.deleted().contains(&7),
+            "the healthy original is kept: {:?}",
+            daemon.deleted()
+        );
     }
 
     /// fails if the record is advanced before the newcomer verified.
