@@ -126,13 +126,14 @@ pub async fn prepare<D: Daemon>(
         // cannot be undone. So this refuses instead.
         let state = State::read(&tree.state_file()).map_err(|source| {
             Error::Config(format!(
-                "{sheep} has a deploy tree at {} and its record at {} cannot be read: \
-                 {source}. Refusing rather than guessing. That record is the only thing that \
-                 says whether {sheep} was ever cut over, and the two answers need opposite \
+                "{sheep} has a deploy tree at {} and its record at {} cannot be read. \
+                 Refusing rather than guessing. That record is the only thing that says \
+                 whether {sheep} was ever cut over, and the two answers need opposite \
                  handling. Do NOT remove the tree until you know which it is: if {sheep} WAS \
                  cut over, its working directory is inside it and removing it takes a running \
                  service's cwd with it. Restore or repair that file first - `shep describe \
-                 {sheep}` shows whether the sheep is running from inside this tree.",
+                 {sheep}` shows whether the sheep is running from inside this tree. Reading it \
+                 failed with: {source}",
                 tree.root().display(),
                 tree.state_file().display()
             ))
