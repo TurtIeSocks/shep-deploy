@@ -193,6 +193,7 @@ pub async fn prepare<D: Daemon>(
         remote,
         branch,
         deployed: None,
+        failed: None,
         verify: Verify::default(),
         // `manual` until the cutover lands, and `cut_over` is what promotes
         // it. A tree nothing has served from is not a deploy target - the
@@ -792,6 +793,7 @@ mod tests {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
             deployed: sha.map(str::to_owned),
+            failed: None,
             verify: Verify::default(),
             watch,
             origin_cwd: None,

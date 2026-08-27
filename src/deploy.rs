@@ -235,17 +235,64 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// writes it again. A caller that treats every error as "the old release is
 /// still serving" is wrong about this one.
 ///
-/// `keep` is the retention count: once a deploy verifies, [`crate::retention`]
-/// reclaims every release beyond the newest `keep`, sparing whatever
-/// `current` names regardless of age. A prune failure is reported with
+/// `keep` is the retention count: [`crate::retention`] reclaims every
+/// release beyond the newest `keep`, sparing whatever `current` names
+/// regardless of age. It runs after every ending, not only a verified one -
+/// the target that keeps failing is the one building a fresh worktree for
+/// every commit somebody pushes, and pruning only on success left exactly
+/// that one growing with the branch. A prune failure is reported with
 /// `eprintln!` rather than returned - see that module's own doc - so it
 /// never turns a deploy that already succeeded into one this function
 /// reports as failed.
+///
+/// Every ending that is not [`Outcome::Deployed`] is written into
+/// `state.failed`, which is what [`unattended`] holds on and what an
+/// operator asking by name ignores. See [`record`].
 pub async fn deploy<D: Daemon>(
     daemon: &D,
     tree: &Tree,
     state: &mut State,
     keep: usize,
+) -> Result<Outcome, Error> {
+    go(daemon, tree, state, keep, Held::Retry).await
+}
+
+/// [`deploy`], as the poll loop asks for it: a sha an earlier attempt
+/// failed on is left alone until the branch moves.
+///
+/// The difference is only the trigger, exactly as `manual` is. Everything
+/// else - releases, shared linking, the atomic swap, probe verification,
+/// auto-rollback and retention - is the same code.
+///
+/// # Errors
+/// [`Error::Held`] if the branch head is the sha `state.failed` names, in
+/// which case nothing at all was attempted. Otherwise as [`deploy`].
+pub async fn unattended<D: Daemon>(
+    daemon: &D,
+    tree: &Tree,
+    state: &mut State,
+    keep: usize,
+) -> Result<Outcome, Error> {
+    go(daemon, tree, state, keep, Held::Hold).await
+}
+
+/// What an entry point does about a sha the last attempt failed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// Try it again. An operator asking for a deploy by name is asking for
+    /// exactly the attempt the loop is declining to make on its own.
+    Retry,
+    /// Leave it alone until the branch moves.
+    Hold,
+}
+
+/// The body both entries share. See [`deploy`].
+async fn go<D: Daemon>(
+    daemon: &D,
+    tree: &Tree,
+    state: &mut State,
+    keep: usize,
+    held: Held,
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
 
@@ -282,9 +329,38 @@ pub async fn deploy<D: Daemon>(
         return Ok(Outcome::UpToDate);
     }
 
-    let release = tree.release(&head);
+    // The whole of what `Held::Hold` changes, and it is deliberately here
+    // rather than before the fetch: the branch moving is what clears a
+    // hold, and the fetch is how this finds out that it did.
+    if held == Held::Hold && state.failed.as_deref() == Some(head.as_str()) {
+        return Err(Error::Held {
+            sheep: sheep.to_owned(),
+            sha: head,
+        });
+    }
+
+    let outcome = attempt(daemon, tree, state, &head, started_at).await;
+    record(tree, state, &head, &outcome, keep);
+    outcome
+}
+
+/// Everything from the release directory to the verdict, for one sha that
+/// is going to be attempted.
+///
+/// Split out of [`go`] so that recording what the attempt came to has one
+/// place to happen rather than five. See [`deploy`] for what each ending
+/// means.
+async fn attempt<D: Daemon>(
+    daemon: &D,
+    tree: &Tree,
+    state: &mut State,
+    head: &str,
+    started_at: Option<PathBuf>,
+) -> Result<Outcome, Error> {
+    let sheep = tree.sheep();
+    let release = tree.release(head);
     if !release.exists() {
-        git::worktree_add(&tree.git(), &release, &head)?;
+        git::worktree_add(&tree.git(), &release, head)?;
     }
     shared::link_cache(&release, &tree.cache_target())?;
     shared::link_into(
@@ -330,16 +406,11 @@ pub async fn deploy<D: Daemon>(
         // deploying the same sha again - wasteful, and safe. That is why it
         // is a `?` here rather than a `Landed` variant.
         Landed::Verified => {
-            state.deployed = Some(head.clone());
+            state.deployed = Some(head.to_owned());
             state.write(&tree.state_file())?;
-            // After the record, and never fatal. See `crate::retention`'s
-            // own doc for both halves: full turnover means nothing is
-            // still executing from an older release, and a deploy that has
-            // already verified and recorded itself did succeed.
-            if let Err(err) = retention::prune(tree, keep) {
-                eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
-            }
-            Ok(Outcome::Deployed { sha: head })
+            Ok(Outcome::Deployed {
+                sha: head.to_owned(),
+            })
         }
         // Nothing was ever started on the new release, so there is nothing
         // to reload onto the old one - only a symlink to put back.
@@ -353,7 +424,7 @@ pub async fn deploy<D: Daemon>(
                 tree,
                 state,
                 previous.as_deref(),
-                &head,
+                head,
                 &why,
                 patience,
             )
@@ -373,7 +444,7 @@ pub async fn deploy<D: Daemon>(
                 tree,
                 state,
                 previous.as_deref(),
-                &head,
+                head,
                 &source.to_string(),
                 patience,
             )
@@ -383,6 +454,53 @@ pub async fn deploy<D: Daemon>(
                 source: Box::new(source),
             })
         }
+    }
+}
+
+/// Writes down what this attempt on `head` came to, and reclaims old
+/// releases.
+///
+/// Two pieces of bookkeeping that belong to every ending rather than to
+/// one of them, and both used to sit in the verified arm alone.
+///
+/// `failed` is what stops the poll loop attempting one bad commit forever.
+/// `deployed` advances only on a verify, so a sha that did not land leaves
+/// the head and the record different, and the loop would find that
+/// difference again on every tick. Recorded rather than remembered, so it
+/// survives the dog being restarted, which is when a supervisor would
+/// otherwise turn a held sha back into a rebuild loop.
+///
+/// Retention runs on every ending for the same shape of reason: the target
+/// that keeps failing is the one building a fresh worktree for every commit
+/// somebody pushes, and pruning only after a verify left exactly that one
+/// growing without limit. [`retention::prune`] spares whatever `current`
+/// names, so this is the same call the verified path always made.
+///
+/// Neither failure is fatal and neither is silent. The record write is
+/// reported and passed over because the deploy's own outcome is already
+/// decided and true - what a lost write costs is one more attempt at the
+/// same sha - and the prune failure has always been reported this way; see
+/// [`crate::retention`]'s own doc.
+fn record(
+    tree: &Tree,
+    state: &mut State,
+    head: &str,
+    outcome: &Result<Outcome, Error>,
+    keep: usize,
+) {
+    let sheep = tree.sheep();
+    let landed = matches!(outcome, Ok(Outcome::Deployed { .. }));
+    let failed = (!landed).then(|| head.to_owned());
+
+    if state.failed != failed {
+        state.failed = failed;
+        if let Err(err) = state.write(&tree.state_file()) {
+            eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
+        }
+    }
+
+    if let Err(err) = retention::prune(tree, keep) {
+        eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
     }
 }
 
@@ -1047,6 +1165,7 @@ mod tests {
             remote,
             branch: "main".to_owned(),
             deployed: None,
+            failed: None,
             verify: crate::state::Verify::Probed,
             // What `crate::optin::prepare` writes: a tree nothing has
             // been served from yet is not the poll loop's.
@@ -1504,6 +1623,169 @@ mod tests {
 
         let written = State::read(&fixture.tree.state_file()).expect("deploy.toml was written");
         assert_eq!(written.deployed.as_deref(), Some(second.as_str()));
+    }
+
+    /// fails if a sha whose deploy did not land is not written down. The
+    /// poll loop is why: `state.deployed` advances only on a verify, so
+    /// without a second record the loop compares the branch head against
+    /// the release that is still serving, finds them different, and runs
+    /// the whole sequence again - fetch, full rebuild, swap, reload, wait
+    /// out the verification budget, roll back, reload again - every
+    /// interval, forever, from one bad commit.
+    #[tokio::test(start_paused = true)]
+    async fn a_sha_that_did_not_land_is_written_down() {
+        let mut fixture = fixture_with_previous_release();
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let outcome = unattended(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect("rolls back");
+
+        assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+        assert_eq!(fixture.state.failed.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("deploy.toml was written")
+                .failed
+                .as_deref(),
+            Some(second.as_str()),
+            "and it survives a restart of the dog"
+        );
+    }
+
+    /// fails if the loop attempts a sha it has already failed on. The whole
+    /// point of writing it down: two reloads of a live app and a full
+    /// rebuild every thirty seconds, indefinitely, is what an unheld one
+    /// costs. The branch moving is what clears it, which is what CI does
+    /// with a red commit.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_sha_is_held_until_the_branch_moves() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let daemon = Shepherd::never_ready();
+        unattended(&daemon, &fixture.tree, &mut fixture.state, 5)
+            .await
+            .expect("rolls back");
+        let reloads = daemon.reload_count();
+
+        let err = unattended(&daemon, &fixture.tree, &mut fixture.state, 5)
+            .await
+            .expect_err("holds");
+
+        assert!(matches!(err, Error::Held { .. }), "{err:?}");
+        let shown = err.to_string();
+        assert!(shown.contains(&second), "{shown}");
+        assert_eq!(daemon.reload_count(), reloads, "nothing was reloaded");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous)),
+            "and nothing was swapped"
+        );
+    }
+
+    /// fails if an operator asking for a deploy by name is answered with
+    /// the loop's hold. They are asking for exactly the attempt the loop is
+    /// declining to make on its own - after fixing the machine the build
+    /// needed, most often - and answering "I am not trying that one" would
+    /// leave them with no way to ask.
+    #[tokio::test(start_paused = true)]
+    async fn an_operator_asking_by_name_retries_a_held_sha() {
+        let mut fixture = fixture_with_previous_release();
+        commit_on_origin(&fixture, "second.txt");
+
+        unattended(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect("rolls back");
+
+        let daemon = Shepherd::ready();
+        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, 5)
+            .await
+            .expect("tries again");
+
+        assert!(matches!(outcome, Outcome::Deployed { .. }), "{outcome:?}");
+        assert_eq!(daemon.reload_count(), 1);
+    }
+
+    /// fails if the hold outlives the commit it was about. A push is the
+    /// signal that somebody has done something about the failure, and a
+    /// hold that survived it would need a command nobody knows to run.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_commit_clears_the_hold() {
+        let mut fixture = fixture_with_previous_release();
+        commit_on_origin(&fixture, "second.txt");
+        unattended(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            5,
+        )
+        .await
+        .expect("rolls back");
+
+        let third = commit_on_origin(&fixture, "third.txt");
+        let outcome = unattended(&Shepherd::ready(), &fixture.tree, &mut fixture.state, 5)
+            .await
+            .expect("deploys the new commit");
+
+        assert_eq!(outcome, Outcome::Deployed { sha: third });
+        assert_eq!(fixture.state.failed, None, "the hold is cleared");
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("reads")
+                .failed,
+            None
+        );
+    }
+
+    /// fails if a target that never verifies accumulates a release
+    /// directory per commit. Retention used to run only on the verified
+    /// path, so the one target that keeps failing - the one building a
+    /// fresh worktree every time somebody pushes - was the one nothing
+    /// ever reclaimed, and it grew with the branch rather than with
+    /// `retention`.
+    ///
+    /// The release that just failed is the newest, so it is one of the
+    /// ones retention keeps. What this pins is the bound: the newest
+    /// `keep`, plus whatever `current` names, and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn failed_releases_are_reclaimed_like_any_other() {
+        let mut fixture = fixture_with_previous_release();
+        let live = fixture.state.deployed.clone().expect("a previous release");
+        let mut failed = Vec::new();
+        for name in ["second.txt", "third.txt", "fourth.txt"] {
+            failed.push(commit_on_origin(&fixture, name));
+            unattended(
+                &Shepherd::never_ready(),
+                &fixture.tree,
+                &mut fixture.state,
+                2,
+            )
+            .await
+            .expect("rolls back");
+        }
+
+        assert!(fixture.tree.release(&live).exists(), "current is spared");
+        assert!(
+            !fixture.tree.release(&failed[0]).exists(),
+            "the oldest failure is reclaimed"
+        );
+        assert!(fixture.tree.release(&failed[2]).exists(), "the newest kept");
+        let count = fs::read_dir(fixture.tree.releases())
+            .expect("reads")
+            .count();
+        assert_eq!(count, 3, "the newest two, plus what current names");
     }
 
     /// fails if the process that was already serving passes for the

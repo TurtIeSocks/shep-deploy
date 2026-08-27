@@ -70,6 +70,7 @@ mod tests {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
             deployed: deployed.map(str::to_owned),
+            failed: None,
             verify: crate::state::Verify::default(),
             watch,
             origin_cwd: None,

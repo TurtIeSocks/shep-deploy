@@ -67,6 +67,11 @@ const fn due(state: &State) -> bool {
 /// remotes was unreachable would stop deploying the other four, and nothing
 /// would restart it with a reason anybody could read.
 ///
+/// Through [`deploy::unattended`] rather than [`deploy::deploy`], which is
+/// the difference between a loop and an operator: a sha an earlier attempt
+/// failed on is left alone until the branch moves, rather than rebuilt and
+/// rolled back every interval for as long as nobody pushes.
+///
 /// Targets are re-read from disk every tick rather than cached, so a target
 /// created, retargeted with `git checkout stable`, or switched to `manual`
 /// while the dog runs is picked up on the next pass without a restart.
@@ -101,7 +106,7 @@ async fn tick<D: Daemon>(
         if !due(&state) {
             continue;
         }
-        let outcome = deploy::deploy(daemon, &tree, &mut state, config.retention).await;
+        let outcome = deploy::unattended(daemon, &tree, &mut state, config.retention).await;
         results.push((name, outcome));
     }
     results
@@ -488,14 +493,20 @@ mod tests {
         }
     }
 
-    /// A shepherd that has gone quiet, counting the times it was asked.
+    /// A shepherd that has gone quiet, counting the times it was asked, on
+    /// a branch that moves while it is down.
     ///
-    /// One `describe` per tick, exactly: a deploy captures the generation
+    /// One `describe` per tick, exactly. A deploy captures the generation
     /// before its reload, that capture is the first thing it asks for, and
-    /// this answers it with an error - so the deploy puts `current` back
-    /// and gives up before any second question. Nothing is recorded and
-    /// nothing moves, so the next tick does the identical thing, which is
-    /// what makes the count a tick count.
+    /// this answers it with an error, so the deploy puts `current` back and
+    /// gives up before asking anything else.
+    ///
+    /// The commit is what makes the next tick do the same thing again
+    /// rather than hold: an attempt that failed is recorded against its
+    /// sha, and the branch moving is what clears it. So this is a target
+    /// somebody keeps pushing to while the shepherd is down, which is the
+    /// one shape that really does deploy on every tick - and the reason the
+    /// count is a tick count.
     ///
     /// A count far above what the interval allows means the loop stopped
     /// sleeping. That is a busy loop with no await point in it, and under a
@@ -504,12 +515,14 @@ mod tests {
     /// panic turns that hang into a red test with a reason on it.
     struct Counting {
         describes: Cell<u32>,
+        origin: PathBuf,
     }
 
     impl Counting {
-        const fn new() -> Self {
+        fn new(origin: &Path) -> Self {
             Self {
                 describes: Cell::new(0),
+                origin: origin.to_owned(),
             }
         }
 
@@ -526,11 +539,15 @@ mod tests {
             unimplemented!()
         }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            self.describes.set(self.describes.get() + 1);
+            let asked = self.describes.get() + 1;
+            self.describes.set(asked);
             assert!(
-                self.describes.get() <= 60,
+                asked <= 60,
                 "the loop ticked far more than the interval allows: it is not sleeping"
             );
+            fs::write(self.origin.join(format!("{asked}.txt")), "x").expect("write");
+            git(&self.origin, &["add", "."]);
+            git(&self.origin, &["commit", "-q", "-m", "another"]);
             Err(Error::Protocol("the shepherd stopped answering".to_owned()))
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
@@ -609,6 +626,32 @@ mod tests {
         );
     }
 
+    /// fails if a tick rebuilds a sha the last attempt failed on. This is
+    /// the difference between the loop's entry into the deploy sequence and
+    /// an operator's: unheld, one bad commit costs two reloads of a live
+    /// app and a full rebuild every interval, indefinitely, and nothing
+    /// about that self-corrects until somebody pushes.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_holds_a_sha_that_already_failed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin = write_target_ready(home.path(), "held", Watch::Auto);
+        let tree = Tree::for_sheep(home.path(), "held");
+        let mut state = State::read(&tree.state_file()).expect("reads");
+        state.failed = Some(head_of(origin.path()));
+        state.write(&tree.state_file()).expect("writes");
+
+        let daemon = Ready::new();
+        let results = tick(&daemon, home.path(), config()).await;
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0].1, Err(Error::Held { .. })),
+            "{:?}",
+            results[0].1
+        );
+        assert_eq!(daemon.reloads.get(), 0, "nothing was reloaded");
+    }
+
     /// fails if a tick with no targets at all is an error. That is every
     /// freshly adopted dog, and it must idle quietly rather than logging a
     /// failure every thirty seconds forever.
@@ -671,8 +714,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ticks_are_spaced_by_the_configured_interval() {
         let home = tempfile::tempdir().expect("tempdir");
-        let _origin = write_target_ready(home.path(), "quiet", Watch::Auto);
-        let counter = Counting::new();
+        let origin = write_target_ready(home.path(), "quiet", Watch::Auto);
+        let counter = Counting::new(origin.path());
         let began = tokio::time::Instant::now();
 
         // Three ticks' worth, then stop.
@@ -700,8 +743,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_first_tick_happens_at_once() {
         let home = tempfile::tempdir().expect("tempdir");
-        let _origin = write_target_ready(home.path(), "quiet", Watch::Auto);
-        let counter = Counting::new();
+        let origin = write_target_ready(home.path(), "quiet", Watch::Auto);
+        let counter = Counting::new(origin.path());
 
         let _ = tokio::time::timeout(
             Duration::from_secs(1),

@@ -245,6 +245,25 @@ pub enum Error {
         /// The tree to remove before running `setup` again.
         tree: PathBuf,
     },
+    /// A sha an earlier attempt failed on, left alone until the branch
+    /// moves.
+    ///
+    /// Not a deploy that failed - it is a deploy that was not attempted,
+    /// and the failure it is about already had its own error, one tick or
+    /// one week ago. It is an error rather than an [`crate::deploy::Outcome`]
+    /// because nothing was deployed and because the poll loop already mutes
+    /// a repeated line: an operator sees it once when the hold starts, and
+    /// again if anything about the target changes.
+    ///
+    /// Only [`crate::deploy::unattended`] returns it. An operator asking
+    /// for a deploy by name is asking for exactly the attempt the loop is
+    /// declining to make on its own, so that path retries.
+    Held {
+        /// The sheep being held.
+        sheep: String,
+        /// The sha it is held at.
+        sha: String,
+    },
     /// A release's build command exited without succeeding.
     ///
     /// Deliberately carries only the exit status, not captured output the
@@ -267,6 +286,12 @@ impl fmt::Display for Error {
             Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config(what) => write!(f, "bad deploy configuration: {what}"),
+            Self::Held { sheep, sha } => write!(
+                f,
+                "{sheep} is held at {sha}: the last attempt at that commit did not land, so it \
+                 is left alone until the branch moves rather than rebuilt and rolled back every \
+                 interval. Push a fix, or run `shep deploy {sheep}` to try the same commit again"
+            ),
             Self::NotCutOver { sheep, tree } => write!(
                 f,
                 "{sheep} has a deploy tree but was never cut over to it, so there is nothing to \
@@ -436,6 +461,7 @@ impl core::error::Error for Error {
             Self::Protocol(_)
             | Self::Config(_)
             | Self::NotCutOver { .. }
+            | Self::Held { .. }
             | Self::Git { .. }
             | Self::Raced { .. }
             | Self::Unverified { .. }

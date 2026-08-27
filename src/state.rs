@@ -77,6 +77,24 @@ pub struct State {
     /// The sha currently live under `current`, or `None` before the first
     /// successful deploy.
     pub deployed: Option<String>,
+    /// The sha an attempt last failed on, or `None` when the last attempt
+    /// landed.
+    ///
+    /// What stops the poll loop rebuilding one bad commit forever.
+    /// `deployed` advances only after a verify, so without this the loop
+    /// finds the branch head different from what is serving on every
+    /// single tick and runs the whole sequence again: fetch, full rebuild,
+    /// swap, reload, wait out the verification budget, roll back, reload
+    /// again. Two reloads of a live app and a build every thirty seconds,
+    /// indefinitely, from one bad commit.
+    ///
+    /// The branch moving is what clears it, which is what CI does with a
+    /// red commit. That is the wrong answer for a deploy that failed on a
+    /// network blip rather than on the commit, and it was chosen with that
+    /// in mind: it costs a push, or one `shep deploy <sheep>`, which
+    /// retries a held sha deliberately.
+    #[serde(default)]
+    pub failed: Option<String>,
     /// How a freshly deployed release is judged healthy.
     #[serde(default)]
     pub verify: Verify,
@@ -175,6 +193,7 @@ mod tests {
             remote: "https://github.com/WatWowMap/ReactMap".into(),
             branch: "main".into(),
             deployed: Some("a1b2c3d".into()),
+            failed: None,
             verify: Verify::Probed,
             watch: Watch::Manual,
             origin_cwd: Some(PathBuf::from("/srv/reactmap")),
@@ -233,6 +252,7 @@ mod tests {
             remote: "https://example.com/x".into(),
             branch: "main".into(),
             deployed: deployed.map(str::to_owned),
+            failed: None,
             verify: Verify::default(),
             watch: Watch::default(),
             origin_cwd: None,
