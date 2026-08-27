@@ -203,7 +203,10 @@ fn code_for(err: &Error) -> u8 {
     match err {
         Error::RolledBack { .. } => ROLLED_BACK,
         Error::Stranded { .. } => STRANDED,
-        Error::Config(_) => 4,
+        // The same number as any other configuration refusal: it is one,
+        // from outside. What its own variant buys is inside - see the
+        // variant's doc, and `crate::poll::worth_saying`.
+        Error::Config(_) | Error::NotCutOver { .. } => 4,
         Error::Connect(_) => 5,
         _ => 1,
     }
@@ -472,6 +475,17 @@ mod tests {
         assert_eq!(
             code_for(&Error::Connect(shep_client::ConnectError::HandshakeClosed)),
             5
+        );
+        // A tree the cutover never landed on is a configuration problem
+        // like any other from outside, whatever the loop makes of it
+        // inside: giving it a variant of its own must not give it a number
+        // of its own.
+        assert_eq!(
+            code_for(&Error::NotCutOver {
+                sheep: "web".to_owned(),
+                tree: PathBuf::from("/srv/shep/deploy/web"),
+            }),
+            4
         );
     }
 

@@ -184,6 +184,11 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// below runs again over it regardless.
 ///
 /// # Errors
+/// [`Error::NotCutOver`], before anything at all happens, if the target's
+/// record names no released sha - see the refusal in the body for why that
+/// deploy would report a success it did not achieve, and the variant's own
+/// doc for why the poll loop needs to recognise it.
+///
 /// Anything the steps before the swap return - see [`crate::git::fetch`],
 /// [`crate::shared::to_link`], [`crate::flockfile::app_config`] and
 /// [`crate::build::run`] - in which case nothing has been disturbed and the
@@ -263,14 +268,10 @@ pub async fn deploy<D: Daemon>(
     // interval forever - but this stays, because `shep deploy <sheep>` is
     // one command away and a record can be edited by hand.
     if state.deployed.is_none() {
-        return Err(Error::Config(format!(
-            "{sheep} has a deploy tree but was never cut over to it, so there is nothing to \
-             deploy: its record names no released sha, and nothing has ever been served from \
-             that tree. Deploying now would reload {sheep} at its own checkout and report \
-             success for a release nothing ran. Finish the cutover instead - remove {} and run \
-             `shep-deploy setup {sheep}`.",
-            tree.root().display()
-        )));
+        return Err(Error::NotCutOver {
+            sheep: sheep.to_owned(),
+            tree: tree.root().to_owned(),
+        });
     }
 
     let started_at = swap::resolve(&tree.current())?;
@@ -2296,7 +2297,12 @@ mod tests {
         .await
         .expect_err("refuses");
 
-        assert!(matches!(err, Error::Config(_)), "{err:?}");
+        // Its own variant rather than `Config`, because this refusal
+        // cannot clear on its own and the poll loop has to be able to tell
+        // it from a config problem somebody is about to fix. Matched here
+        // so nothing quietly folds it back into `Config`, where the only
+        // way to recognise it again would be to match on the message text.
+        assert!(matches!(err, Error::NotCutOver { .. }), "{err:?}");
         let shown = err.to_string();
         assert!(shown.contains("never cut over"), "{shown}");
         assert!(shown.contains("shep-deploy setup web"), "{shown}");

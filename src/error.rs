@@ -225,6 +225,26 @@ pub enum Error {
         /// The instances that could not be removed.
         ids: Vec<u32>,
     },
+    /// A deploy tree the cutover never landed on: nothing has ever been
+    /// served from it.
+    ///
+    /// Its own variant rather than a [`Self::Config`], and the poll loop is
+    /// the whole reason. This refusal cannot clear on its own - no fetch,
+    /// no commit and no retry changes it, only an operator removing the
+    /// tree and running `setup` again - so a loop that could not tell it
+    /// from an ordinary config problem would either print the same line
+    /// twice a minute forever or would have to recognise it by matching on
+    /// its own message text.
+    ///
+    /// `crate::deploy::set_watch`'s refusal of `auto` on the same tree
+    /// stays an ordinary [`Self::Config`]: nothing retries a setting, so
+    /// there is nothing there for a caller to recognise.
+    NotCutOver {
+        /// The sheep whose tree it is.
+        sheep: String,
+        /// The tree to remove before running `setup` again.
+        tree: PathBuf,
+    },
     /// A release's build command exited without succeeding.
     ///
     /// Deliberately carries only the exit status, not captured output the
@@ -247,6 +267,15 @@ impl fmt::Display for Error {
             Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config(what) => write!(f, "bad deploy configuration: {what}"),
+            Self::NotCutOver { sheep, tree } => write!(
+                f,
+                "{sheep} has a deploy tree but was never cut over to it, so there is nothing to \
+                 deploy: its record names no released sha, and nothing has ever been served from \
+                 that tree. Deploying now would reload {sheep} at its own checkout and report \
+                 success for a release nothing ran. Finish the cutover instead - remove {} and \
+                 run `shep-deploy setup {sheep}`.",
+                tree.display()
+            ),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Git {
                 command,
@@ -406,6 +435,7 @@ impl core::error::Error for Error {
                 .map(|err| err as &(dyn core::error::Error + 'static)),
             Self::Protocol(_)
             | Self::Config(_)
+            | Self::NotCutOver { .. }
             | Self::Git { .. }
             | Self::Raced { .. }
             | Self::Unverified { .. }
