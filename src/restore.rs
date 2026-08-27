@@ -652,6 +652,9 @@ mod tests {
             fs::write(&path, format!("{{\"apps\":[{}]}}", apps.join(","))).expect("write roll");
             Ok(path)
         }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
     }
 
     /// fails if a sheep that pre-existed the dog is not put back where its

@@ -8,6 +8,7 @@
 use core::fmt;
 use std::path::PathBuf;
 
+use shep_client::shep_core::protocol::SmitError;
 use shep_client::{ConnectError, RequestError};
 
 /// Anything that can go wrong in one deploy.
@@ -31,6 +32,16 @@ pub enum Error {
     /// A `[dog.deploy]` (or per-sheep override) section could not be
     /// understood.
     Config(String),
+    /// A smit's own text could not become one at all - too long, empty, or
+    /// carrying a control character.
+    ///
+    /// Reached only if [`crate::smit::publish`]'s own truncation somehow
+    /// still leaves something the daemon's [`Smit`](shep_client::shep_core::protocol::Smit)
+    /// refuses: a branch name is what this crate builds a smit from, and
+    /// git already refuses a control character in a ref name, so this is a
+    /// defensive path rather than one either of those inputs can reach in
+    /// the ordinary case.
+    Smit(SmitError),
     /// An operation failed with an I/O-shaped error, naming the path most
     /// relevant to the failure.
     ///
@@ -286,6 +297,7 @@ impl fmt::Display for Error {
             Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config(what) => write!(f, "bad deploy configuration: {what}"),
+            Self::Smit(err) => write!(f, "could not publish a smit: {err}"),
             Self::Held { sheep, sha } => write!(
                 f,
                 "{sheep} is held at {sha}: the last attempt at that commit did not land, so it \
@@ -451,6 +463,7 @@ impl core::error::Error for Error {
         match self {
             Self::Connect(err) => Some(err),
             Self::Request(err) => Some(err),
+            Self::Smit(err) => Some(err),
             Self::Io { source, .. } => Some(source),
             Self::RollbackFailed { source, .. }
             | Self::RolledBack { source, .. }

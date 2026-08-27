@@ -675,9 +675,9 @@ dependencies = [
 
 [[package]]
 name = "shep-client"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91ad70f14243ab40e03110c39d164c915f7e6f376e474936aea0f9fccd665f1d"
+checksum = "3a233e614cecdb713546bef79f2488844e0eac2327cfce590fa217a2bc7cba05"
 dependencies = [
  "futures-util",
  "shep-core",
@@ -688,9 +688,9 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7074da91a07046a1f9e80979f39640a5b93eaca91daf6d41c8ea1ab31a69d58"
+checksum = "9e5318a8a9049976a3bb8ead94abfc8f17fc327334eeb429b10da3af90513b94"
 dependencies = [
  "annotate-snippets",
  "anstyle",

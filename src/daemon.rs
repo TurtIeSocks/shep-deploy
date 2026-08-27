@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use shep_client::{
     Client,
     shep_core::config::AppConfig,
-    shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec},
+    shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec, Smit},
 };
 
 use crate::error::Error;
@@ -139,6 +139,21 @@ pub trait Daemon {
     // Called by `crate::roll::registered`, which `crate::survey::survey`
     // calls in turn.
     async fn save_roll(&self) -> Result<PathBuf, Error>;
+
+    /// Attach this dog's short string to `sheep`, for `shep flock` to
+    /// paint.
+    ///
+    /// Ephemeral and owned by this dog: the daemon holds it in memory and
+    /// drops it when this process stops, for any reason, which is why the
+    /// poll loop republishes on every tick rather than only on change.
+    ///
+    /// # Errors
+    /// As [`Self::dog_config`]. [`Live`]'s own implementation can also fail
+    /// before ever asking the shepherd, if `text` cannot become a
+    /// [`Smit`] at all - see
+    /// [`crate::smit::publish`] for why that is not expected to happen in
+    /// the ordinary case.
+    async fn set_smit(&self, sheep: &str, text: &str) -> Result<(), Error>;
 }
 
 /// A [`Client`] behind the [`Daemon`] trait - the only implementation this
@@ -228,6 +243,18 @@ impl Daemon for Live {
             other => Err(unexpected("SaveRoll", &other)),
         }
     }
+
+    async fn set_smit(&self, sheep: &str, text: &str) -> Result<(), Error> {
+        let smit: Smit = text.parse().map_err(Error::Smit)?;
+        let asked = Request::SetSmit {
+            sheep: sheep.to_owned(),
+            smit: Some(smit),
+        };
+        match self.0.request(asked).await? {
+            Response::SmitPainted(_) => Ok(()),
+            other => Err(unexpected("SetSmit", &other)),
+        }
+    }
 }
 
 /// The shepherd answered something this dog cannot use.
@@ -251,6 +278,7 @@ fn named(response: &Response) -> String {
         Response::Restarted(flock) => format!("a Restarted of {}", flock.len()),
         Response::DogSection { .. } => "a DogSection".to_owned(),
         Response::RollSaved { .. } => "a RollSaved".to_owned(),
+        Response::SmitPainted(flock) => format!("a SmitPainted of {}", flock.len()),
         // `Response` is `#[non_exhaustive]`, so this arm is not optional. A
         // variant added to the protocol after this dog was written is
         // exactly the one worth naming, and only `Debug` can name it.
@@ -329,6 +357,9 @@ mod tests {
         async fn save_roll(&self) -> Result<PathBuf, Error> {
             unimplemented!()
         }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
     }
 
     /// A [`Daemon`] that cannot be reached at all - every method answers
@@ -359,6 +390,9 @@ mod tests {
             Err(Error::Protocol("no session".to_owned()))
         }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
+            Err(Error::Protocol("no session".to_owned()))
+        }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Err(Error::Protocol("no session".to_owned()))
         }
     }

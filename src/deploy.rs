@@ -1553,6 +1553,9 @@ mod tests {
         async fn save_roll(&self) -> Result<PathBuf, Error> {
             unimplemented!()
         }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
     }
 
     /// fails if a deploy that never comes up leaves the new release live.

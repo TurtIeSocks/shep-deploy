@@ -725,6 +725,9 @@ mod tests {
                 .expect("write roll");
             Ok(path)
         }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
     }
 
     /// Runs a git subcommand for fixture setup, panicking if it fails.
@@ -1203,6 +1206,9 @@ mod tests {
             unimplemented!()
         }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
+            unimplemented!()
+        }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             unimplemented!()
         }
     }

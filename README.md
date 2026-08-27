@@ -60,6 +60,15 @@ Both are read once, when the dog starts, so changing either takes a `shep restar
 
 One target's failure never stops the others, and never stops the dog. Each target's outcome is reported on its own and the loop carries on. `up to date` prints nothing at all, which is the answer to almost every tick of almost every target, and a line that repeats is said once rather than every interval.
 
+Every tick also paints each target's smit, so `shep flock` shows which branch and sha it is on without a second command:
+
+```text
+▲ main@a1b2c3      watched
+⏸ main@a1b2c3      manual
+```
+
+Republished every tick rather than on change: shep holds a smit in memory only for as long as the connection that painted it stays open, so a dog that only published on change would show nothing at all after a daemon restart until its next deploy. A refused smit is logged and otherwise ignored - it is cosmetic, never worth failing a deploy over.
+
 **A commit that does not land is left alone until the branch moves.** It is written into `deploy.toml` as `failed`, because otherwise the branch head and the deployed sha stay different and every tick runs the whole sequence again: fetch, full rebuild, swap, reload, wait out the verification budget, roll back, reload again. Two reloads of a live app and a build every thirty seconds, from one bad commit, until somebody notices. Pushing a fix clears it, which is what CI does with a red commit; so does `shep deploy <sheep>`, which retries the same commit deliberately. The tradeoff is deliberate too: a deploy that failed on a network blip rather than on the commit waits for one of those two, rather than being retried on the next tick. `shep-deploy survey` shows such a target as `held`, naming the commit it is holding, so a target stuck since yesterday does not read like one with nothing to do. Survey reads the record, never the remote, so a hold that a push already cleared still shows until the next tick.
 
 A tick never begins while the previous one is still running, so a push landing during a build is deployed on the next tick rather than aborting the build in flight.
@@ -98,7 +107,7 @@ Unix only. This is deliberate, not a gap waiting to be filled by accident: the d
 
 Working: the deploy sequence, the operator commands, opt-in, the poll loop, retention, and restore on removal. Tested against a real shepherd.
 
-Not built: smits, which need a shep-side wire change, and Windows.
+Not built: Windows.
 
 See [docs/writing-plans/plans/2026-08-26-deploy-engine.md](docs/writing-plans/plans/2026-08-26-deploy-engine.md) for what was built, and the [design spec](docs/brainstorming/specs/2026-08-26-deploy-dog-design.md) for what it is for.
 

@@ -366,6 +366,9 @@ mod tests {
         async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
             unimplemented!()
         }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
     }
 
     /// fails if the process that was already serving passes for the one the
