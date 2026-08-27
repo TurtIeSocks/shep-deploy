@@ -48,6 +48,20 @@ shep-deploy survey
 shep-deploy on-remove
 ```
 
+Adopted as a dog, `shep-deploy` takes no arguments and polls instead. Every 30 seconds by default, it deploys any `watch = "auto"` target whose branch has moved. Configure it in `shep.toml`:
+
+```toml
+[dog.deploy]
+interval = "30s"
+retention = 5
+```
+
+`retention` is how many releases each target keeps. It cannot be below 2: the release a failed deploy rolls back to is the second newest, so anything lower would silently disable rollback, and it is refused rather than clamped.
+
+One target's failure never stops the others, and never stops the dog. Each target's outcome is reported on its own and the loop carries on. `up to date` prints nothing at all, which is the answer to almost every tick of almost every target.
+
+A tick never begins while the previous one is still running, so a push landing during a build is deployed on the next tick rather than aborting the build in flight.
+
 `--watch` changes the setting and returns without deploying. `survey` reports where every registered sheep stands and starts, registers and writes nothing.
 
 `shep-deploy on-remove` is the lifecycle hook: shep runs it before forgetting the dog, and it puts every sheep back where it ran before the dog took over. A sheep the dog bootstrapped has nowhere to go back to, so it is left running from `current` and the report says exactly that, with the path. **The deploy tree is never deleted.** It is not the dog's to delete, and in the bootstrap case a running app is still pointing into it.
@@ -80,7 +94,9 @@ Unix only. This is deliberate, not a gap waiting to be filled by accident: the d
 
 ## Status
 
-The deploy sequence, the operator commands, opt-in, and on-remove restore all work, and there are tests against a real shepherd. Not built yet: the poll loop that makes `watch = auto` mean anything, and Windows.
+Working: the deploy sequence, the operator commands, opt-in, the poll loop, retention, and restore on removal. Tested against a real shepherd.
+
+Not built: smits, which need a shep-side wire change, and Windows.
 
 See [docs/writing-plans/plans/2026-08-26-deploy-engine.md](docs/writing-plans/plans/2026-08-26-deploy-engine.md) for what was built, and the [design spec](docs/brainstorming/specs/2026-08-26-deploy-dog-design.md) for what it is for.
 

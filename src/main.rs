@@ -8,8 +8,9 @@
 //!
 //! Supervised, the dog is spawned with no argv at all and one environment
 //! entry, `SHEP_HOME` - that is the dog contract, and it is why
-//! [`daemon::adopted_name`] exists. The poll loop that mode runs is not
-//! built yet.
+//! [`daemon::adopted_name`] exists. That mode runs [`poll::run`], which
+//! deploys every `watch = "auto"` target whose branch has moved, once an
+//! interval, until the process is asked to stop.
 //!
 //! Run directly, it takes a verb:
 //!
@@ -48,6 +49,7 @@ mod flockfile;
 mod git;
 mod optin;
 mod paths;
+mod poll;
 mod restore;
 mod retention;
 mod roll;
@@ -63,6 +65,7 @@ use std::process::ExitCode;
 
 use shep_client::Client;
 use shep_client::shep_core::paths::ShepPaths;
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::daemon::Live;
 use crate::deploy::Outcome;
@@ -157,10 +160,7 @@ async fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let outcome = match route(&args) {
-        Route::Poll => {
-            println!("shep-deploy: the poll loop is not implemented yet");
-            return ExitCode::SUCCESS;
-        }
+        Route::Poll => poll_forever().await,
         // Its own connection, matching every sibling verb, rather than
         // reaching for a `daemon` that does not exist in this scope. It
         // returns an `ExitCode` directly, not a `Result<u8, Error>`, because
@@ -183,6 +183,74 @@ async fn main() -> ExitCode {
             ExitCode::from(code_for(&err))
         }
     }
+}
+
+/// The supervised mode: connect, read this dog's own config section, and
+/// poll until the process is asked to stop.
+///
+/// Answers 0 for a stop that was asked for, which is the only way out that
+/// is not an error. [`poll::run`] itself never returns.
+///
+/// # Errors
+/// [`Error::Io`] if `$SHEP_HOME` cannot be resolved, [`Error::Connect`] if
+/// the shepherd's socket cannot be reached, and whatever
+/// [`config::read`] returns - a `[dog.<name>]` section that cannot be
+/// parsed stops the dog here rather than being ignored, because a dog
+/// running on defaults it was not asked for looks exactly like one
+/// honouring the config.
+///
+/// A target's own failure is NOT one of these. It is reported and the loop
+/// carries on to the next target; see [`poll::run`].
+async fn poll_forever() -> Result<u8, Error> {
+    let home = shep_home()?;
+    let client = Client::connect(&socket()?).await?;
+    let daemon = Live::new(client);
+    let config = config::read(&daemon).await?;
+
+    tokio::select! {
+        result = poll::run(&daemon, &home, config) => result.map(|()| 0),
+        () = terminate() => {
+            println!("shep-deploy: stopping");
+            Ok(0)
+        }
+    }
+}
+
+/// Resolves when the process is asked to stop, on whichever of `SIGTERM` or
+/// `SIGINT` arrives first.
+///
+/// `SIGTERM` is what shep sends a dog it is stopping; `SIGINT` is what a
+/// terminal sends somebody who started the dog by hand to watch it.
+///
+/// The stop is not deferred to a tick boundary. Cancelling [`poll::run`]
+/// can land inside a deploy, which is acceptable and documented there: the
+/// worst it costs is one rebuild on the next start.
+async fn terminate() {
+    tokio::select! {
+        () = arrives(SignalKind::terminate()) => {}
+        () = arrives(SignalKind::interrupt()) => {}
+    }
+}
+
+/// Resolves when `kind` arrives, and never otherwise.
+///
+/// Two things that are not a signal arriving end up in the same place:
+/// registering the handler failing, which needs a runtime with no I/O
+/// driver and so cannot happen under `#[tokio::main]`, and the stream
+/// closing. Neither is a reason to stop polling, and returning from either
+/// would print "stopping" for a stop nobody asked for. The signal keeps its
+/// default disposition in the first case, so a `SIGTERM` still ends the
+/// process - without the tidy message.
+async fn arrives(kind: SignalKind) {
+    match signal(kind) {
+        Ok(mut stream) => {
+            if stream.recv().await.is_some() {
+                return;
+            }
+        }
+        Err(err) => eprintln!("shep-deploy: cannot listen for {kind:?}: {err}"),
+    }
+    core::future::pending().await
 }
 
 /// The exit code for a run that finished, reporting what it finished as.
