@@ -87,16 +87,19 @@ pub enum Restored {
         /// Why the restore itself failed.
         why: String,
     },
-    /// A delete landed for some but not all of this sheep's instances
-    /// before one of them refused.
+    /// At least one delete already landed for this sheep before another
+    /// one refused, so there is still at least one instance to account
+    /// for.
     ///
     /// Its own variant because neither of the other failure shapes is true
-    /// of it: `Failed`'s "left as it is" is false - some instances really
-    /// are gone - and `Lost`'s "gone from the flock" is false too, since
-    /// the registered config was never touched (the loop only calls
-    /// `Delete`, never `Start`) and instances that were never reached may
-    /// still be serving. The sheep's real state now disagrees with
-    /// `deploy.toml`, and only `shep describe` can say by how much.
+    /// of it: `Failed`'s "left as it is" is false - at least one instance
+    /// really is gone - and `Lost`'s "gone from the flock" over-claims,
+    /// since instances the loop never reached may still be serving. What
+    /// this crate cannot know from here is whether the registered config
+    /// survived: `Delete` is stop plus deregister, and the roll drops a
+    /// name with no live instance, so a delete that lands on the LAST
+    /// remaining instance really does deregister it. Only `shep describe`
+    /// and `shep flock` can say.
     PartlyDeleted {
         /// The sheep left in this state.
         sheep: String,
@@ -235,10 +238,11 @@ enum PutBack {
     /// delete already ran, so the sheep was stopped and a fresh instance
     /// started to get back to that config.
     Reset(Error),
-    /// A delete landed for some but not all instances before one refused.
-    /// NOT `Untouched` (some instances really are gone) and NOT `Deleted`
-    /// (the registered config was never touched, and the name may still be
-    /// live) - the sheep's real state and `deploy.toml` now disagree.
+    /// At least one delete already landed before another one refused.
+    /// NOT `Untouched` (at least one instance really is gone) and NOT
+    /// `Deleted` either - whether the registered config survived depends
+    /// on whether the deletes that landed included the last live instance,
+    /// which this loop does not track.
     PartlyDeleted(Error),
     /// The delete landed and neither the restore nor the fallback did.
     Deleted(Error),
@@ -284,14 +288,23 @@ async fn put_back<D: Daemon>(
         Ok(live) => live,
         Err(err) => return PutBack::Untouched(err),
     };
+    let mut any_delete_landed = false;
     for info in &live {
         if let Err(err) = daemon.delete(info.id).await {
-            // Partway through: some instances are gone, others may not be
-            // reached at all, and the registered config was never touched.
-            // Neither `Untouched` nor `Deleted` is true of that, so this
-            // gets its own variant - see `PutBack::PartlyDeleted`'s doc.
-            return PutBack::PartlyDeleted(err);
+            // The discriminator is whether a PRIOR delete already landed,
+            // not whether this one failed: a refusal on the very first
+            // instance with nothing behind it has changed nothing at all,
+            // and is `Untouched` exactly as before this variant existed. A
+            // refusal after at least one delete succeeded is the case
+            // `Untouched` cannot describe truthfully - see
+            // `PutBack::PartlyDeleted`'s doc.
+            return if any_delete_landed {
+                PutBack::PartlyDeleted(err)
+            } else {
+                PutBack::Untouched(err)
+            };
         }
+        any_delete_landed = true;
     }
 
     match daemon.start(vec![restored]).await {
@@ -347,9 +360,9 @@ pub fn report(results: &[Restored]) -> String {
             // running: `shep describe`.
             Restored::PartlyDeleted { sheep, why } => format!(
                 "{sheep}: only SOME of its instances could be stopped before a delete failed \
-                 ({why}), so it is neither fully running nor fully removed and its registered \
-                 config was never touched. Run `shep describe {sheep}` to see what is actually \
-                 still there before assuming either.\n"
+                 ({why}), so it is neither fully running nor fully removed. Run `shep describe \
+                 {sheep}` to see what is actually still there, and `shep flock` for whether it \
+                 is still registered, before assuming either.\n"
             ),
             // The row an operator must not misread. Every other outcome
             // leaves a running app; this one does not, and "could not be
@@ -516,11 +529,22 @@ mod tests {
             this
         }
 
+        /// A single instance is described, and its only `delete` refuses.
+        /// Nothing lands before the failure, so the sheep is fully running
+        /// and fully registered - the ordinary shape a refused delete
+        /// takes, and the one that must stay `Failed` rather than
+        /// `PartlyDeleted`, which needs a delete to have already landed.
+        fn refusing_first_delete_only(sheep: &[&'static str]) -> Self {
+            let mut this = Self::new(sheep, Refuse::Never);
+            this.delete_fails_at = Some(1);
+            this
+        }
+
         /// Two instances are described; the first `delete` lands, the
         /// second refuses. This is the only shape any test here gives more
         /// than one instance, deliberately: it is what exercises the branch
-        /// where a delete fails PARTWAY through, with some instances
-        /// already gone and others still live.
+        /// where a delete fails PARTWAY through, with at least one instance
+        /// already gone and another one still to account for.
         fn refusing_delete_partway(sheep: &[&'static str]) -> Self {
             let mut this = Self::new(sheep, Refuse::Never);
             this.instances = 2;
@@ -881,8 +905,10 @@ mod tests {
     /// fails if a partly-deleted sheep is worded as though it were either
     /// fully running or fully removed. Neither `Failed`'s "left as it is"
     /// nor `Lost`'s "gone from the flock" is true here, and this pins the
-    /// one true thing the report can say: check `shep describe` for what is
-    /// actually there.
+    /// two true things the report can say: check `shep describe` for what
+    /// is actually there, and `shep flock` for whether it is still
+    /// registered - this crate cannot know that from here, since `Delete`
+    /// landing on the LAST remaining instance really does deregister it.
     #[tokio::test]
     async fn a_partly_deleted_sheep_is_worded_as_neither_running_nor_removed() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -894,11 +920,41 @@ mod tests {
         let text = report(&results);
         assert!(!text.contains("left as it is"), "{text}");
         assert!(!text.contains("gone from the flock"), "{text}");
+        assert!(!text.contains("never touched"), "{text}");
         assert!(
             text.contains("neither fully running nor fully removed"),
             "{text}"
         );
         assert!(text.contains("shep describe bpm"), "{text}");
+        assert!(text.contains("shep flock"), "{text}");
+    }
+
+    /// fails if a delete refused on the FIRST instance, with nothing behind
+    /// it, is reported as `PartlyDeleted`. Nothing landed: the sheep is
+    /// fully running and fully registered, which is exactly `Failed`'s
+    /// "left as it is" case. The discriminator for `PartlyDeleted` is
+    /// whether a delete already landed, not whether one failed - a
+    /// single-instance sheep whose only delete is refused must stay
+    /// `Failed`, and this is the ordinary shape a refused delete takes.
+    #[tokio::test]
+    async fn a_delete_refused_with_nothing_landed_yet_stays_failed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_with_origin(home.path(), "bpm", "/srv/reactmap", "bun .");
+        let daemon = Recording::refusing_first_delete_only(&["bpm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(results[0], Restored::Failed { .. }),
+            "{:?}",
+            results[0]
+        );
+        let text = report(&results);
+        assert!(text.contains("left as it is"), "{text}");
+        assert!(
+            !text.contains("neither fully running nor fully removed"),
+            "{text}"
+        );
     }
 
     /// fails if `on-remove` ever turns a partial failure into a nonzero
