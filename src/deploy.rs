@@ -217,6 +217,15 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// [`Error::RollbackFailed`] is also what a failed `undo_swap` gives, for
 /// the same reason it wraps a failed `restore`: `current` is left naming a
 /// release nothing is running.
+///
+/// One error here does NOT mean the deploy failed. [`Error::Io`] from
+/// writing `deploy.toml`, which happens only after a successful verify, is
+/// returned instead of [`Outcome::Deployed`] even though the new release is
+/// live and verified. Nothing is rolled back, deliberately: there is nothing
+/// to undo and undoing would take a working release out of service. Only the
+/// record lags, so the next deploy of the same sha repeats the work and
+/// writes it again. A caller that treats every error as "the old release is
+/// still serving" is wrong about this one.
 pub async fn deploy<D: Daemon>(
     daemon: &D,
     tree: &Tree,
