@@ -52,6 +52,7 @@ mod restore;
 mod retention;
 mod roll;
 mod shared;
+mod smit;
 mod state;
 mod survey;
 mod swap;
