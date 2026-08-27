@@ -89,15 +89,15 @@ pub struct Prepared {
 ///
 /// Refuses outright, before touching anything, if `sheep` is already a
 /// target - see the module doc for why a re-run has to be refused rather
-/// than treated as a retry.
-///
-/// The record it writes says `watch = "manual"`, whatever the sheep ends up
-/// with: nothing has been served from the tree yet, and [`cut_over`] is
-/// what promotes it. A cutover abandoned partway therefore leaves a target
-/// the poll loop passes over rather than one it refuses every interval. Everything after that refusal either succeeds
+/// than treated as a retry. Everything after that refusal either succeeds
 /// all the way through to a release under `current`, or fails partway and
 /// leaves a directory behind with no `deploy.toml` in it, which is not a
 /// target and does not trip that same refusal on a second attempt.
+///
+/// The record it writes says `watch = "manual"`, whatever the sheep ends
+/// up with: nothing has been served from the tree yet, and [`cut_over`] is
+/// what promotes it. A cutover abandoned partway therefore leaves a target
+/// the poll loop passes over rather than one it refuses every interval.
 ///
 /// # Errors
 /// [`Error::Config`] if `sheep` is already a deploy target, if the
