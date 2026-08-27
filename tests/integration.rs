@@ -128,8 +128,17 @@ impl Shepherd {
     /// Run `shep-deploy deploy <sheep>` against this home, exactly as the
     /// supervised dog or an operator's direct invocation would.
     fn deploy(&self, sheep: &str) -> Output {
+        self.deploy_args(&["deploy", sheep])
+    }
+
+    /// Run `shep-deploy` against this home with whatever argv is given.
+    ///
+    /// `SHEP_HOME` and nothing else, which is the whole of a dog's
+    /// environment - a verb that needed more than that would work here and
+    /// fail under the shepherd.
+    fn deploy_args(&self, args: &[&str]) -> Output {
         Command::new(DEPLOY_BIN)
-            .args(["deploy", sheep])
+            .args(args)
             .env("SHEP_HOME", self.home())
             .output()
             .expect("shep-deploy ran")
@@ -375,6 +384,62 @@ fn register_web(shepherd: &Shepherd, readiness: Readiness, extra: &str) {
     ]);
 }
 
+/// The `listen_timeout` the pre-adoption checkout registration declares, in
+/// seconds. Short: nothing in that phase is being measured, and the test
+/// spends the wait before it can do anything else.
+const CHECKOUT_LISTEN: u64 = 1;
+
+/// Registers `web` the way an operator already runs it, before this dog has
+/// touched anything: from their OWN clone of `origin`, out of a Flockfile
+/// with **no `cwd` key at all**.
+///
+/// The missing `cwd` is the point rather than a shortcut. It is the
+/// ordinary way an app is registered, and it is precisely the case the
+/// cutover's explicit `cwd` exists for: shep resolves a defaulted `cwd` to
+/// the Flockfile's own directory at REGISTRATION, so the sheep this starts
+/// is pinned to this checkout and [`crate::optin::cut_over`] has to re-point
+/// it at the `current` symlink itself.
+///
+/// The clone is separate from `origin` on purpose. This Flockfile is
+/// probeless, because the probe the committed one carries looks through a
+/// `current` symlink that does not exist yet and the sheep could never come
+/// up; leaving that edit in `origin`'s working tree would then get committed
+/// by the next `git commit -a` and ship a release the deploy path refuses
+/// for having no probe.
+///
+/// Returns the clone, which the caller has to keep alive: it is the
+/// registered sheep's working directory until the cutover moves it.
+fn register_from_checkout(shepherd: &Shepherd, origin: &Path) -> tempfile::TempDir {
+    let checkout = tempfile::tempdir().expect("tempdir");
+    git(
+        checkout.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().expect("utf-8 origin path"),
+            ".",
+        ],
+    );
+    let path = checkout.path().join("Flockfile.toml");
+    fs::write(
+        &path,
+        app_toml(
+            shepherd.home(),
+            false,
+            Readiness::Heuristic(CHECKOUT_LISTEN),
+            "",
+        ),
+    )
+    .expect("write the checkout Flockfile");
+    shepherd.ok(&[
+        "start",
+        path.to_str().expect("utf-8 path"),
+        "--style",
+        "bare",
+    ]);
+    checkout
+}
+
 /// The last non-empty line of `path`, or `None` if it cannot be read yet.
 ///
 /// The app's stdout log is how these tests tell which RELEASE is executing,
@@ -424,6 +489,43 @@ fn described_pid(shepherd: &Shepherd, sheep: &str) -> Option<u32> {
         .next()?
         .parse()
         .ok()
+}
+
+/// How many instances `shep describe` reports under `sheep`.
+///
+/// Counted as `"id":` occurrences, the same shape [`described_pid`] reads a
+/// pid with and for the same reason - no JSON dependency in this crate. One
+/// per instance and nothing else in the listing carries that key: a lamb has
+/// a pid and a name, never an id.
+fn described_instances(shepherd: &Shepherd, sheep: &str) -> usize {
+    shepherd
+        .ok(&["describe", sheep, "--format", "json"])
+        .matches("\"id\":")
+        .count()
+}
+
+/// The stdout log shep is writing for `sheep` right now, as `describe`
+/// itself names it.
+///
+/// Read from the listing rather than assembled from a slot number, because
+/// the slot is not predictable across a cutover. Measured on a real
+/// shepherd: `Start` on a registered name adds the newcomer BESIDE the
+/// original, so the newcomer takes slot 1 and keeps it after the original is
+/// deleted. A helper hard-coding `<sheep>-0-out.log` would go on reading the
+/// log of the instance the cutover removed, whose last line is whatever it
+/// was serving when it died.
+///
+/// A later reload does not move it - the instance id changes and the slot
+/// does not - so one read before a deploy is good for the assertions after
+/// it.
+fn out_file(shepherd: &Shepherd, sheep: &str) -> PathBuf {
+    let listing = shepherd.ok(&["describe", sheep, "--format", "json"]);
+    let named = listing
+        .split("\"out_file\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("describe names an out_file");
+    PathBuf::from(named)
 }
 
 /// fails if a deploy of a fixture repo does not reach the running sheep at
@@ -801,4 +903,142 @@ fn a_reload_that_uses_its_whole_drain_window_still_deploys() {
         Some("v2"),
         "the running process must be executing the new release"
     );
+}
+
+/// fails if a sheep taken over by `setup` does not follow later swaps.
+///
+/// This is the fact no fake can check and the one that fails silently
+/// exactly one release after the mistake: a Flockfile app's DEFAULTED cwd is
+/// resolved at REGISTRATION, so a sheep registered from inside a release is
+/// pinned to that release forever and every later swap moves a symlink it no
+/// longer reaches. Measured on a real shepherd before this crate existed:
+/// the reload after a swap re-ran the OLD release's script.
+///
+/// It deploys TWICE for that reason. One deploy proves nothing here, because
+/// a sheep pinned to release one and a sheep following `current` are
+/// indistinguishable while release one IS current.
+///
+/// It also pins two things no unit test can reach: that `Start` on a
+/// registered name adds an instance beside the old one rather than replacing
+/// it, and that the cutover deleted the ORIGINAL instance and not the
+/// newcomer. Both are real rows under one name on a real shepherd, and an id
+/// read from the wrong side of the `Start` deletes the release that was just
+/// deployed while every count assertion still passes. The surviving pid is
+/// what tells them apart.
+#[test]
+fn a_sheep_taken_over_by_setup_follows_a_later_swap() {
+    let shepherd = Shepherd::new();
+    let origin = origin_with_app(shepherd.home(), "v1", Readiness::Probe, "");
+
+    // The sheep as the operator already runs it: registered from their own
+    // checkout, with no deploy tree anywhere. Held, because it is that
+    // sheep's working directory until the cutover moves it.
+    let _checkout = register_from_checkout(&shepherd, origin.path());
+    wait_until("web to come up from the checkout", || {
+        described_online(&shepherd, "web")
+    });
+    let before = described_pid(&shepherd, "web").expect("a pid");
+
+    let setup = shepherd.deploy_args(&["setup", "web"]);
+    assert!(
+        setup.status.success(),
+        "setup failed: {}{}",
+        String::from_utf8_lossy(&setup.stdout),
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    // One instance again, and it must be the NEWCOMER. Two rows shared this
+    // name for the length of the cutover, so this is the assertion that
+    // catches an id taken from the wrong side of the `Start`.
+    wait_until("the cutover to settle", || {
+        described_instances(&shepherd, "web") == 1
+    });
+    assert_ne!(
+        described_pid(&shepherd, "web"),
+        Some(before),
+        "the surviving instance must be the newcomer, not the one it replaced"
+    );
+
+    // Read after the cutover settled, so it names the newcomer's log rather
+    // than the deleted original's.
+    let out_log = out_file(&shepherd, "web");
+
+    // Now the half a single deploy cannot prove.
+    write_run_script(origin.path(), "v2");
+    git(origin.path(), &["commit", "-qam", "v2"]);
+    let deployed = shepherd.deploy("web");
+    assert!(
+        deployed.status.success(),
+        "the second deploy failed: {}{}",
+        String::from_utf8_lossy(&deployed.stdout),
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+
+    wait_until("the second release to be serving", || {
+        last_line(&out_log).as_deref() == Some("v2")
+    });
+}
+
+/// fails if the supervised mode does not deploy on its own.
+///
+/// `watch = "auto"` means nothing until the binary, given NO ARGV AT ALL as
+/// the dog contract requires, connects, works out its own adopted name from
+/// its own pid in a real flock listing, reads its own `[dog.<name>]`
+/// section, finds its targets on disk and deploys one. Every one of those is
+/// stubbed in the unit tests, and the pid lookup in particular can only be
+/// wrong against a real daemon.
+///
+/// `shep.toml` is written after the shepherd is already up, which is
+/// deliberate and safe: the daemon re-reads a dog's section per
+/// `Request::DogConfig` rather than caching one at boot.
+///
+/// **The dog's own stdout is what settles who deployed**, and it is not
+/// belt and braces. `shep adopt` vets a candidate by spawning it with no
+/// argv and the real `$SHEP_HOME` before it records anything, so for about
+/// fifty milliseconds a second copy of this binary is running the same poll
+/// loop against the same targets. That copy is killed with its stdio on
+/// `/dev/null`, so a line in `logs/deploy-0-out.log` can only have come from
+/// the instance the shepherd supervises. Asserting on the running release
+/// alone would not tell the two apart, and neither would the mutation this
+/// test is checked with, because the vetting spawn runs the mutated loop
+/// too.
+#[test]
+fn the_supervised_dog_deploys_a_moved_branch_without_being_asked() {
+    let shepherd = Shepherd::new();
+    let origin = origin_with_app(shepherd.home(), "v1", Readiness::Probe, "");
+    let sha = build_tree(shepherd.home(), "web", origin.path());
+    write_state(shepherd.home(), "web", origin.path(), &sha, "probed");
+    register_web(&shepherd, Readiness::Probe, "");
+    wait_until("web to come up", || described_online(&shepherd, "web"));
+    let out_log = out_file(&shepherd, "web");
+
+    // A one-second interval, so a tick that finds nothing the first time
+    // round costs a second rather than the default half minute.
+    fs::write(
+        shepherd.home().join("shep.toml"),
+        "[dog.deploy]\ninterval = \"1s\"\nretention = 5\n",
+    )
+    .expect("write shep.toml");
+
+    write_run_script(origin.path(), "v2");
+    git(origin.path(), &["commit", "-qam", "v2"]);
+    let second = head_of(origin.path());
+
+    // Adopted and supervised, with no argv, exactly as the contract says.
+    // The name is the binary's own stem with `shep-` stripped, which is what
+    // makes the section above this dog's.
+    shepherd.ok(&["adopt", DEPLOY_BIN, "--style", "bare"]);
+    wait_until("the dog to be supervised", || {
+        described_instances(&shepherd, "deploy") == 1
+    });
+    let dog_log = out_file(&shepherd, "deploy");
+
+    wait_until("the poll loop to deploy v2 on its own", || {
+        last_line(&out_log).as_deref() == Some("v2")
+    });
+    wait_until("the supervised dog to report the deploy as its own", || {
+        fs::read_to_string(&dog_log)
+            .unwrap_or_default()
+            .contains(&format!("web deployed {second}"))
+    });
 }
