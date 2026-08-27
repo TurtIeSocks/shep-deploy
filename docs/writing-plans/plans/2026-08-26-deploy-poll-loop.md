@@ -55,7 +55,7 @@ Each of these cost real time during plan one. They are inputs, not questions.
 - **`Request::Start` on an already-registered name ADDS instances, it does not re-register.** `do_start` calls `instance_slots(&existing, instances)`, and `instance_slots(&[0], 1)` is `[1]`. So a `Start` with a new `AppConfig` spawns a *second* instance from the *new* config beside the running one. That is what makes the spec's cutover ("start a new sheep pointing at `current`, wait for `Online`, stop and delete the old registration") implementable at all, and it is also why the first cutover can collide on a port. Task 8.
 - **`SelectorSpec::Id(u32)` exists,** and `Request::Delete` is documented as "stop + deregister matching sheep". So the old instance can be deleted by id without touching the new one.
 - **`Response::RollSaved { path, apps }` hands back the roll's absolute path,** so the dog asks for it rather than rebuilding it from `ShepPaths`.
-- **The integration tier costs about 71 seconds per run** and drives a real shepherd. Every test owns a `tempfile::tempdir()` as `$SHEP_HOME` and kills its own daemon on drop. Do not put a test there that a unit test with an honest fake could carry.
+- **The integration tier costs about 31 seconds per run** and drives a real shepherd. Every test owns a `tempfile::tempdir()` as `$SHEP_HOME` and kills its own daemon on drop. Do not put a test there that a unit test with an honest fake could carry.
 - **Fakes hide defects.** The two worst bugs in plan one survived unit testing because the fakes were too kind: one turned over instantly where a real shepherd keeps the old instance `Online` for seconds, and another could only refuse a reload with an RPC error, never with a transport failure. Where a task's correctness depends on the daemon's real timing or real failure shapes, the task says so and requires the integration tier.
 - **The rollback boundary is the swap.** `land` owns every fallible step after it and cannot return an error; each failure is a `Landed` variant, so `deploy`'s match is exhaustive over what has to be undone rather than over what went wrong. **Any new work this plan adds after a swap must live inside that structure rather than beside it.** Building beside the boundary is exactly how plan one accumulated five blockers on a diff where no single round was wrong and the composition was.
 
@@ -4344,7 +4344,7 @@ EOF
 **Interfaces:**
 - Consumes: the whole crate, through the two real binaries.
 
-**Two tests, and only two.** The tier costs about 71 seconds already and every test here drives a real daemon. Each of these covers something **no unit test with an honest fake can reach**, which is the bar; anything a fake could carry stays a unit test.
+**Two tests, and only two.** The tier costs about 31 seconds already and every test here drives a real daemon. Each of these covers something **no unit test with an honest fake can reach**, which is the bar; anything a fake could carry stays a unit test.
 
 **Test one: opt-in end to end.** It proves the three facts Task 8 is built on are still true of the real shepherd rather than only of this crate's fakes: that `Start` on a registered name adds an instance beside the old one, that `Delete` by id removes only the one named, and above all **that the sheep registered with an explicit `cwd` of `current` actually follows a later swap**. That last is the one that matters. It is the fact a fake cannot check, it fails silently exactly one release after the mistake, and it is why the test deploys twice: opt-in, then a second release, then asserts the running process is executing the second one.
 
@@ -4464,7 +4464,7 @@ cargo install shep --locked
 SHEP_BIN="$(command -v shep)" cargo test --features integration --locked
 ```
 
-Expected: 7 passed (5 carried plus 2 new), and the tier's total wall clock somewhere near 110 seconds.
+Expected: 7 passed (5 carried plus 2 new), and the tier's total wall clock near 31 seconds, since both new tests run inside the drain-window test's own thirty.
 
 - [ ] **Step 4: Prove both are non-vacuous**
 
@@ -4485,7 +4485,7 @@ git add tests/integration.rs
 git commit -F- <<'EOF'
 test: opt-in and the poll loop, against a real shepherd
 
-Two tests, and only two. The tier already costs about 71 seconds and every
+Two tests, and only two. The tier already costs about 31 seconds and every
 test here drives a real daemon, so the bar is whether a unit test with an
 honest fake could carry it. Retention, restore, survey and the smit string
 all could, and stay where they are.
