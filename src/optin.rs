@@ -89,7 +89,12 @@ pub struct Prepared {
 ///
 /// Refuses outright, before touching anything, if `sheep` is already a
 /// target - see the module doc for why a re-run has to be refused rather
-/// than treated as a retry. Everything after that refusal either succeeds
+/// than treated as a retry.
+///
+/// The record it writes says `watch = "manual"`, whatever the sheep ends up
+/// with: nothing has been served from the tree yet, and [`cut_over`] is
+/// what promotes it. A cutover abandoned partway therefore leaves a target
+/// the poll loop passes over rather than one it refuses every interval. Everything after that refusal either succeeds
 /// all the way through to a release under `current`, or fails partway and
 /// leaves a directory behind with no `deploy.toml` in it, which is not a
 /// target and does not trip that same refusal on a second attempt.
@@ -189,7 +194,12 @@ pub async fn prepare<D: Daemon>(
         branch,
         deployed: None,
         verify: Verify::default(),
-        watch: Watch::default(),
+        // `manual` until the cutover lands, and `cut_over` is what promotes
+        // it. A tree nothing has served from is not a deploy target - the
+        // deploy path refuses one outright - so writing `auto` here would
+        // hand the poll loop a target it can only refuse, once every
+        // interval, for as long as the abandoned tree sits there.
+        watch: Watch::Manual,
         // The two fields the whole restore depends on, captured once, here,
         // and never touched again.
         origin_cwd: Some(checkout.clone()),
@@ -273,6 +283,14 @@ pub async fn prepare<D: Daemon>(
 /// [`State::write`] failing is the mild one, and it is passed through. The
 /// release is serving and only the record is missing, which the next
 /// `shep-deploy deploy` writes.
+///
+/// A cutover that lands with nothing stranded promotes the record's `watch`
+/// from the `manual` [`prepare`] wrote to `auto`, which is what makes the
+/// target the poll loop's. A stranded one does not: instances it could not
+/// delete are still registered, and every later deploy reloads the name and
+/// respawns each of them from its own pre-adoption spec, so a loop polling
+/// it would bring them back on a schedule. Remove the ids the error names,
+/// then `shep deploy <sheep> --watch auto`.
 pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<String, Error> {
     let Prepared {
         tree,
@@ -327,6 +345,17 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
             // Written either way: the release is serving, so the record
             // naming it is true whatever the cleanup did.
             state.deployed = Some(sha.clone());
+            // The promotion out of `manual`, and only on the clean path.
+            // The tree has now been served from, which is what makes it a
+            // deploy target at all. A cutover that left instances behind
+            // has not finished: every later deploy reloads the name and
+            // respawns each leftover from its own pre-adoption spec, so a
+            // loop polling this target would bring them back on a
+            // schedule. The operator removes the ids the error names and
+            // then asks for `--watch auto`.
+            if stranded.is_empty() {
+                state.watch = Watch::Auto;
+            }
             state.write(&tree.state_file())?;
 
             if stranded.is_empty() {
@@ -1894,6 +1923,67 @@ mod tests {
 
         assert!(matches!(err, Error::CutOver { .. }), "{err}");
         assert_eq!(State::read(&path).expect("reads").deployed, None);
+    }
+
+    /// fails if a tree the cutover has not landed on is left watched. The
+    /// poll loop deploys every `auto` target it finds, and a deploy against
+    /// such a tree is refused - so a target abandoned between `prepare` and
+    /// `cut_over` would be refused once every interval, forever, for a
+    /// target the loop should be ignoring outright. `prepare` writes
+    /// `manual` and the cutover promotes it, which is the same rule the
+    /// docs already state: a sheep is not a deploy target until a cutover
+    /// lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_prepared_target_is_not_watched_until_the_cutover_lands() {
+        let (daemon, prepared, _dirs) = cutover_fixture().await;
+        let path = prepared.tree.state_file();
+
+        assert_eq!(
+            State::read(&path).expect("reads").watch,
+            Watch::Manual,
+            "prepared, and nothing has served from the tree yet"
+        );
+
+        cut_over(&daemon, prepared).await.expect("cuts over");
+
+        assert_eq!(
+            State::read(&path).expect("reads").watch,
+            Watch::Auto,
+            "the cutover landed, so the poll loop may have it"
+        );
+    }
+
+    /// fails if a cutover that was abandoned leaves the target watched.
+    /// This is the tree nobody ever served from, and the loop must pass
+    /// over it rather than meeting `deploy`'s refusal every interval.
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_cutover_leaves_the_target_unwatched() {
+        let (daemon, prepared, _dirs) = cutover_fixture_never_appears().await;
+        let path = prepared.tree.state_file();
+
+        cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        assert_eq!(State::read(&path).expect("reads").watch, Watch::Manual);
+    }
+
+    /// fails if a cutover that landed and could not tidy up starts the poll
+    /// loop off on its own. The release IS serving, so the record names it -
+    /// but instances the cutover could not delete are still registered, and
+    /// every later deploy reloads the name and respawns each of them from
+    /// its own pre-adoption spec. Unattended, that is the leftover coming
+    /// back on a schedule. The operator removes the ids the error names and
+    /// then asks for `--watch auto`.
+    #[tokio::test(start_paused = true)]
+    async fn a_stranded_cutover_does_not_start_the_loop_off_on_its_own() {
+        let (daemon, prepared, _dirs) = cutover_fixture_comes_up_but_refuses_deletes().await;
+        let path = prepared.tree.state_file();
+
+        let err = cut_over(&daemon, prepared).await.expect_err("is stranded");
+
+        assert!(matches!(err, Error::Stranded { .. }), "{err}");
+        let state = State::read(&path).expect("reads");
+        assert!(state.deployed.is_some(), "the release is serving");
+        assert_eq!(state.watch, Watch::Manual);
     }
 
     /// fails if a cutover that DID land stops recording what it landed, or

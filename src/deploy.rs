@@ -257,8 +257,11 @@ pub async fn deploy<D: Daemon>(
     // served, and the sha is written into the record.
     //
     // Three messages already tell an operator not to do this, and a fourth
-    // would not help: `prepare` writes `watch = "auto"`, so once the poll
-    // loop lands this runs with no operator involved at all.
+    // would not help. The poll loop no longer arrives here on its own -
+    // `prepare` writes `watch = "manual"` and the cutover is what promotes
+    // it, so an abandoned tree is passed over rather than refused once an
+    // interval forever - but this stays, because `shep deploy <sheep>` is
+    // one command away and a record can be edited by hand.
     if state.deployed.is_none() {
         return Err(Error::Config(format!(
             "{sheep} has a deploy tree but was never cut over to it, so there is nothing to \
@@ -2254,9 +2257,9 @@ mod tests {
     /// is `exit 1`.
     ///
     /// Three messages already tell an operator not to do this and none of
-    /// them refused it. Prose is also the wrong instrument here: `prepare`
-    /// writes `watch = "auto"`, so once the poll loop lands this runs with
-    /// no operator involved at all.
+    /// them refused it. Prose is also the wrong instrument here: an
+    /// abandoned tree is now left `manual`, so the poll loop passes over
+    /// it, but `shep deploy <sheep>` still reaches this by hand.
     #[tokio::test(start_paused = true)]
     async fn a_tree_the_cutover_never_landed_on_is_refused_before_anything_happens() {
         let mut fixture = fixture_before_any_release();
