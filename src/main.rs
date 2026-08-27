@@ -65,7 +65,7 @@ use std::process::ExitCode;
 
 use shep_client::Client;
 use shep_client::shep_core::paths::ShepPaths;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::daemon::Live;
 use crate::deploy::Outcome;
@@ -203,54 +203,100 @@ async fn main() -> ExitCode {
 /// carries on to the next target; see [`poll::run`].
 async fn poll_forever() -> Result<u8, Error> {
     let home = shep_home()?;
+    // First, and before anything is awaited. See `Stop`.
+    let mut stop = Stop::install();
+
     let client = Client::connect(&socket()?).await?;
     let daemon = Live::new(client);
     let config = config::read(&daemon).await?;
 
     tokio::select! {
         result = poll::run(&daemon, &home, config) => result.map(|()| 0),
-        () = terminate() => {
+        () = stop.arrives() => {
             println!("shep-deploy: stopping");
             Ok(0)
         }
     }
 }
 
-/// Resolves when the process is asked to stop, on whichever of `SIGTERM` or
-/// `SIGINT` arrives first.
+/// The two signals that mean stop, registered.
 ///
 /// `SIGTERM` is what shep sends a dog it is stopping; `SIGINT` is what a
 /// terminal sends somebody who started the dog by hand to watch it.
 ///
-/// The stop is not deferred to a tick boundary. Cancelling [`poll::run`]
-/// can land inside a deploy, which is acceptable and documented there: the
-/// worst it costs is one rebuild on the next start.
-async fn terminate() {
-    tokio::select! {
-        () = arrives(SignalKind::terminate()) => {}
-        () = arrives(SignalKind::interrupt()) => {}
+/// # Why this is a type, and why it is installed by a plain function
+///
+/// [`signal`] inside an `async fn` does not run when the future is created.
+/// It runs when the future is first polled, and `tokio::select!` polls its
+/// branches in an order that is randomised per process, so a handler
+/// installed that way does not exist yet on about half of starts. The
+/// window is the first tick, which opens with a `git fetch` - and a
+/// `SIGTERM` arriving in it kills the process on the signal's default
+/// disposition, with no message and nothing else in this file running.
+///
+/// A non-async `install` cannot be lazy, so the handlers exist before the
+/// loop is polled at all.
+struct Stop {
+    /// The `SIGTERM` stream, or `None` if it could not be installed.
+    term: Option<Signal>,
+    /// The `SIGINT` stream, on the same terms.
+    interrupt: Option<Signal>,
+}
+
+impl Stop {
+    /// Installs both handlers now.
+    fn install() -> Self {
+        Self {
+            term: listen(SignalKind::terminate()),
+            interrupt: listen(SignalKind::interrupt()),
+        }
+    }
+
+    /// Resolves when either signal arrives, and never otherwise.
+    ///
+    /// A stream that is absent or closed is not a request to stop, and
+    /// returning for one would print "stopping" for a stop nobody asked
+    /// for. The signal keeps its default disposition in that case, so a
+    /// `SIGTERM` still ends the process - without the tidy message.
+    ///
+    /// # What a stop does NOT interrupt
+    ///
+    /// Not a tick boundary: cancelling [`poll::run`] can land inside a
+    /// deploy, which is acceptable and documented there. It IS deferred
+    /// while a `git` call is in flight, because those run through blocking
+    /// `std::process::Command` on a current-thread runtime, so nothing else
+    /// is polled until the child exits - and a fetch against a host that is
+    /// not answering is not a bounded wait.
+    async fn arrives(&mut self) {
+        let asked = match (&mut self.term, &mut self.interrupt) {
+            (Some(term), Some(interrupt)) => tokio::select! {
+                arrived = term.recv() => arrived,
+                arrived = interrupt.recv() => arrived,
+            },
+            (Some(only), None) | (None, Some(only)) => only.recv().await,
+            (None, None) => None,
+        };
+
+        if asked.is_none() {
+            core::future::pending().await
+        }
     }
 }
 
-/// Resolves when `kind` arrives, and never otherwise.
+/// One signal handler, or `None` and a complaint if it cannot be installed.
 ///
-/// Two things that are not a signal arriving end up in the same place:
-/// registering the handler failing, which needs a runtime with no I/O
-/// driver and so cannot happen under `#[tokio::main]`, and the stream
-/// closing. Neither is a reason to stop polling, and returning from either
-/// would print "stopping" for a stop nobody asked for. The signal keeps its
-/// default disposition in the first case, so a `SIGTERM` still ends the
-/// process - without the tidy message.
-async fn arrives(kind: SignalKind) {
+/// Registering fails only on a runtime with no I/O driver, which
+/// `#[tokio::main]` never builds. It is reported rather than fatal because
+/// a dog that cannot catch `SIGTERM` still deploys perfectly well; it just
+/// dies less tidily.
+fn listen(kind: SignalKind) -> Option<Signal> {
     match signal(kind) {
-        Ok(mut stream) => {
-            if stream.recv().await.is_some() {
-                return;
-            }
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            eprintln!("shep-deploy: cannot listen for {kind:?}: {err}");
+            None
         }
-        Err(err) => eprintln!("shep-deploy: cannot listen for {kind:?}: {err}"),
     }
-    core::future::pending().await
 }
 
 /// The exit code for a run that finished, reporting what it finished as.
@@ -593,6 +639,22 @@ mod tests {
         // The escape hatch for a sheep whose name is a verb.
         assert_eq!(route(&["deploy", "survey"]), Route::Deploy("survey"));
         assert_eq!(route(&[]), Route::Poll);
+    }
+
+    /// fails if the stop handlers stop being installed eagerly. An
+    /// `async fn` that calls `signal()` registers on its first poll, not on
+    /// creation, and `select!` polls in a randomised order - so lazily
+    /// installed handlers do not exist during the first tick on about half
+    /// of starts, and that tick opens with a `git fetch`. A `SIGTERM` in
+    /// that window kills the dog on the default disposition.
+    ///
+    /// `install` being a plain function is what makes it eager; this is
+    /// what makes it work.
+    #[tokio::test]
+    async fn both_stop_handlers_are_installed_up_front() {
+        let stop = Stop::install();
+        assert!(stop.term.is_some(), "SIGTERM");
+        assert!(stop.interrupt.is_some(), "SIGINT");
     }
 
     /// fails if `on-remove` stops routing to its own hook, or starts being
