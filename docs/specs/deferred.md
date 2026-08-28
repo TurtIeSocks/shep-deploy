@@ -65,23 +65,38 @@ Rin's framing, 2026-08-28: a command for this, "for noobs". That is the right
 target. The people most exposed by a build running as root are exactly the
 people least likely to know that is what is happening.
 
+Rin's call, same day, on both open questions this originally left hanging:
+
+**It is a shep command, not a dog command.** Nothing about "give this app its
+own user" is deploy-specific, and `shep adopt` is already where an operator
+goes. Recorded here because the review that surfaced it happened here; the
+entry belongs in shep's own `docs/specs/deferred.md` and should move there.
+
+**It does not modify the Flockfile. It reads it.** This is the better shape and
+it dissolves the question rather than answering it. The Flockfile already
+declares `user = "svc-worker"`; the command reads that declaration and makes it
+true on the host. Nothing writes into the deployed repository, so this crate's
+refusal of a committed `user` key stands untouched, and the operator's
+statement of intent stays the single source of truth.
+
 Rough shape, not a design:
 
 ```sh
-shep-deploy provision <sheep>          # what it would do, then stop
-shep-deploy provision <sheep> --commit # do it
+shep provision <sheep>            # read the Flockfile, say what is missing
+shep provision <sheep> --commit   # make it so
 ```
 
-Creating a system user with no login shell and no password, taking ownership
-of that sheep's deploy tree, and reporting the `user = "..."` line to add. It
-would need to be idempotent, to refuse rather than adopt a user that already
-exists and owns other things, and to say exactly what it is about to run
-before it runs it, because it needs root and an operator handing root to a
-tool deserves to read the commands first.
+Reading `user` from the app's own Flockfile entry, then creating that system
+user if absent (no login shell, no password), and taking ownership of the
+paths that user needs: its deploy tree, its log files, its home. Reporting what
+already matched rather than redoing it.
 
-**Open questions this does not answer.** Whether it writes the Flockfile line
-itself or only prints it, given the Flockfile lives in the deployed repository
-and this crate refuses committed `user` keys for good reasons. Whether it
-belongs here at all rather than in shep, since nothing about it is
-deploy-specific and `shep adopt` is where an operator already goes to set a
-dog up.
+It needs to be idempotent, to refuse rather than adopt a user that already
+exists and owns things it did not create, and to print every command before
+running it. It needs root, and an operator handing root to a tool deserves to
+read what it is about to do first.
+
+The pleasant consequence of reading rather than writing: an app with no `user`
+declared has nothing to provision, and the command can say so plainly. That is
+the moment to tell someone their build is running as the shepherd, which is
+the whole problem this is for.
