@@ -239,11 +239,45 @@ pub async fn wait<D: Daemon>(
     }
 
     sleep(DWELL).await;
-    let flock = daemon.describe(sheep).await?;
+    // Retried like the one in `turnover`, and for the same reason. Retrying
+    // there and not here left `Verify::Alive` with exactly the bug the retry
+    // was added to fix: one transient answer after the dwell propagates,
+    // `land` reads it as a failure, and a healthy release is rolled back at
+    // the cost of a second live reload. Found on 2026-08-28, in review of the
+    // commit that added the first retry.
+    let flock = describe_within(daemon, sheep, DWELL).await?;
     Ok(!flock.is_empty()
         && flock
             .iter()
             .all(|info| settled.holds(info) && is_alive(info)))
+}
+
+/// [`Daemon::describe`], retrying an answer that could clear on its own.
+///
+/// The judgement is [`Error::is_retryable`]'s, which the crate already applies
+/// to `reload` over the same socket: a `Timeout` or an `Internal` is the
+/// shepherd being busy, a `NotFound` is a question that will never have a
+/// different answer.
+///
+/// `budget` bounds the retrying, so a shepherd that is genuinely gone still
+/// fails rather than hanging.
+///
+/// # Errors
+/// Whatever [`Daemon::describe`] returns, once a failure is either fatal or
+/// the budget is spent.
+async fn describe_within<D: Daemon>(
+    daemon: &D,
+    sheep: &str,
+    budget: Duration,
+) -> Result<Vec<ProcessInfo>, Error> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match daemon.describe(sheep).await {
+            Ok(flock) => return Ok(flock),
+            Err(err) if err.is_retryable() && Instant::now() < deadline => sleep(POLL).await,
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Polls until `before` has been replaced by instances `accept` is happy
@@ -276,14 +310,12 @@ async fn turnover<D: Daemon>(
         // the same socket. Retried inside the budget rather than beyond it,
         // so a shepherd that is genuinely gone still fails at the deadline
         // instead of hanging.
-        let flock = match daemon.describe(sheep).await {
-            Ok(flock) => flock,
-            Err(err) if err.is_retryable() && Instant::now() < deadline => {
-                sleep(POLL).await;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        let flock = describe_within(
+            daemon,
+            sheep,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await?;
         if before.has_turned_over(&flock, accept) {
             return Ok(Some(Generation {
                 pids: flock.iter().filter_map(|info| info.pid).collect(),

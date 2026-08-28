@@ -17,7 +17,7 @@ missing.
 
 The integration tier needs a real shep binary and panics without one:
 
-```
+```text
 the integration tier needs $SHEP_BIN pointing at a built shep binary,
 for example SHEP_BIN="$(command -v shep)": NotPresent
 ```
@@ -57,7 +57,7 @@ SHEP_BIN="$(command -v shep)" cargo test --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-258 unit tests, 7 integration, ~20s and ~31s respectively as of 2026-08-28.
+265 unit tests and 7 integration as of 2026-08-28, ~20s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
 
 ## Architecture
 

@@ -679,11 +679,12 @@ mod tests {
     /// Its own directory, never `release/target`, because that entry is the
     /// one a repository can ship and therefore the one `copy_artifact` must
     /// not trust.
-    fn tempdir_cache() -> std::path::PathBuf {
-        let dir = fixtures::tempdir();
-        let path = dir.path().to_owned();
-        std::mem::forget(dir);
-        path
+    ///
+    /// Returns the `TempDir` so it is cleaned up. An earlier version forgot it
+    /// to dodge a lifetime, which left a directory behind per call for the
+    /// life of the process and after it.
+    fn tempdir_cache() -> tempfile::TempDir {
+        fixtures::tempdir()
     }
 
     use crate::fixtures;
@@ -806,7 +807,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+            run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
                 .await
                 .is_err()
         );
@@ -820,7 +821,7 @@ mod tests {
         let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec::default();
         assert!(
-            run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+            run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
                 .await
                 .is_ok()
         );
@@ -880,7 +881,7 @@ mod tests {
             env: BTreeMap::new(),
             artifacts: vec![],
         };
-        run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+        run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
             .await
             .expect("builds");
         let leaked = std::fs::read_to_string(rel.path().join("leaked.txt")).unwrap_or_default();
@@ -909,7 +910,7 @@ mod tests {
             &spec,
             None,
             &["CARGO_PKG_NAME".to_owned()],
-            &tempdir_cache(),
+            tempdir_cache().path(),
         )
         .await
         .expect("builds");
@@ -947,7 +948,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/id_rsa")],
         };
-        let err = run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+        let err = run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
             .await
             .expect_err("a source outside the tree must be refused");
         assert!(
@@ -1037,7 +1038,7 @@ mod tests {
             artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
         };
 
-        let err = run("web", &release, &spec, None, &[], &tempdir_cache())
+        let err = run("web", &release, &spec, None, &[], tempdir_cache().path())
             .await
             .expect_err("an escaping artifact must be refused");
         assert!(
@@ -1119,7 +1120,7 @@ mod tests {
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
         assert!(
-            run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+            run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
                 .await
                 .is_ok()
         );
@@ -1140,9 +1141,16 @@ mod tests {
             ..Default::default()
         };
         let user = current_username();
-        run("web", rel.path(), &spec, Some(&user), &[], &tempdir_cache())
-            .await
-            .expect("dropping to one's own user and group is always permitted");
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            Some(&user),
+            &[],
+            tempdir_cache().path(),
+        )
+        .await
+        .expect("dropping to one's own user and group is always permitted");
     }
 
     /// fails if a nonexistent `as_user` is silently accepted instead of
@@ -1175,7 +1183,7 @@ mod tests {
             &spec,
             Some("shep-deploy-test-no-such-user"),
             &[],
-            &tempdir_cache(),
+            tempdir_cache().path(),
         )
         .await
         .expect_err("no such user");
@@ -1248,10 +1256,40 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+        run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
             .await
             .expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
+    }
+}
+
+#[cfg(test)]
+mod demo_probe {
+    use super::*;
+    use crate::fixtures;
+
+    #[tokio::test]
+    async fn demo_alias_via_self_pointing_symlink_truncates_existing_file() {
+        let rel = fixtures::fixture_release(&[]);
+        std::fs::write(rel.path().join("keep.txt"), b"IMPORTANT-PRESERVED-CONTENT").unwrap();
+        // Committed symlink: target -> "." (release root itself)
+        std::os::unix::fs::symlink(".", rel.path().join("target")).unwrap();
+
+        let cache = fixtures::tempdir();
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                rel.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/keep.txt")],
+        };
+        let result = run("web", rel.path(), &spec, None, &[], cache.path()).await;
+        eprintln!("run result: {result:?}");
+        let contents = std::fs::read_to_string(rel.path().join("keep.txt")).unwrap_or_default();
+        eprintln!("keep.txt contents afterward: {contents:?}");
+        assert_eq!(contents, "IMPORTANT-PRESERVED-CONTENT", "should be untouched if guard holds");
     }
 }

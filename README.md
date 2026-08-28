@@ -97,7 +97,7 @@ unconditionally, whatever its age. It cannot be below 2: the release a failed
 deploy rolls back to is the second newest, so anything lower would silently
 disable rollback, and it is refused rather than clamped.
 
-`git_timeout` bounds any single git subprocess. Targets are deployed one at a
+`git_timeout` bounds the fetch, which is the only git call that talks to a network. The rest operate on local directories and cannot hang on a remote. Targets are deployed one at a
 time, so without it a remote that drops packets rather than refusing them stops
 every target and every smit refresh, with no error and no log line. Five
 minutes by default, which is generous enough for a cold clone of a large

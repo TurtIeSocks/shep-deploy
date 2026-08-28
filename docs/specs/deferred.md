@@ -49,7 +49,7 @@ Also worth stating: it is not a substitute for the mitigations that already
 exist. Running the shepherd as a non-root user and setting `user` on every app
 closes the ordinary cases. Landlock is what closes the unusual ones.
 
-## A command that provisions the user a sheep should run as
+## A command that provisions the unix user a sheep should run as
 
 The single cheapest thing an operator can do for build safety is give each app
 its own unprivileged user and set `user` on it. shep's own docs recommend

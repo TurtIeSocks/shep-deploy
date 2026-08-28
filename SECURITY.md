@@ -17,13 +17,19 @@ knowing.
 
 ## Security premises
 
-IF the shepherd runs as an unprivileged user, OR every deployed app sets
-`user` so builds drop to a dedicated account, THEN:
+IF every deployed app sets `user`, so each build drops to an account of its
+own, THEN:
 
 - A build is confined to that account's privileges. It cannot read or write
   anything that uid cannot already reach.
-- A compromised build reaches that one app's data, not the host's and not other
-  apps'.
+- A compromised build reaches that one app's data, and not other apps'.
+
+IF the shepherd merely runs unprivileged, with apps that set no `user`, THEN
+the host is protected from a build and the apps are not protected from each
+other. Every build runs as the shepherd's own uid, so it reads and writes
+whatever any app under that shepherd can, including their deploy trees, their
+logs, and any `.env` shared into their releases. That is better than root and
+it is not isolation.
 
 IF neither holds, and the shepherd runs as root with apps that set no `user`,
 THEN a build script from the tracked branch runs as root, once per deploy.
