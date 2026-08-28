@@ -29,7 +29,10 @@
 //! this is a direct edge on something every build already compiles.
 
 use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::PathBuf;
 
+use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 
 use crate::error::Error;
@@ -80,9 +83,34 @@ pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
     // process is at that moment holding a lock on, for no reason.
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(held) => Ok(Deploying { _held: held }),
-        Err((_, _)) => Err(Error::AlreadyDeploying {
-            sheep: tree.sheep().to_owned(),
-        }),
+        Err((_, errno)) => Err(refusal(tree.sheep(), path, errno)),
+    }
+}
+
+/// Why the lock could not be taken, told apart by the errno.
+///
+/// Only `EWOULDBLOCK` means somebody else holds it, and it is the only one
+/// `LockExclusiveNonblock` returns for contention. Reporting every failure as
+/// contention is the false refusal this whole module is supposed to prevent:
+/// `ENOLCK` from an exhausted lock table, `EIO`, or a mount that does not
+/// implement `flock` would each stop the dog deploying that sheep and send the
+/// operator looking for a second process that does not exist, with the one
+/// piece of information that would have told them otherwise discarded.
+///
+/// Found by round 12 of the founder's review, in code written the same day.
+///
+/// `EAGAIN` is not matched separately: `nix` gives it and `EWOULDBLOCK` the
+/// same discriminant, so naming both is an unreachable arm rather than the
+/// belt-and-braces it looks like. Clippy said so.
+fn refusal(sheep: &str, path: PathBuf, errno: Errno) -> Error {
+    match errno {
+        Errno::EWOULDBLOCK => Error::AlreadyDeploying {
+            sheep: sheep.to_owned(),
+        },
+        other => Error::Io {
+            path,
+            source: io::Error::from_raw_os_error(other as i32),
+        },
     }
 }
 
@@ -120,6 +148,39 @@ mod tests {
         drop(hold(&tree).expect("the first hold"));
 
         hold(&tree).expect("the tree must be free once the first is dropped");
+    }
+
+    /// fails if a lock failure that is NOT contention is reported as
+    /// contention.
+    ///
+    /// `hold` mapped every `flock` errno to "another deploy is already
+    /// running". Only `EWOULDBLOCK` means that. `ENOLCK` from an exhausted
+    /// kernel lock table, `EIO`, or a mount with no `flock` support would each
+    /// stop the dog deploying that sheep and send the operator hunting a
+    /// second process that does not exist, with the errno that would have told
+    /// them otherwise thrown away. That is the false refusal this module
+    /// exists to avoid, produced by the module itself.
+    #[test]
+    fn a_lock_failure_that_is_not_contention_says_what_it_was() {
+        let path = std::path::PathBuf::from("/x/deploy.lock");
+
+        let contended = refusal("web", path.clone(), Errno::EWOULDBLOCK);
+        assert!(
+            matches!(&contended, Error::AlreadyDeploying { sheep } if sheep == "web"),
+            "contention is the one case that claim is true for: {contended:?}"
+        );
+
+        for errno in [Errno::ENOLCK, Errno::EIO, Errno::EOPNOTSUPP] {
+            let err = refusal("web", path.clone(), errno);
+            assert!(
+                matches!(&err, Error::Io { path: named, .. } if named == &path),
+                "{errno:?} must name the lock file, not a rival process: {err:?}"
+            );
+            assert!(
+                !format!("{err}").contains("already running"),
+                "{errno:?} must not claim contention: {err}"
+            );
+        }
     }
 
     /// fails if two sheep contend with each other. The lock is per tree, and
