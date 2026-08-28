@@ -185,9 +185,16 @@ mod tests {
     /// other than what it says is worse than one that is refused.
     #[test]
     fn an_unknown_key_in_the_record_is_refused_and_named() {
+        // `checkout` is present, and load-bearing: it has no default, so
+        // leaving it out made the document invalid twice over and the test
+        // passed on whichever error serde reported first. It still caught the
+        // guard being removed, but failed with "TOML parse error at line 1"
+        // instead of naming the typo, which sends the next reader to the wrong
+        // place.
         let toml = r#"
 remote = "https://example.invalid/repo.git"
 branch = "main"
+checkout = "/srv/web"
 verfiy = "alive"
 "#;
         let err = toml::from_str::<State>(toml).expect_err("a typo must not parse");
