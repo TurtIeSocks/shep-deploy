@@ -100,3 +100,28 @@ The pleasant consequence of reading rather than writing: an app with no `user`
 declared has nothing to provision, and the command can say so plainly. That is
 the moment to tell someone their build is running as the shepherd, which is
 the whole problem this is for.
+
+## An operator-declared artifact source
+
+`build.artifacts` can no longer name a source outside the release and the
+dog's own cache. Refused since 2026-08-28, because `CARGO_TARGET_DIR` comes
+from the deployed repository's Flockfile and the copy-back runs in the dog's
+own process at its own uid: pointing it anywhere on the host read that file
+into the release, where a static-serving app then hands it out over HTTP. No
+build code had to run.
+
+That narrows something this module's own doc described as intended: "artifacts
+remains for the builds that genuinely do put their output somewhere the release
+cannot see, including one an operator points elsewhere themselves."
+
+The words hid the problem. The operator does not point it anywhere; the
+`[build]` block lives in the deployed repository, so whoever can land a commit
+points it. Those are different people, and the whole threat model of this crate
+turns on the difference.
+
+If a build genuinely needs to salvage output from outside the tree, the
+declaration has to come from somewhere the operator controls: an
+`artifact_roots` list in `[dog.deploy]`, alongside `passthrough`, which the
+repository can then name paths under but cannot extend. Same shape as the
+environment allowlist, for the same reason. Not built, because nothing has
+asked for it yet and the narrowing costs nothing until something does.

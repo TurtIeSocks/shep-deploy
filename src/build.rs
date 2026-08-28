@@ -356,6 +356,38 @@ fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Pa
     release.join(artifact)
 }
 
+/// The deepest ancestor of `path` that exists, fully resolved.
+///
+/// `canonicalize` fails on a path that does not exist yet, and an artifact's
+/// destination usually does not, so this walks up until something does. What
+/// comes back has every symlink on it followed, which is the whole point: a
+/// destination is only safe if the directory it will really land in is safe.
+fn resolve_deepest(path: &Path) -> Option<PathBuf> {
+    let mut probe = path.to_owned();
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            return Some(real);
+        }
+        if !probe.pop() {
+            return None;
+        }
+    }
+}
+
+/// Whether `candidate` really lands under one of `roots`, symlinks followed.
+///
+/// The lexical check in [`contained_artifacts`] cannot answer this, and that
+/// is not a gap in it but a limit of strings. A repository can commit a
+/// symlink, and `crate::shared::link_cache` leaves a `target` entry alone when
+/// the release already ships one, so `target/out` with no `..` and no leading
+/// slash walks wherever that committed link points. Demonstrated 2026-08-28:
+/// a release shipping `target -> /tmp/outside` had `target/victim` written
+/// through it, at the dog's uid, which is root under the arrangement shep's
+/// own docs recommend.
+fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
+    resolve_deepest(candidate).is_some_and(|real| roots.iter().any(|root| real.starts_with(root)))
+}
+
 /// Copies one declared artifact from wherever the build actually left it
 /// into its named path inside `release`.
 ///
@@ -376,6 +408,7 @@ fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Pa
 /// the path declared.
 fn copy_artifact(
     release: &Path,
+    cache: &Path,
     env: &BTreeMap<String, String>,
     artifact: &Path,
 ) -> Result<(), Error> {
@@ -398,6 +431,41 @@ fn copy_artifact(
 
     let from = artifact_source(release, env, artifact);
     let to = release.join(artifact);
+
+    // Both ends checked against where they REALLY land, not against how they
+    // are spelled. The lexical refusal above catches `..` and an absolute
+    // path; it cannot catch a committed symlink, and it says nothing at all
+    // about the source, which `CARGO_TARGET_DIR` points wherever the
+    // repository's own Flockfile says.
+    //
+    // `cache` is passed in rather than read from `release/target`, which is
+    // exactly the entry an attacker controls: `link_cache` leaves a release's
+    // own `target` alone when it ships one.
+    //
+    // Two escapes measured 2026-08-28, both writing or reading at the dog's
+    // uid because this runs in the parent, after the build's own drop:
+    // `target -> /tmp/outside` wrote through the committed link, and
+    // `CARGO_TARGET_DIR = /any/path` with `artifacts = ["target/id_rsa"]`
+    // read an arbitrary file into the release, where a static-serving app
+    // then hands it out over HTTP.
+    let roots = [
+        release
+            .canonicalize()
+            .unwrap_or_else(|_| release.to_owned()),
+        cache.canonicalize().unwrap_or_else(|_| cache.to_owned()),
+    ];
+    for (end, path) in [("destination", &to), ("source", &from)] {
+        if !lands_within(&roots, path) {
+            return Err(Error::Config(format!(
+                "build.artifacts entry `{}` resolves its {end} to `{}`, which is \
+                 outside the release and its build cache",
+                artifact.display(),
+                resolve_deepest(path)
+                    .unwrap_or_else(|| path.clone())
+                    .display()
+            )));
+        }
+    }
 
     if from == to {
         return Ok(());
@@ -500,6 +568,7 @@ pub async fn run(
     spec: &BuildSpec,
     as_user: Option<&str>,
     passthrough: &[String],
+    cache: &Path,
 ) -> Result<(), Error> {
     let Some(command) = spec.command.as_deref() else {
         return Ok(());
@@ -557,7 +626,7 @@ pub async fn run(
     }
 
     for artifact in &spec.artifacts {
-        copy_artifact(release, &spec.env, artifact)?;
+        copy_artifact(release, cache, &spec.env, artifact)?;
     }
 
     Ok(())
@@ -565,6 +634,18 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    /// A throwaway stand-in for the dog's own build cache.
+    ///
+    /// Its own directory, never `release/target`, because that entry is the
+    /// one a repository can ship and therefore the one `copy_artifact` must
+    /// not trust.
+    fn tempdir_cache() -> std::path::PathBuf {
+        let dir = fixtures::tempdir();
+        let path = dir.path().to_owned();
+        std::mem::forget(dir);
+        path
+    }
+
     use crate::fixtures;
 
     use super::*;
@@ -684,7 +765,11 @@ mod tests {
             command: Some("exit 3".into()),
             ..Default::default()
         };
-        assert!(run("web", rel.path(), &spec, None, &[]).await.is_err());
+        assert!(
+            run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+                .await
+                .is_err()
+        );
     }
 
     /// fails if an absent build command is an error rather than a no-op.
@@ -694,7 +779,11 @@ mod tests {
     async fn an_absent_build_command_is_not_an_error() {
         let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec::default();
-        assert!(run("web", rel.path(), &spec, None, &[]).await.is_ok());
+        assert!(
+            run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+                .await
+                .is_ok()
+        );
     }
 
     /// fails if declared artifacts are not copied into the release. With
@@ -704,6 +793,9 @@ mod tests {
     #[tokio::test]
     async fn declared_artifacts_are_copied_into_the_release() {
         let rel = fixtures::fixture_release(&[]);
+        // The redirect points at the dog's OWN cache, which is the only
+        // outside-the-release source that is still allowed. See
+        // `a_source_outside_the_release_and_cache_is_refused` for why.
         let cache = fixtures::tempdir();
         std::fs::create_dir_all(cache.path().join("release")).unwrap();
         std::fs::write(cache.path().join("release/koji"), b"binary").unwrap();
@@ -716,7 +808,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/koji")],
         };
-        run("web", rel.path(), &spec, None, &[])
+        run("web", rel.path(), &spec, None, &[], cache.path())
             .await
             .expect("builds");
         assert!(rel.path().join("target/release/koji").exists());
@@ -748,7 +840,7 @@ mod tests {
             env: BTreeMap::new(),
             artifacts: vec![],
         };
-        run("web", rel.path(), &spec, None, &[])
+        run("web", rel.path(), &spec, None, &[], &tempdir_cache())
             .await
             .expect("builds");
         let leaked = std::fs::read_to_string(rel.path().join("leaked.txt")).unwrap_or_default();
@@ -777,6 +869,7 @@ mod tests {
             &spec,
             None,
             &["CARGO_PKG_NAME".to_owned()],
+            &tempdir_cache(),
         )
         .await
         .expect("builds");
@@ -785,6 +878,85 @@ mod tests {
                 .expect("the build wrote it")
                 .trim(),
             "shep-deploy"
+        );
+    }
+
+    /// fails if `CARGO_TARGET_DIR` can read a file from anywhere on the host.
+    ///
+    /// The simplest of the three escapes and the one needing no trick at all:
+    /// `env` comes from the deployed repository's own Flockfile, and nothing
+    /// validated where it pointed. `artifacts = ["target/id_rsa"]` is relative
+    /// and has no `..`, so both lexical guards pass, and `copy_artifact` then
+    /// reads whatever that source names into the release. No build code runs.
+    ///
+    /// It matters because the copy happens in THIS process, at the dog's uid,
+    /// which shep's docs recommend running as root. And a release is the
+    /// directory a static-serving app hands out over HTTP.
+    #[tokio::test]
+    async fn a_source_outside_the_release_and_cache_is_refused() {
+        let rel = fixtures::fixture_release(&[]);
+        let elsewhere = fixtures::tempdir();
+        std::fs::write(elsewhere.path().join("id_rsa"), b"PRIVATE KEY").expect("secret");
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                elsewhere.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/id_rsa")],
+        };
+        let err = run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+            .await
+            .expect_err("a source outside the tree must be refused");
+        assert!(
+            format!("{err}").contains("outside the release"),
+            "must say why: {err}"
+        );
+        assert!(
+            !rel.path().join("target/id_rsa").exists(),
+            "nothing may be read into the release"
+        );
+    }
+
+    /// fails if a committed symlink can carry a write out of the release.
+    ///
+    /// No `..` and no absolute path, so the lexical guard passes and cannot
+    /// help: the escape is a filesystem object, not a string. A repository can
+    /// commit a symlink, and `crate::shared::link_cache` leaves a `target`
+    /// entry alone when the release already ships one, so the dog writes
+    /// straight through it at its own uid.
+    #[tokio::test]
+    async fn a_committed_target_symlink_cannot_carry_a_write_out() {
+        let rel = fixtures::fixture_release(&[]);
+        let outside = fixtures::tempdir();
+        std::fs::write(outside.path().join("victim"), b"original").expect("victim");
+        std::os::unix::fs::symlink(outside.path(), rel.path().join("target")).expect("link");
+
+        let cache = fixtures::tempdir();
+        std::fs::write(cache.path().join("victim"), b"ATTACKER").expect("payload");
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/victim")],
+        };
+        let err = run("web", rel.path(), &spec, None, &[], cache.path())
+            .await
+            .expect_err("a write through a committed symlink must be refused");
+        assert!(
+            format!("{err}").contains("outside the release"),
+            "must say why: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim")).expect("still there"),
+            "original",
+            "the file outside the release must be untouched"
         );
     }
 
@@ -825,7 +997,7 @@ mod tests {
             artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
         };
 
-        let err = run("web", &release, &spec, None, &[])
+        let err = run("web", &release, &spec, None, &[], &tempdir_cache())
             .await
             .expect_err("an escaping artifact must be refused");
         assert!(
@@ -906,7 +1078,11 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
-        assert!(run("web", rel.path(), &spec, None, &[]).await.is_ok());
+        assert!(
+            run("web", rel.path(), &spec, None, &[], &tempdir_cache())
+                .await
+                .is_ok()
+        );
     }
 
     /// fails if `as_user` is silently ignored on the accept side of the
@@ -924,7 +1100,7 @@ mod tests {
             ..Default::default()
         };
         let user = current_username();
-        run("web", rel.path(), &spec, Some(&user), &[])
+        run("web", rel.path(), &spec, Some(&user), &[], &tempdir_cache())
             .await
             .expect("dropping to one's own user and group is always permitted");
     }
@@ -959,6 +1135,7 @@ mod tests {
             &spec,
             Some("shep-deploy-test-no-such-user"),
             &[],
+            &tempdir_cache(),
         )
         .await
         .expect_err("no such user");
@@ -1031,7 +1208,7 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run("web", rel.path(), &spec, None, &[])
+        run("web", rel.path(), &spec, None, &[], &tempdir_cache())
             .await
             .expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");

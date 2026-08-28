@@ -18,6 +18,7 @@ use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -125,8 +126,31 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         });
     };
 
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    // Bounded, like the wait above and for the same reason. git exiting does
+    // not mean the pipe is closed: anything it forked that inherited fd 1 or 2
+    // still holds the write end, and an ssh ControlPersist master or a
+    // `&`-backgrounded helper in an alias does exactly that while git itself
+    // exits 0. Joining unconditionally here made the SUCCESS path the one
+    // remaining unbounded wait, which is worse than the failure paths already
+    // fixed, because it fires on the ordinary case.
+    //
+    // Measured 2026-08-28 before this change: a git alias forking
+    // `sh -c 'sleep 8 &'` returned Ok after 8.02 seconds against a 600ms
+    // budget, having reported success the whole time.
+    let left = deadline.saturating_duration_since(Instant::now());
+    let (Ok(stdout), Ok(stderr)) = (out.recv_timeout(left), err.recv_timeout(left)) else {
+        // Something still holds the pipe. Signal the group so it stops, and
+        // report the budget rather than the output we never got.
+        abandon(&mut child);
+        return Err(Error::Git {
+            command: format!("git {}", args.join(" ")),
+            status: None,
+            stderr: format!(
+                "exited, but something it started still held its output after \
+                 {budget:?}; abandoned so the other targets keep deploying"
+            ),
+        });
+    };
 
     decode(dir, args, status, stdout, stderr)
 }
@@ -160,14 +184,18 @@ fn abandon(child: &mut std::process::Child) {
 ///
 /// A free function rather than a closure because the two pipes are different
 /// types and a closure cannot be generic over them.
-fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut buf);
         }
-        buf
-    })
+        // The receiver is dropped when the budget runs out, so this send can
+        // fail. That is the intended shape, not an error to report.
+        let _ = tx.send(buf);
+    });
+    rx
 }
 
 /// How often [`run_git_within`] asks whether the child has finished.
@@ -538,6 +566,35 @@ mod tests {
             out.len() > 100_000,
             "the fixture must exceed a pipe buffer or this proves nothing, got {} bytes",
             out.len()
+        );
+    }
+
+    /// fails if a process git spawned can extend the budget on the SUCCESS
+    /// path, where git itself exited cleanly.
+    ///
+    /// The nastiest of the three versions of this bug, because it fires on the
+    /// ordinary case rather than on a failure. `git` can exit 0 while
+    /// something it forked still holds fd 1 or 2: an ssh ControlPersist
+    /// master, or a `&`-backgrounded helper in an alias. `try_wait` sees
+    /// success, the loop breaks, and collecting the output blocks on a pipe
+    /// that will not close.
+    ///
+    /// Measured 2026-08-28 before the fix: this exact shape returned `Ok`
+    /// after 8.02 seconds against a 600ms budget.
+    #[test]
+    fn output_is_collected_within_the_budget_even_when_git_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = Instant::now();
+        let _ = run_git_within(
+            dir.path(),
+            &["-c", "alias.fork=!sh -c 'sleep 8 &'", "fork"],
+            Duration::from_millis(600),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "git exited at once; collecting its output must not wait out what it \
+             forked. Took {elapsed:?} against a 600ms budget"
         );
     }
 

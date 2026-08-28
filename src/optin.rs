@@ -235,6 +235,7 @@ pub async fn prepare<D: Daemon>(
         &spec,
         app.user.as_deref(),
         &config.passthrough,
+        &tree.cache_target(),
     )
     .await?;
 

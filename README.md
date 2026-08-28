@@ -254,6 +254,14 @@ Fetching happens in the dog's own process and keeps its own environment, so a
 private repository still clones; only the build loses the socket. Name it in
 `passthrough` if a build genuinely needs it.
 
+`build.artifacts` may only name paths that really land inside the release or
+the dog's own build cache, resolved rather than spelled. A `..`, an absolute
+path, a committed symlink, or a `CARGO_TARGET_DIR` pointing elsewhere are all
+refused. That is narrower than it was: a build whose output genuinely lands
+outside both is no longer copyable, because the copy runs in the dog's own
+process at its own uid, and the `[build]` block naming the path comes from the
+deployed repository rather than from you.
+
 **What the allowlist does not cover, and cannot.** Your project's own secrets
 are not in the dog's environment, they are in your repository's working tree. A
 `.env` file is gitignored, which is exactly the rule that makes shep-deploy
