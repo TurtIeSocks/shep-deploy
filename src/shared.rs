@@ -443,6 +443,16 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
             // `user` among them, and a build pinned to an unprivileged
             // account runs as the dog's own uid instead. Silently: nothing
             // errors, because an absent override is a legitimate state.
+            // Reserved by the dog, the same way the override is reserved for
+            // the operator. `deploy::checkout_release` writes this name inside
+            // every release before `link_into` runs, so a checkout carrying a
+            // gitignored file of the same name met an `AlreadyExists` and a
+            // refusal telling the operator to add it to `.shepignore`, blaming
+            // their repository for a collision with the dog's own bookkeeping.
+            if path == Path::new(crate::deploy::COMPLETE) {
+                return false;
+            }
+
             path == Path::new(crate::flockfile::OVERRIDE)
                 || !patterns
                     .iter()
@@ -796,6 +806,27 @@ mod tests {
         let linked = to_link(repo.path()).expect("computes");
         assert!(linked.iter().any(|p| p.ends_with("config/local.json")));
         assert!(!linked.iter().any(|p| p.ends_with("dist")));
+    }
+
+    /// fails if a checkout carrying the dog's own completion marker collides
+    /// with it.
+    ///
+    /// `deploy::checkout_release` writes `.shep-complete` inside every release
+    /// before `link_into` runs. A checkout with a gitignored file of that name
+    /// therefore met an `AlreadyExists` and a refusal telling the operator to
+    /// add it to `.shepignore`, blaming their repository for a collision with
+    /// the dog's own bookkeeping.
+    #[test]
+    fn the_dogs_own_marker_is_never_shared_in() {
+        let repo = fixture_repo(&[(".gitignore", ".shep-complete\n")]);
+        fs::write(repo.path().join(".shep-complete"), "").expect("the operator's own");
+
+        let linked = to_link(repo.path()).expect("computes");
+
+        assert!(
+            !linked.iter().any(|p| p.ends_with(".shep-complete")),
+            "the name is the dog's inside a release: {linked:?}"
+        );
     }
 
     /// fails if a committed `.shepignore` can drop the operator's own

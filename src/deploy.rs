@@ -358,7 +358,7 @@ async fn go<D: Daemon>(
 ///
 /// Inside the release rather than beside it, so retention removes it along
 /// with the release it describes and no bookkeeping outlives its subject.
-const COMPLETE: &str = ".shep-complete";
+pub(crate) const COMPLETE: &str = ".shep-complete";
 
 /// Checks `sha` out at `release`, unless a FINISHED checkout is already there.
 ///
