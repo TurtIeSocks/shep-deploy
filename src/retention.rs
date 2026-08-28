@@ -173,6 +173,22 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
+    /// Pins `path`'s modification time, so an ordering test does not depend
+    /// on how far apart two filesystem operations happen to land.
+    ///
+    /// Both tests below did depend on that, and CI caught it: on macOS the
+    /// gaps were wide enough, on ubuntu two entries tied and `doomed`'s
+    /// tiebreak is the name ascending, which put a `0`-prefixed stand-in in
+    /// the KEPT group instead of the doomed one. The test then passed against
+    /// the very bug it was written for.
+    fn at_second(path: &Path, seconds: u64) {
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        fs::File::open(path)
+            .expect("open for set_times")
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .expect("pin the mtime");
+    }
+
     /// fails if something under `releases/` that is not a release can take
     /// one of the kept slots.
     ///
@@ -188,13 +204,18 @@ mod tests {
     #[test]
     fn a_stray_file_under_releases_cannot_push_a_release_out() {
         let (tree, shas) = fixture_tree_with_releases(3);
-        let rollback_target = tree.release(&shas[1]);
-        fs::write(tree.releases().join("notes.txt"), "not a release").expect("stray");
+        let stray = tree.releases().join("notes.txt");
+        fs::write(&stray, "not a release").expect("stray");
+
+        at_second(&tree.release(&shas[0]), 10);
+        at_second(&tree.release(&shas[1]), 20);
+        at_second(&tree.release(&shas[2]), 30);
+        at_second(&stray, 40);
 
         prune(&tree, 2).expect("prunes");
 
         assert!(
-            rollback_target.is_dir(),
+            tree.release(&shas[1]).is_dir(),
             "the second newest release is the rollback target and must survive"
         );
     }
@@ -213,7 +234,7 @@ mod tests {
     /// is-this-a-release filter, because it is shaped exactly like one, and
     /// `git worktree remove` then refuses it.
     ///
-    /// Its mtime is placed between the kept releases and the doomed ones so
+    /// Its mtime is pinned between the kept releases and the doomed ones so
     /// it is removed FIRST. Ordered last it would strand nothing and the test
     /// would pass against the unfixed code.
     #[test]
@@ -221,11 +242,12 @@ mod tests {
         let (tree, shas) = fixture_tree_with_releases(4);
         let never_a_worktree = tree.releases().join("0".repeat(40));
         fs::create_dir(&never_a_worktree).expect("a release-shaped directory");
-        // Bump the two newest above it, so the doomed set is
-        // [never_a_worktree, shas[1], shas[0]] in that order.
-        for sha in &shas[2..] {
-            fs::write(tree.release(sha).join("touched.txt"), "x").expect("bump mtime");
-        }
+
+        at_second(&tree.release(&shas[0]), 10);
+        at_second(&tree.release(&shas[1]), 20);
+        at_second(&never_a_worktree, 30);
+        at_second(&tree.release(&shas[2]), 40);
+        at_second(&tree.release(&shas[3]), 50);
 
         let err = prune(&tree, 2).expect_err("the failure must still be reported");
 
