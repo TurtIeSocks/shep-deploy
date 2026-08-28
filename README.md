@@ -84,13 +84,27 @@ moved. Configure it in `shep.toml`:
 [dog.deploy]
 interval = "30s"
 retention = 5
+git_timeout = "5m"
+passthrough = ["CARGO_HOME"]
 ```
 
-Both are read once, when the dog starts, so changing either takes a `shep
-restart deploy`. `retention` is how many releases each target keeps. It cannot
-be below 2: the release a failed deploy rolls back to is the second newest, so
-anything lower would silently disable rollback, and it is refused rather than
-clamped.
+All four are read once, when the dog starts, so changing any takes a `shep
+restart deploy`.
+
+`retention` is how many releases each target keeps **besides the live one**, so
+a target holds up to `retention + 1` directories. The live release is spared
+unconditionally, whatever its age. It cannot be below 2: the release a failed
+deploy rolls back to is the second newest, so anything lower would silently
+disable rollback, and it is refused rather than clamped.
+
+`git_timeout` bounds any single git subprocess. Targets are deployed one at a
+time, so without it a remote that drops packets rather than refusing them stops
+every target and every smit refresh, with no error and no log line. Five
+minutes by default, which is generous enough for a cold clone of a large
+repository.
+
+`passthrough` names environment variables a build may keep from the dog's own
+environment. See Security below for why that list starts empty.
 
 One target's failure never stops the others, and never stops the dog. Each
 target's outcome is reported on its own and the loop carries on. `up to date`
@@ -226,9 +240,32 @@ shep-deploy warns when it is about to run a build as root with no `user` set.
 It does not refuse. Whether an app runs without a `user` is shep's call and the
 operator's, not a deploy dog's.
 
+A build starts from a cleared environment, not this process's. It gets `PATH`,
+`HOME`, `LANG`, `LC_ALL` and `TZ`, whatever `passthrough` names in
+`[dog.deploy]`, and the release's own `[build] env`. Nothing else. Dropping uid
+and gid bounds what a build can touch; it does nothing about what it can read
+out of its own environment, because those values are copied in before the drop
+happens. A dog started with a registry token in its environment would otherwise
+hand it to every build it runs.
+
+`SSH_AUTH_SOCK` is not in that base set, on purpose. A forwarded agent reaching
+a build lets the build authenticate as you anywhere that agent is trusted.
+Fetching happens in the dog's own process and keeps its own environment, so a
+private repository still clones; only the build loses the socket. Name it in
+`passthrough` if a build genuinely needs it.
+
+**What the allowlist does not cover, and cannot.** Your project's own secrets
+are not in the dog's environment, they are in your repository's working tree. A
+`.env` file is gitignored, which is exactly the rule that makes shep-deploy
+symlink it into every release, so the build reads it and so does the app at
+runtime. That is the intended behaviour and the reason shared files exist. It
+does mean a build command can read every secret the app itself can read, no
+matter what this allowlist says. The bound worth having there is `user`, so
+that a build and the app it builds are confined to the same one account.
+
 Nothing else here handles credentials. Git auth is inherited from the user the
-build runs as, so a private repository works exactly as it does in that user's
-own shell, and no token passes through any URL or argument this crate builds.
+dog runs as, so a private repository works as it does in that user's own shell,
+and no token passes through any URL or argument this crate builds.
 
 ## Platform
 

@@ -635,7 +635,7 @@ async fn land<D: Daemon>(daemon: &D, sheep: &str, app: &AppConfig, mode: Verify)
 /// `RequestError` is `#[non_exhaustive]`, so a variant added later lands in
 /// the same fail-safe direction rather than in this list.
 ///
-/// [`is_retryable`] draws its own line in the same place for the same
+/// [`Error::is_retryable`] draws its own line in the same place for the same
 /// reason, and the two disagreeing is what let this through: the rollback's
 /// reload already treated `Timeout` as "might yet clear" while the deploy's
 /// reload treated it as "never happened".
@@ -1007,7 +1007,7 @@ const RETRY_EVERY: Duration = Duration::from_millis(500);
 /// is precisely what verification just gave up waiting for. Retrying is
 /// therefore the difference between a rollback that lands a few seconds late
 /// and one that cannot happen at all. What is retried and what is not is
-/// [`is_retryable`]'s decision.
+/// [`Error::is_retryable`]'s decision.
 ///
 /// # Errors
 /// The failure, at once if it could never clear, or the last one after

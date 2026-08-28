@@ -29,8 +29,19 @@ pub enum Error {
     Request(RequestError),
     /// The shepherd answered with a response this dog cannot use.
     Protocol(String),
-    /// A `[dog.deploy]` (or per-sheep override) section could not be
-    /// understood.
+    /// Some operator-supplied input failed validation, and the message says
+    /// which and why.
+    ///
+    /// Deliberately broad, and named for the kind of mistake rather than for
+    /// one file. It is built at 35 sites across ten modules: a `[dog.<name>]`
+    /// section, a `deploy.toml` record, a release's own Flockfile, an
+    /// unresolvable `user`, an artifact path that would escape its release,
+    /// and a bad `--watch` argument, which is not TOML at all.
+    ///
+    /// It said "a `[dog.deploy]` (or per-sheep override) section could not be
+    /// understood" until 2026-08-28, which was true of one site and misleading
+    /// about the other 34. That matters more here than elsewhere: this
+    /// module's own doc says it exists to be read on its own.
     Config(String),
     /// A smit's own text could not become one at all - too long, empty, or
     /// carrying a control character.
