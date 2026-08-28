@@ -219,7 +219,15 @@ pub async fn prepare<D: Daemon>(
     let sha = git::remote_head(&tree.git(), &state.branch)?;
 
     let release = tree.release(&sha);
-    git::worktree_add(&tree.git(), &release, &sha)?;
+    // Shared with `deploy::attempt` rather than a bare `worktree_add`, and
+    // that is what makes this function's own retry story true. `git worktree
+    // add` refuses a path that already exists ("fatal: `<path>` already
+    // exists") and refuses one it still has registered after the directory
+    // was removed ("missing but already registered worktree"). So every run
+    // that died anywhere from here onward left a release directory that made
+    // the next run fail on git rather than resume, which is the opposite of
+    // what the doc above promises.
+    crate::deploy::checkout_release(&tree.git(), &release, &sha)?;
     shared::link_cache(&release, &tree.cache_target())?;
     // Held, not recomputed. This is the only record of which files came from
     // the operator's own checkout rather than from the repository, and
@@ -863,6 +871,41 @@ mod tests {
             .await
             .expect("prepares");
         assert_eq!(prepared.state.branch, "stable");
+    }
+
+    /// fails if a run that died before writing its record cannot simply be
+    /// run again, which is what this function's own doc promises twice.
+    ///
+    /// The promise was false from `worktree_add` onward. `prepare` had no
+    /// existence guard and no cleanup on any failure path, so the release
+    /// directory a dead run left behind made the next run fail with a raw
+    /// `fatal: '<path>' already exists` from git. Verified 2026-08-28.
+    ///
+    /// Modelled here at the narrowest window the doc calls out by name, a
+    /// kill between `swap::point_at` and `state.write`: the release and
+    /// `current` exist, `deploy.toml` does not, so the "already a deploy
+    /// target" refusal at the top correctly does not fire and the run gets
+    /// as far as the checkout before failing.
+    #[tokio::test]
+    async fn a_prepare_that_died_before_writing_its_record_runs_again() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout_with_commit();
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
+
+        let first = prepare(&daemon, home.path(), "bpm", &test_config())
+            .await
+            .expect("prepares");
+        std::fs::remove_file(first.tree.state_file()).expect("the record a kill never wrote");
+
+        let again = prepare(&daemon, home.path(), "bpm", &test_config())
+            .await
+            .expect("a tree with no record must be resumable, as the doc says");
+        assert_eq!(again.sha, first.sha);
+        assert!(
+            again.tree.state_file().is_file(),
+            "the second run must leave the record the first one never wrote"
+        );
     }
 
     /// fails if `current` does not end up pointing at a real release
