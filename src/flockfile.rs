@@ -68,34 +68,67 @@ pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<App
     })
 }
 
-/// The release's `[build]` block, or the default (no command, which
+/// The release's `[dog.deploy.build]` block, or the default (no command, which
 /// [`crate::build::run`] treats as a no-op) if it declares none.
 ///
 /// Read from the same merged document [`app_config`] reads, so the
-/// operator's override wins here too. That is not incidental: `build.env`
-/// routinely names host-specific paths - a registry token or a `NODE_ENV`,
-/// say - and those are exactly the values a committed file cannot know and
-/// an operator has to pin locally.
+/// operator's override wins here too. That is not incidental: the block's
+/// `env` routinely names host-specific paths - a registry token or a
+/// `NODE_ENV`, say - and those are exactly the values a committed file
+/// cannot know and an operator has to pin locally.
 ///
-/// The block is top-level rather than a key on the app entry, because
-/// `AppConfig` refuses unknown fields: a `build` key inside `[[app]]` would
-/// make shep's own parser reject the entry. One block per Flockfile also
-/// matches what a release actually is - one checkout, built once - even
-/// when several sheep are deployed from the same repository.
+/// Not a key on the app entry, because `AppConfig` refuses unknown fields: a
+/// `build` key inside `[[app]]` would make shep's own parser reject the
+/// entry. One block per Flockfile also matches what a release actually is,
+/// one checkout built once, even when several sheep are deployed from the
+/// same repository.
+///
+/// Under `[dog.deploy.build]` rather than a top-level `[build]`, and that move is
+/// the whole reason this doc changed. shep's `RawFlockfile` denies unknown
+/// fields at the top level too, so a Flockfile carrying `[build]` could not
+/// be registered with shep at all: `shep start Flockfile.toml` answered
+/// "unknown field `build`, expected `$schema` or `app`". An operator
+/// following this crate's own README could not complete step one. shep
+/// gained a `dog` table for exactly this in 0.1.10, and this is the key that
+/// goes in it.
 ///
 /// # Errors
 /// As [`app_config`] for reading and merging the two files, plus
-/// [`Error::Config`] if the `[build]` block does not match
-/// [`BuildSpec`]'s schema - an unknown key, or a value of the wrong type.
+/// [`Error::Config`] if the block does not match [`BuildSpec`]'s schema - an
+/// unknown key, or a value of the wrong type - or if the Flockfile still
+/// carries a top-level `[build]`.
 pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error> {
     let merged = merged_document(release, shared)?;
-    let Some(build) = merged.as_table().and_then(|doc| doc.get("build")) else {
+    let doc = merged.as_table();
+
+    // Refused rather than ignored, because ignoring it builds nothing and says
+    // nothing: a release whose build never ran, swapped in and reported as
+    // deployed. The old spelling is in this crate's own published README, so
+    // whoever meets this message is following instructions that were right at
+    // the time.
+    if doc.is_some_and(|doc| doc.contains_key("build")) {
+        return Err(Error::Config(format!(
+            "{}: `[build]` moved to `[dog.deploy.build]`. shep refuses a Flockfile with a \
+             top-level `build` key, so the old spelling could not be registered with \
+             `shep start` at all; `[dog]` is the table shep keeps for a dog's own \
+             config. Rename the block.",
+            release.display()
+        )));
+    }
+
+    let Some(build) = doc
+        .and_then(|doc| doc.get("dog"))
+        .and_then(Value::as_table)
+        .and_then(|dogs| dogs.get("deploy"))
+        .and_then(Value::as_table)
+        .and_then(|deploy| deploy.get("build"))
+    else {
         return Ok(BuildSpec::default());
     };
 
     build.clone().try_into().map_err(|source: toml::de::Error| {
         Error::Config(format!(
-            "{}: `[build]` does not match the build schema: {source}",
+            "{}: `[dog.deploy.build]` does not match the build schema: {source}",
             release.display()
         ))
     })
@@ -596,7 +629,31 @@ mod tests {
         assert!(err.to_string().contains("ghost"));
     }
 
-    /// fails if a declared `[build]` block does not reach the build step.
+    /// fails if the old top-level `[build]` spelling is silently ignored.
+    ///
+    /// It has to be refused rather than skipped. Skipping it builds nothing
+    /// and says nothing: the release is swapped in unbuilt and reported as
+    /// deployed. And whoever meets this is following this crate's own
+    /// published README, which documented `[build]` while that spelling made
+    /// the Flockfile unregisterable with `shep start`.
+    #[test]
+    fn the_old_top_level_build_block_is_refused_by_name() {
+        let rel = fixtures::fixture_release(&[(
+            "Flockfile.toml",
+            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\n",
+        )]);
+
+        let err = build_spec(rel.path(), &[]).expect_err("the old spelling must be refused");
+
+        let text = format!("{err}");
+        assert!(
+            text.contains("[dog.deploy.build]"),
+            "must name the new home: {text}"
+        );
+        assert!(text.contains("shep start"), "must say why it moved: {text}");
+    }
+
+    /// fails if a declared `[dog.deploy.build]` block does not reach the build step.
     /// `env` and `artifacts` both matter to a real build - a pinned
     /// registry token, and a binary the release can't see the build
     /// producing - so a block that parsed its command and dropped either
@@ -605,7 +662,7 @@ mod tests {
     fn a_build_block_parses_into_a_spec() {
         let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
-            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\nenv = {              CARGO_TARGET_DIR = '/srv/cache' }\nartifacts = ['target/release/koji']\n",
+            "[[app]]\nname='web'\nscript='x'\n\n[dog.deploy.build]\ncommand = 'make build'\nenv = {              CARGO_TARGET_DIR = '/srv/cache' }\nartifacts = ['target/release/koji']\n",
         )]);
         let spec = build_spec(rel.path(), &[]).expect("parses");
         assert_eq!(spec.command.as_deref(), Some("make build"));
@@ -619,7 +676,7 @@ mod tests {
         );
     }
 
-    /// fails if a Flockfile with no `[build]` block becomes an error
+    /// fails if a Flockfile with no `[dog.deploy.build]` block becomes an error
     /// rather than the no-op spec. ReactMap run as `bun .` declares no
     /// build at all, which is one of the three worked examples this design
     /// has to cover.
@@ -642,11 +699,11 @@ mod tests {
         let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
-                "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\n",
+                "[[app]]\nname='web'\nscript='x'\n\n[dog.deploy.build]\ncommand = 'make build'\n",
             ),
             (
                 "Flockfile.override.toml",
-                "[build]\nenv = { CARGO_TARGET_DIR = '/srv/cache' }\n",
+                "[dog.deploy.build]\nenv = { CARGO_TARGET_DIR = '/srv/cache' }\n",
             ),
         ]);
         let spec = build_spec(rel.path(), &[]).expect("parses");
@@ -664,7 +721,7 @@ mod tests {
     fn an_unknown_build_key_is_refused() {
         let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
-            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommands = 'make build'\n",
+            "[[app]]\nname='web'\nscript='x'\n\n[dog.deploy.build]\ncommands = 'make build'\n",
         )]);
         let err = build_spec(rel.path(), &[]).expect_err("refuses");
         assert!(err.to_string().contains("commands"));

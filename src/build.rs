@@ -96,17 +96,17 @@ const BASE_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ"];
 /// declared script can execute, and what to salvage from wherever that run
 /// actually left its output.
 ///
-/// This is the `[build]` block of a release's own Flockfile, parsed by
+/// This is the `[dog.deploy.build]` block of a release's own Flockfile, parsed by
 /// [`crate::flockfile::build_spec`]:
 ///
 /// ```toml
-/// [build]
+/// [dog.deploy.build]
 /// command = "bun install && bun run build"
 /// env = { CARGO_TARGET_DIR = "/srv/cache/koji" }
 /// artifacts = ["target/release/koji"]
 /// ```
 ///
-/// Every field is optional and an absent `[build]` block is the default
+/// Every field is optional and an absent `[dog.deploy.build]` block is the default
 /// value of this struct, which [`run`] treats as a no-op. Unknown keys are
 /// refused rather than ignored, matching `shep_core`'s own `AppConfig`: a
 /// typo in a build block would otherwise mean a build that silently never
@@ -732,7 +732,7 @@ pub async fn run(
     // commit on the tracked branch.
     //
     // What survives is named in three places and nowhere else: BASE_ENV, the
-    // operator's `passthrough` list, and the release's own `[build] env`.
+    // operator's `passthrough` list, and the release's own `[dog.deploy.build] env`.
     child.env_clear();
     for (key, value) in BASE_ENV
         .iter()

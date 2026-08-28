@@ -25,6 +25,31 @@ shep adopt shep-deploy
 `shep adopt` registers it with the shepherd, which supervises it from then on.
 `shep dogs` lists what you have adopted.
 
+## Telling it how to build
+
+The build command lives in the deployed repository's own Flockfile, under the
+table shep keeps for a dog's config:
+
+```toml
+[[app]]
+name = "web"
+script = "server.js"
+
+[dog.deploy.build]
+command = "npm ci && npm run build"
+artifacts = ["dist/bundle.js"]
+```
+
+shep reads nothing under `dog` and validates none of it. It only had to stop
+refusing the document for carrying it, which it does as of 0.1.10, so the same
+Flockfile now registers with `shep start` and tells this dog how to build.
+
+That is a change from earlier versions, which put the block at the top level as
+`[build]`. shep refused a Flockfile with an unknown top-level key, so an
+operator following these instructions could not register their app at all. A
+top-level `[build]` is now refused here by name, pointing at the new spelling,
+rather than ignored and silently building nothing.
+
 ## What one deploy does
 
 1. Fetch into a bare clone, and compare the branch head to the last deployed
@@ -285,11 +310,11 @@ operator's, not a deploy dog's.
 
 A build starts from a cleared environment, not this process's. It gets `PATH`,
 `HOME`, `LANG`, `LC_ALL` and `TZ`, whatever `passthrough` names in
-`[dog.deploy]`, and the release's own `[build] env`. Nothing else. Dropping uid
-and gid bounds what a build can touch; it does nothing about what it can read
-out of its own environment, because those values are copied in before the drop
-happens. A dog started with a registry token in its environment would otherwise
-hand it to every build it runs.
+`[dog.deploy]` in `shep.toml`, and the release's own `[dog.deploy.build] env`.
+Nothing else. Dropping uid and gid bounds what a build can touch; it does
+nothing about what it can read out of its own environment, because those values
+are copied in before the drop happens. A dog started with a registry token in
+its environment would otherwise hand it to every build it runs.
 
 `SSH_AUTH_SOCK` is not in that base set, on purpose. A forwarded agent reaching
 a build lets the build authenticate as you anywhere that agent is trusted.
@@ -302,8 +327,8 @@ the dog's own build cache, resolved rather than spelled. A `..`, an absolute
 path, a committed symlink, or a `CARGO_TARGET_DIR` pointing elsewhere are all
 refused. That is narrower than it was: a build whose output genuinely lands
 outside both is no longer copyable, because the copy runs in the dog's own
-process at its own uid, and the `[build]` block naming the path comes from the
-deployed repository rather than from you.
+process at its own uid, and the `[dog.deploy.build]` block naming the path
+comes from the deployed repository rather than from you.
 
 **What the allowlist does not cover, and cannot.** Your project's own secrets
 are not in the dog's environment, they are in your repository's working tree. A

@@ -2361,7 +2361,7 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         fs::write(
             fixture.origin.path().join("Flockfile.toml"),
-            format!("{FLOCKFILE}\n[build]\ncommand = 'exit 3'\n"),
+            format!("{FLOCKFILE}\n[dog.deploy.build]\ncommand = 'exit 3'\n"),
         )
         .expect("write Flockfile");
         commit_on_origin(&fixture, "second.txt");
@@ -3021,7 +3021,9 @@ mod tests {
         let previous = fixture.state.deployed.clone().expect("a previous release");
         fs::write(
             fixture.origin.path().join("Flockfile.toml"),
-            format!("{FLOCKFILE}\n[build]\ncommand = 'ln -sfn \"$PWD\" ../../current'\n"),
+            format!(
+                "{FLOCKFILE}\n[dog.deploy.build]\ncommand = 'ln -sfn \"$PWD\" ../../current'\n"
+            ),
         )
         .expect("write Flockfile");
         commit_on_origin(&fixture, "second.txt");
