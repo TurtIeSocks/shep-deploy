@@ -12,7 +12,12 @@
 #                       already defaulting to true; what is new is
 #                       release-plz-changelog.toml, which skips docs, test,
 #                       ci, chore and style commits so a generated section
-#                       stays short and reads like a hand-written one.
+#                       stays short and reads like a hand-written one. Two
+#                       survive those skips on purpose: release-plz's own
+#                       `chore: update Cargo.toml dependencies`, parsed before
+#                       the generic chore skip and grouped under Internal, and
+#                       anything marked breaking, which
+#                       `protect_breaking_commits` keeps regardless.
 #   semver_check        unset -> true. cargo-semver-checks against the
 #                       published version, so an accidental breaking change
 #                       fails the release PR rather than shipping in a patch.
