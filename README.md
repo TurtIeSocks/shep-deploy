@@ -208,19 +208,32 @@ seconds later. A release that starts, stays up and serves nothing passes that.
 Every deploy after the first is verified against a new process reaching
 `Online`.
 
-**That is weaker than it sounds today, and the gap is shep's rather than this
-crate's.** Measured 2026-08-28 against a real shepherd: a sheep with an HTTP
-`readiness_probe` that never passes is marked `Online` by shep about a second
-into a reload, well inside its `listen_timeout`, and stays there. `shep reload`
-on its own does it too, with no deploy dog involved, and exits 0. So a release
-that starts and never becomes ready is verified, recorded as deployed, and not
-rolled back, and the app is down while the record says otherwise. Reproduced
-with the probe still registered and confirmed present in shep's own snapshot.
+**That used to be weaker than it sounds, and the gap was shep's rather than
+this crate's.** Measured 2026-08-28 against a real shepherd: a sheep with an
+HTTP `readiness_probe` that never passes was marked `Online` about a second
+into a reload, well inside its `listen_timeout`, and stayed there. The cause
+was the reload's overlap. Both instances were up when the replacement's first
+probe landed, the outgoing one answered it, and shep took that as the incoming
+one proving itself. A release that started and never became ready was verified,
+recorded as deployed, and not rolled back, with the app down while the record
+said otherwise.
 
-Until shep gates a reload's replacement on the probe, treat `verify = "probed"`
-as "a new process started and stayed up", which is what `verify = "alive"`
-already promises. Rollback still works for a release that CRASHES; it is
-readiness specifically that is not caught.
+shep fixed it the same day. A probed app is now reloaded serially: the old
+instance drains first, so the only process that can answer the replacement's
+probe is the replacement. An app that sets `reuse_port` keeps the overlap it
+asks for and gets a second probe once the drained instance is gone. Either way
+a replacement that never answers is left `starting` rather than `online`, which
+is what this crate reads, so `verify = "probed"` now means what it says.
+
+One thing to size correctly. A `reuse_port` app's reload costs one more
+`listen_timeout` than it used to, for that second probe, and the budget in
+`deploy.rs` is `listen_timeout + graceful_timeout + slack` per instance. For
+that one combination the budget can expire mid-check and roll back a release
+that was fine. A false rollback rather than a false success, which is the right
+direction to fail, but it wants a wider budget.
+
+Rollback works for a release that crashes and for one that starts without
+serving. Both are caught.
 
 ## Removing it
 
