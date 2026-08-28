@@ -449,7 +449,19 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
             // gitignored file of the same name met an `AlreadyExists` and a
             // refusal telling the operator to add it to `.shepignore`, blaming
             // their repository for a collision with the dog's own bookkeeping.
+            //
+            // Said out loud rather than dropped quietly. Round 12 of the
+            // founder's review made the point against the first version of
+            // this: the old behaviour was wrong but LOUD, and replacing it
+            // with a silent drop takes an operator's file out of every release
+            // with nothing anywhere saying so. A file this name is real and
+            // rare enough to be worth one line.
             if path == Path::new(crate::deploy::COMPLETE) {
+                eprintln!(
+                    "shep-deploy: not sharing `{}` from the checkout: that name is the dog's own \
+                     inside a release, and the release's copy wins",
+                    path.display()
+                );
                 return false;
             }
 
