@@ -49,6 +49,7 @@ use shep_client::shep_core::protocol::ProcessInfo;
 use tokio::time::{Instant, sleep};
 
 use crate::build;
+use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::deploy::RELOAD_DEADLINE_SLACK;
 use crate::error::Error;
@@ -111,6 +112,7 @@ pub async fn prepare<D: Daemon>(
     daemon: &D,
     shep_home: &Path,
     sheep: &str,
+    config: &DogConfig,
 ) -> Result<Prepared, Error> {
     let tree = Tree::for_sheep(shep_home, sheep);
     if tree.state_file().is_file() {
@@ -213,7 +215,7 @@ pub async fn prepare<D: Daemon>(
         source,
     })?;
     git::init_bare(&tree.git())?;
-    git::fetch(&tree.git(), &state.remote)?;
+    git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
     let sha = git::remote_head(&tree.git(), &state.branch)?;
 
     let release = tree.release(&sha);
@@ -227,7 +229,14 @@ pub async fn prepare<D: Daemon>(
 
     let app = flockfile::app_config(&release, sheep)?;
     let spec = flockfile::build_spec(&release)?;
-    build::run(sheep, &release, &spec, app.user.as_deref()).await?;
+    build::run(
+        sheep,
+        &release,
+        &spec,
+        app.user.as_deref(),
+        &config.passthrough,
+    )
+    .await?;
 
     // `current` now points through a real release carrying the operator's
     // shared files - the whole deliverable of part one. `state.write` comes
@@ -662,6 +671,16 @@ async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -
 
 #[cfg(test)]
 mod tests {
+    /// The config every test that is not about a config value runs on.
+    fn test_config() -> crate::config::DogConfig {
+        crate::config::DogConfig {
+            interval: std::time::Duration::from_secs(30),
+            retention: 5,
+            git_timeout: std::time::Duration::from_secs(60),
+            passthrough: Vec::new(),
+        }
+    }
+
     // For `Error::source` on the variant the quiet-shepherd path returns.
     use core::error::Error as _;
     use std::cell::{Cell, RefCell};
@@ -819,7 +838,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
         let shown = err.to_string();
@@ -839,7 +858,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm")
+        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect("prepares");
 
@@ -861,7 +880,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm")
+        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect("prepares");
         assert_eq!(prepared.state.branch, "stable");
@@ -879,7 +898,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm")
+        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect("prepares");
 
@@ -905,7 +924,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
         assert!(err.to_string().contains("detached"), "{err}");
@@ -1235,7 +1254,9 @@ mod tests {
         let checkout = checkout_with_commit();
         let entries = [("bpm", checkout.path())];
         let roll = RollOf(&entries);
-        let prepared = prepare(&roll, home.path(), "bpm").await.expect("prepares");
+        let prepared = prepare(&roll, home.path(), "bpm", &test_config())
+            .await
+            .expect("prepares");
 
         (
             CutOverDouble::new(originals, script, refuses),
@@ -1652,7 +1673,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
 
@@ -1688,7 +1709,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
 

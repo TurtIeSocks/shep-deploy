@@ -16,7 +16,9 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
 
@@ -37,6 +39,85 @@ use crate::error::Error;
 /// `dir`. A `git` invocation that launches but exits non-zero is
 /// [`Error::Git`] instead, since `git`'s own stderr is worth keeping
 /// separate from "could not even run it".
+/// [`run_git`], abandoning the subprocess if it outlives `budget`.
+///
+/// Only [`crate::git::fetch`] uses this, and only because it is the one git
+/// invocation that talks to a network. The other ten callers operate on local
+/// directories and cannot hang on a remote that stopped answering.
+///
+/// Why it matters more than an ordinary slow call: the poll loop deploys
+/// targets one at a time, so an unbounded fetch does not fail one target, it
+/// stops every target and the smit refresh with it, with no error and no log
+/// line. A remote behind a firewall that drops packets rather than refusing
+/// them produces exactly that, and it is an ordinary misconfiguration.
+///
+/// The child is killed on expiry rather than left to finish, because a git
+/// process still holding the bare clone's lock would fail the next tick too.
+///
+/// Residual, stated rather than hidden: this still occupies the caller for up
+/// to `budget`. The runtime is single-threaded, so a target whose remote is a
+/// black hole delays the others by that much. Bounded and reported beats
+/// unbounded and silent, which is the whole of what this buys.
+///
+/// # Errors
+/// [`Error::Git`] naming the command and a `None` status if `budget` elapses
+/// first. Otherwise exactly what [`run_git`] returns.
+pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Result<String, Error> {
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| Error::Io {
+            path: dir.to_owned(),
+            source,
+        })?;
+
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Err(source) => {
+                let _ = child.kill();
+                return Err(Error::Io {
+                    path: dir.to_owned(),
+                    source,
+                });
+            }
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+        }
+        if Instant::now() >= deadline {
+            // Killed, then reaped: leaving it would keep the bare clone's
+            // lock and fail the next tick for a reason that looks unrelated.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::Git {
+                command: format!("git {}", args.join(" ")),
+                status: None,
+                stderr: format!(
+                    "no answer within {}s; abandoned so the other targets keep deploying",
+                    budget.as_secs()
+                ),
+            });
+        }
+        thread::sleep(POLL);
+    }
+
+    let output = child.wait_with_output().map_err(|source| Error::Io {
+        path: dir.to_owned(),
+        source,
+    })?;
+    decode(dir, args, &output)
+}
+
+/// How often [`run_git_within`] asks whether the child has finished.
+///
+/// Fifty milliseconds: short enough that a fetch finishing is not perceptibly
+/// delayed, long enough that a five-minute budget costs six thousand cheap
+/// syscalls rather than a busy loop.
+const POLL: Duration = Duration::from_millis(50);
+
 pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
     let output = Command::new("git")
         .current_dir(dir)
@@ -47,6 +128,16 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
             source,
         })?;
 
+    decode(dir, args, &output)
+}
+
+/// Turns a finished `git` invocation into stdout or the error it earned.
+///
+/// Shared by [`run_git`] and [`run_git_within`] rather than duplicated: the
+/// two differ only in how they wait for the child, and a second copy of this
+/// is how the bounded path would drift into reporting failures differently
+/// from the unbounded one.
+fn decode(dir: &Path, args: &[&str], output: &std::process::Output) -> Result<String, Error> {
     if !output.status.success() {
         return Err(Error::Git {
             command: format!("git {}", args.join(" ")),
@@ -55,7 +146,7 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
         });
     }
 
-    String::from_utf8(output.stdout).map_err(|err| Error::Io {
+    String::from_utf8(output.stdout.clone()).map_err(|err| Error::Io {
         path: dir.to_owned(),
         source: io::Error::other(err),
     })
@@ -310,6 +401,40 @@ pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a git subprocess can outlive its budget.
+    ///
+    /// Without the bound this hangs forever rather than failing, which is the
+    /// whole point: the poll loop deploys targets one at a time, so an
+    /// unanswered fetch stops every target with no error and no log line.
+    ///
+    /// `10.255.255.1` is RFC 1918 space that routes nowhere on an ordinary
+    /// host, so the connect blocks rather than being refused. Measured before
+    /// this test was written: the same fetch was still blocked after three
+    /// seconds. A refusal would make this test pass for the wrong reason, so
+    /// it asserts on the timeout's own message rather than merely on `Err`.
+    #[test]
+    fn a_git_subprocess_that_never_answers_is_abandoned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_git(dir.path(), &["init", "-q"]).expect("init");
+
+        let err = run_git_within(
+            dir.path(),
+            &[
+                "fetch",
+                "git://10.255.255.1/x",
+                "+refs/heads/*:refs/heads/*",
+            ],
+            Duration::from_millis(400),
+        )
+        .expect_err("an unanswered fetch must not hang");
+
+        let said = format!("{err}");
+        assert!(
+            said.contains("no answer within"),
+            "must fail on the budget, not on something else: {said}"
+        );
+    }
+
     use super::*;
     use std::sync::Mutex;
     use tempfile::TempDir;

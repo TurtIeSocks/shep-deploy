@@ -211,7 +211,7 @@ async fn poll_forever() -> Result<u8, Error> {
     let config = config::read(&daemon).await?;
 
     tokio::select! {
-        result = poll::run(&daemon, &home, config) => result.map(|()| 0),
+        result = poll::run(&daemon, &home, &config) => result.map(|()| 0),
         () = stop.arrives() => {
             println!("shep-deploy: stopping");
             Ok(0)
@@ -340,8 +340,8 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
     let client = Client::connect(&socket()?).await?;
     let daemon = Live::new(client);
 
-    let keep = config::read(&daemon).await?.retention;
-    let outcome = deploy::deploy(&daemon, &tree, &mut state, keep).await?;
+    let config = config::read(&daemon).await?;
+    let outcome = deploy::deploy(&daemon, &tree, &mut state, &config).await?;
     match &outcome {
         Outcome::UpToDate => println!("{sheep} is up to date at {}", deployed(&state)),
         Outcome::Deployed { sha } => println!("{sheep} deployed {sha}"),
@@ -368,7 +368,8 @@ async fn setup_once(sheep: &str) -> Result<u8, Error> {
     let client = Client::connect(&socket()?).await?;
     let daemon = Live::new(client);
 
-    let prepared = optin::prepare(&daemon, &shep_home()?, sheep).await?;
+    let config = config::read(&daemon).await?;
+    let prepared = optin::prepare(&daemon, &shep_home()?, sheep, &config).await?;
     // Read before `cut_over` consumes `prepared`.
     let current = prepared.tree.current();
 

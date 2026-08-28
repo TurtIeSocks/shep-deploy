@@ -47,9 +47,10 @@
 
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::Error;
-use crate::shared::run_git;
+use crate::shared::{run_git, run_git_within};
 
 /// Converts `path` to `&str` for an argument `git` needs to see, refusing a
 /// path this process cannot represent as one rather than lossily mangling
@@ -176,10 +177,11 @@ pub fn current_branch(checkout: &Path) -> Result<String, Error> {
 /// # Errors
 /// [`Error::Git`] if `remote` cannot be reached or refuses the fetch.
 /// [`Error::Io`] if `git` itself cannot be launched.
-pub fn fetch(git_dir: &Path, remote: &str) -> Result<(), Error> {
-    run_git(
+pub fn fetch(git_dir: &Path, remote: &str, budget: Duration) -> Result<(), Error> {
+    run_git_within(
         git_dir,
         &["fetch", "--prune", remote, "+refs/heads/*:refs/heads/*"],
+        budget,
     )
     .map(|_| ())
 }
@@ -255,6 +257,12 @@ pub fn worktree_prune(git_dir: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// A budget the test tier can never legitimately hit.
+    ///
+    /// These fetches are between two local directories, so anything slower
+    /// than this is a hang worth failing on rather than waiting out.
+    const TEST_BUDGET: Duration = Duration::from_secs(60);
+
     use super::*;
     use std::fs;
     use std::process::Command;
@@ -368,7 +376,12 @@ mod tests {
         let origin = fixture_repo_with_commits(1);
         let git_dir = bare_git_dir();
 
-        fetch(git_dir.path(), origin.path().to_str().expect("utf-8 path")).expect("fetches");
+        fetch(
+            git_dir.path(),
+            origin.path().to_str().expect("utf-8 path"),
+            TEST_BUDGET,
+        )
+        .expect("fetches");
 
         let expected = origin.path();
         let sha = String::from_utf8(
@@ -397,14 +410,14 @@ mod tests {
         let git_dir = bare_git_dir();
         let url = origin.path().to_str().expect("utf-8 path");
 
-        fetch(git_dir.path(), url).expect("first fetch");
+        fetch(git_dir.path(), url, TEST_BUDGET).expect("first fetch");
         let first = remote_head(git_dir.path(), "main").expect("resolves after first fetch");
 
         fs::write(origin.path().join("second.txt"), "y").expect("write second commit's file");
         run(origin.path(), &["add", "."]);
         run(origin.path(), &["commit", "-q", "-m", "second"]);
 
-        fetch(git_dir.path(), url).expect("second fetch");
+        fetch(git_dir.path(), url, TEST_BUDGET).expect("second fetch");
         let second = remote_head(git_dir.path(), "main").expect("resolves after second fetch");
 
         assert_ne!(first, second);
@@ -425,11 +438,11 @@ mod tests {
         let git_dir = bare_git_dir();
         let url = origin.path().to_str().expect("utf-8 path");
 
-        fetch(git_dir.path(), url).expect("first fetch sees feature");
+        fetch(git_dir.path(), url, TEST_BUDGET).expect("first fetch sees feature");
         remote_head(git_dir.path(), "feature").expect("feature resolves before deletion");
 
         run(origin.path(), &["branch", "-D", "feature"]);
-        fetch(git_dir.path(), url).expect("second fetch prunes feature");
+        fetch(git_dir.path(), url, TEST_BUDGET).expect("second fetch prunes feature");
 
         let err =
             remote_head(git_dir.path(), "feature").expect_err("a deleted branch must not resolve");
@@ -443,7 +456,12 @@ mod tests {
     fn remote_head_refuses_an_unknown_branch() {
         let origin = fixture_repo_with_commits(1);
         let git_dir = bare_git_dir();
-        fetch(git_dir.path(), origin.path().to_str().expect("utf-8 path")).expect("fetches");
+        fetch(
+            git_dir.path(),
+            origin.path().to_str().expect("utf-8 path"),
+            TEST_BUDGET,
+        )
+        .expect("fetches");
 
         let err = remote_head(git_dir.path(), "no-such-branch").expect_err("no such branch");
         assert!(matches!(err, Error::Git { .. }));

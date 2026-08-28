@@ -131,6 +131,9 @@ fn sha_of(release: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A budget the test tier can never legitimately hit; see `git`'s own.
+    const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
     use super::*;
     use std::process::Command;
     use std::time::Duration;
@@ -186,7 +189,7 @@ mod tests {
         fs::create_dir_all(tree.git()).expect("create git dir");
         run(&tree.git(), &["init", "-q", "--bare"]);
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
-        git::fetch(&tree.git(), &remote).expect("fetch");
+        git::fetch(&tree.git(), &remote, TEST_BUDGET).expect("fetch");
 
         let log = Command::new("git")
             .current_dir(tree.git())

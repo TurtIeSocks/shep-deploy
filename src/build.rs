@@ -60,6 +60,7 @@
 //!   cannot see, including one an operator points elsewhere themselves.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,24 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::error::Error;
+
+/// The environment variables a build keeps from this process, by name.
+///
+/// Deliberately tiny. `sh -c` needs `PATH` to find anything; a toolchain
+/// manager needs `HOME` to find its own installation; `LANG` and `LC_ALL`
+/// keep a build's own output readable, and `TZ` keeps a timestamp in a
+/// generated artifact from moving with the machine's default. Everything
+/// else an operator wants is opted into by name through `passthrough` in
+/// `[dog.deploy]`, so it appears in `shep.toml` where it can be read rather
+/// than being inherited invisibly.
+///
+/// Notably absent and absent on purpose: `SSH_AUTH_SOCK`. A forwarded agent
+/// reaching a build means the build can authenticate as the operator
+/// anywhere that agent is trusted. `crate::git::fetch` runs in THIS process
+/// and keeps its own environment, so a private repository still clones; it
+/// is only the build that loses the socket, and an operator who genuinely
+/// needs it during a build can name it in `passthrough`.
+const BASE_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ"];
 
 /// What to run to turn a freshly checked-out release into something its
 /// declared script can execute, and what to salvage from wherever that run
@@ -480,6 +499,7 @@ pub async fn run(
     release: &Path,
     spec: &BuildSpec,
     as_user: Option<&str>,
+    passthrough: &[String],
 ) -> Result<(), Error> {
     let Some(command) = spec.command.as_deref() else {
         return Ok(());
@@ -495,6 +515,29 @@ pub async fn run(
     let mut child = Command::new("sh");
     child.arg("-c").arg(command);
     child.current_dir(release);
+
+    // Cleared, then rebuilt deliberately. Dropping uid and gid below bounds
+    // what the build can TOUCH; it does nothing about what it can READ out of
+    // its own environment, because those values are copied into the child
+    // before any of it happens. A dog started with a registry token or a
+    // forwarded agent socket in its environment would hand both to every
+    // build it runs, and a build command is chosen by whoever can land a
+    // commit on the tracked branch.
+    //
+    // What survives is named in three places and nowhere else: BASE_ENV, the
+    // operator's `passthrough` list, and the release's own `[build] env`.
+    child.env_clear();
+    for (key, value) in BASE_ENV
+        .iter()
+        .filter_map(|k| Some((*k, env::var(k).ok()?)))
+    {
+        child.env(key, value);
+    }
+    for key in passthrough {
+        if let Ok(value) = env::var(key) {
+            child.env(key, value);
+        }
+    }
     child.envs(&spec.env);
 
     if let Some(user) = as_user {
@@ -656,7 +699,7 @@ mod tests {
             command: Some("exit 3".into()),
             ..Default::default()
         };
-        assert!(run("web", rel.path(), &spec, None).await.is_err());
+        assert!(run("web", rel.path(), &spec, None, &[]).await.is_err());
     }
 
     /// fails if an absent build command is an error rather than a no-op.
@@ -666,7 +709,7 @@ mod tests {
     async fn an_absent_build_command_is_not_an_error() {
         let rel = fixture_release(&[]);
         let spec = BuildSpec::default();
-        assert!(run("web", rel.path(), &spec, None).await.is_ok());
+        assert!(run("web", rel.path(), &spec, None, &[]).await.is_ok());
     }
 
     /// fails if declared artifacts are not copied into the release. With
@@ -688,8 +731,76 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/koji")],
         };
-        run("web", rel.path(), &spec, None).await.expect("builds");
+        run("web", rel.path(), &spec, None, &[])
+            .await
+            .expect("builds");
         assert!(rel.path().join("target/release/koji").exists());
+    }
+
+    /// fails if the dog's own environment leaks into a build unasked.
+    ///
+    /// Dropping uid and gid bounds what a build can TOUCH. It does nothing
+    /// about what the build can READ out of its environment, because those
+    /// values are copied into the child before the drop happens. A dog
+    /// started with a registry token in its environment would hand it to
+    /// every build, and the build command is chosen by whoever can land a
+    /// commit on the tracked branch.
+    ///
+    /// `CARGO_PKG_NAME` is the probe because cargo sets it for the test
+    /// process itself, so it is genuinely present in this process's
+    /// environment and genuinely absent from `BASE_ENV`. Setting one here
+    /// instead is not available: `std::env::set_var` is unsafe in edition
+    /// 2024 and this crate forbids unsafe outright.
+    #[tokio::test]
+    async fn the_dogs_own_environment_does_not_reach_a_build() {
+        assert!(
+            std::env::var("CARGO_PKG_NAME").is_ok(),
+            "the probe variable must exist in this process or the test proves nothing"
+        );
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("printenv CARGO_PKG_NAME > leaked.txt; true".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![],
+        };
+        run("web", rel.path(), &spec, None, &[])
+            .await
+            .expect("builds");
+        let leaked = std::fs::read_to_string(rel.path().join("leaked.txt")).unwrap_or_default();
+        assert!(
+            leaked.trim().is_empty(),
+            "the build saw CARGO_PKG_NAME = {leaked:?}, so the environment was inherited"
+        );
+    }
+
+    /// fails if `passthrough` stops being the way a build gets a variable.
+    ///
+    /// The counterpart to the test above: the bound is only usable if there
+    /// is a way through it, and that way has to be named in `shep.toml` so
+    /// the exposure is readable rather than inherited.
+    #[tokio::test]
+    async fn a_named_passthrough_variable_reaches_the_build() {
+        let rel = fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("printenv CARGO_PKG_NAME > passed.txt; true".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![],
+        };
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &["CARGO_PKG_NAME".to_owned()],
+        )
+        .await
+        .expect("builds");
+        assert_eq!(
+            std::fs::read_to_string(rel.path().join("passed.txt"))
+                .expect("the build wrote it")
+                .trim(),
+            "shep-deploy"
+        );
     }
 
     /// fails if a `..` in a declared artifact can reach outside the release.
@@ -729,7 +840,7 @@ mod tests {
             artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
         };
 
-        let err = run("web", &release, &spec, None)
+        let err = run("web", &release, &spec, None, &[])
             .await
             .expect_err("an escaping artifact must be refused");
         assert!(
@@ -810,7 +921,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
-        assert!(run("web", rel.path(), &spec, None).await.is_ok());
+        assert!(run("web", rel.path(), &spec, None, &[]).await.is_ok());
     }
 
     /// fails if `as_user` is silently ignored on the accept side of the
@@ -828,7 +939,7 @@ mod tests {
             ..Default::default()
         };
         let user = current_username();
-        run("web", rel.path(), &spec, Some(&user))
+        run("web", rel.path(), &spec, Some(&user), &[])
             .await
             .expect("dropping to one's own user and group is always permitted");
     }
@@ -862,6 +973,7 @@ mod tests {
             rel.path(),
             &spec,
             Some("shep-deploy-test-no-such-user"),
+            &[],
         )
         .await
         .expect_err("no such user");
@@ -934,7 +1046,9 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run("web", rel.path(), &spec, None).await.expect("builds");
+        run("web", rel.path(), &spec, None, &[])
+            .await
+            .expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
     }
