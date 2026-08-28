@@ -156,6 +156,17 @@ impl Tree {
         self.root.join("current")
     }
 
+    /// The file a deploy takes an exclusive `flock` on, so only one process
+    /// at a time works on this tree.
+    ///
+    /// Its own file rather than the record or the root: `flock` is held for
+    /// the life of an open handle, and taking it on `deploy.toml` would tie
+    /// the lock's lifetime to a file the deploy rewrites underneath itself.
+    #[must_use]
+    pub fn lock_file(&self) -> PathBuf {
+        self.root.join("deploy.lock")
+    }
+
     /// Where this sheep's [`crate::state::State`] lives.
     #[must_use]
     pub fn state_file(&self) -> PathBuf {

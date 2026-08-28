@@ -65,6 +65,7 @@ use shep_client::shep_core::config::AppConfig;
 use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::error::Error;
+use crate::lock;
 use crate::paths::Tree;
 use crate::state::{State, Verify, Watch};
 use crate::verify::Generation;
@@ -296,6 +297,14 @@ async fn go<D: Daemon>(
     held: Held,
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
+
+    // Held for the whole of this function, and dropped with it. Everything
+    // below writes to the tree, and the poll loop's no-overlap guarantee
+    // covers one tick against another IN THIS PROCESS and nothing else: the
+    // README tells an operator to run `shep-deploy deploy <sheep>` by hand
+    // while the dog is polling. See `crate::lock` for what that collision
+    // actually did.
+    let _deploying = lock::hold(tree)?;
 
     // The one state where a deploy is not merely wrong but silently
     // convincing, and the reason it is refused in code rather than in prose.
@@ -1708,6 +1717,35 @@ mod tests {
 
         let written = State::read(&fixture.tree.state_file()).expect("deploy.toml was written");
         assert_eq!(written.deployed.as_deref(), Some(second.as_str()));
+    }
+
+    /// fails if two processes can deploy one sheep at once.
+    ///
+    /// The poll loop's no-overlap guarantee is one `for` loop in one process.
+    /// README.md tells an operator to run `shep-deploy deploy <sheep>` by hand
+    /// to retry a held commit, and the dog is polling the whole time, so two
+    /// processes on one tree is a documented workflow rather than a corner
+    /// case. Round 10 reproduced both of them losing to git's own index lock
+    /// and the loser then recording a failure for the sha the winner deployed.
+    ///
+    /// The hold here stands in for that other process.
+    #[tokio::test]
+    async fn a_deploy_is_refused_while_another_process_holds_the_tree() {
+        let mut fixture = fixture_with_previous_release();
+        commit_on_origin(&fixture, "second.txt");
+        let daemon = Shepherd::ready();
+        let held = crate::lock::hold(&fixture.tree).expect("the other process");
+
+        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
+            .await
+            .expect_err("must refuse while the tree is held");
+
+        assert!(
+            matches!(&err, Error::AlreadyDeploying { sheep } if sheep == "web"),
+            "must name the sheep rather than fail somewhere inside git: {err:?}"
+        );
+        assert_eq!(daemon.reload_count(), 0, "nothing may have been attempted");
+        drop(held);
     }
 
     /// fails if a straggler process can mark a sha failed that another

@@ -51,6 +51,7 @@ mod error;
 mod fixtures;
 mod flockfile;
 mod git;
+mod lock;
 mod optin;
 mod paths;
 mod poll;

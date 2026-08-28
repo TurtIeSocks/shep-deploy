@@ -11,6 +11,10 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 shep-client = "0.1.4"
+# Already in the tree: shep-core depends on it, so this is a direct edge on
+# something every build of this crate already compiles. Only `fs` is wanted,
+# for `flock(2)`.
+nix = { version = "0.29", default-features = false, features = ["fs"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "process", "signal"] }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

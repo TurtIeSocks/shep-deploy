@@ -300,6 +300,11 @@ pub enum Error {
         /// signal instead of exiting.
         status: Option<i32>,
     },
+    /// Another process is already deploying this sheep.
+    AlreadyDeploying {
+        /// The sheep whose tree is held.
+        sheep: String,
+    },
     /// The build ran longer than `build_timeout` and was abandoned.
     ///
     /// Distinct from [`Self::Build`] because the two need different words. A
@@ -511,6 +516,12 @@ impl fmt::Display for Error {
                     removes.join(", ")
                 )
             }
+            Self::AlreadyDeploying { sheep } => write!(
+                f,
+                "another deploy of {sheep} is already running; this one did nothing. \
+                 The dog polls on its own, so a deploy started by hand while a tick \
+                 is in flight meets this"
+            ),
             Self::BuildTimedOut { after } => write!(
                 f,
                 "the build did not finish within {after:?} and was abandoned; raise \
@@ -544,6 +555,7 @@ impl core::error::Error for Error {
             | Self::Git { .. }
             | Self::Raced { .. }
             | Self::BuildTimedOut { .. }
+            | Self::AlreadyDeploying { .. }
             | Self::Unverified { .. }
             | Self::Stranded { .. }
             | Self::Build { .. } => None,

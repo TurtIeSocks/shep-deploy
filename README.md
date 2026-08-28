@@ -124,6 +124,13 @@ A tick never begins while the previous one is still running, so a push landing
 during a build is deployed on the next tick rather than aborting the build in
 flight.
 
+Nor does a second process. Each deploy takes an exclusive `flock` on its own
+tree for as long as it runs, so `shep-deploy deploy web` typed while the dog is
+mid-tick on `web` is refused in one sentence rather than colliding somewhere
+inside git. The lock is per sheep, so other targets are unaffected, and the
+kernel releases it if the holder dies, so a killed dog leaves nothing behind
+holding a sheep hostage.
+
 Every tick also paints each target's smit, so `shep flock` shows which branch
 and sha it is on without a second command:
 

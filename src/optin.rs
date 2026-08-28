@@ -55,6 +55,7 @@ use crate::deploy::RELOAD_DEADLINE_SLACK;
 use crate::error::Error;
 use crate::flockfile;
 use crate::git;
+use crate::lock;
 use crate::paths::Tree;
 use crate::roll;
 use crate::shared;
@@ -209,6 +210,11 @@ pub async fn prepare<D: Daemon>(
         origin_script: Some(previous_config.script.clone()),
         checkout,
     };
+
+    // Same hold a deploy takes, for the same reason: everything below writes
+    // to this tree, and a poll tick can be doing the same at the same moment.
+    // After the directory exists, because that is what the lock file lives in.
+    let _deploying = lock::hold(&tree)?;
 
     std::fs::create_dir_all(tree.releases()).map_err(|source| Error::Io {
         path: tree.releases(),
