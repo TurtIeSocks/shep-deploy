@@ -28,6 +28,7 @@ So the local loop is one of these, not the shep-workspace habit of
 ```bash
 cargo test
 ```
+
 ```bash
 SHEP_BIN="$(command -v shep)" cargo test --all-features
 ```
@@ -47,12 +48,15 @@ a pipeline's `$?` is the last command's, so `cargo test ... | tail` reports
 ```bash
 cargo fmt --all --check
 ```
+
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
 ```bash
 SHEP_BIN="$(command -v shep)" cargo test --all-features
 ```
+
 ```bash
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
