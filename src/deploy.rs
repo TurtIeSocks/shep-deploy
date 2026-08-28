@@ -556,15 +556,55 @@ fn record(
     let failed = (!landed).then(|| head.to_owned());
 
     if state.failed != failed {
-        state.failed = failed;
-        if let Err(err) = state.write(&tree.state_file()) {
-            eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
+        // Re-read before writing, because this process may not be the only
+        // one deploying this sheep. `state` here is whatever THIS process
+        // read at its own start, and `State::write` replaces the whole
+        // record, so writing it blind is last-writer-wins over a record
+        // somebody else may have advanced since.
+        match landed_elsewhere(tree, head, failed.as_deref()) {
+            Some(fresher) => *state = fresher,
+            None => {
+                state.failed = failed;
+                if let Err(err) = state.write(&tree.state_file()) {
+                    eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
+                }
+            }
         }
     }
 
     if let Err(err) = retention::prune(tree, keep) {
         eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
     }
+}
+
+/// The on-disk record, when it already says `head` is deployed and this
+/// attempt is about to say `head` failed.
+///
+/// The poll loop guarantees one tick never overlaps another IN THIS PROCESS.
+/// It says nothing about a second process, and README.md tells an operator to
+/// start one: `shep-deploy deploy <sheep>` is the documented way to retry a
+/// held commit. Run while the dog's own tick is deploying the same sha, both
+/// processes read `deploy.toml` at their own start and write it back whole.
+///
+/// Round 10 of the founder's review reproduced where that lands. The straggler
+/// loses its checkout to git's own index lock, fails, and writes its record:
+/// `deployed` reverts to the sha it read at startup and `failed` names the sha
+/// that is actually running. `go` then refuses to retry that sha forever,
+/// because `state.failed` matching the branch head is exactly the hold
+/// condition, so auto-deploy stops until somebody notices.
+///
+/// Adopting the fresher record rather than refusing to write is what makes the
+/// in-memory copy stop being stale too: the poll loop keeps this `State` for
+/// the rest of its life.
+///
+/// This narrows the window rather than closing it. Two processes can still
+/// interleave between this read and the write, and the real fix is an advisory
+/// lock held across the whole of `go`, which needs a dependency this crate
+/// does not have. `docs/specs/deferred.md` records that decision.
+fn landed_elsewhere(tree: &Tree, head: &str, failing: Option<&str>) -> Option<State> {
+    failing?;
+    let on_disk = State::read(&tree.state_file()).ok()?;
+    (on_disk.deployed.as_deref() == Some(head)).then_some(on_disk)
 }
 
 /// What became of a release between the swap and the verdict.
@@ -1666,6 +1706,59 @@ mod tests {
 
         let written = State::read(&fixture.tree.state_file()).expect("deploy.toml was written");
         assert_eq!(written.deployed.as_deref(), Some(second.as_str()));
+    }
+
+    /// fails if a straggler process can mark a sha failed that another
+    /// process already deployed.
+    ///
+    /// Two processes on one tree is not exotic: README.md documents
+    /// `shep-deploy deploy <sheep>` as the way to retry a held commit, and the
+    /// poll loop only guarantees a tick does not overlap another tick IN THE
+    /// SAME PROCESS. Both read `deploy.toml` at their own start, and
+    /// `State::write` replaces the whole record.
+    ///
+    /// Modelled with the two independent reads that produces. One clone runs
+    /// a real deploy to completion, so the file says `second` is deployed. The
+    /// other is still holding what it read at startup, and records a failure
+    /// for the same sha, which is what a process that lost the checkout to
+    /// git's own index lock does.
+    ///
+    /// The damage is not just a wrong line in a file. `go` refuses to retry a
+    /// sha that `state.failed` names, so a record saying the running release
+    /// failed freezes auto-deploy for that target until somebody notices.
+    #[tokio::test]
+    async fn a_straggler_cannot_fail_a_sha_another_process_deployed() {
+        let mut fixture = fixture_with_previous_release();
+        let second = commit_on_origin(&fixture, "second.txt");
+        let mut straggler = fixture.state.clone();
+
+        deploy(
+            &Shepherd::ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &test_config(),
+        )
+        .await
+        .expect("the winner lands");
+
+        record(
+            &fixture.tree,
+            &mut straggler,
+            &second,
+            &Err(Error::Protocol("lost the checkout race".to_owned())),
+            test_config().retention,
+        );
+
+        let written = State::read(&fixture.tree.state_file()).expect("still readable");
+        assert_eq!(
+            written.deployed.as_deref(),
+            Some(second.as_str()),
+            "the record must still name the sha that is actually running"
+        );
+        assert_eq!(
+            written.failed, None,
+            "a sha another process deployed must not be recorded as failed"
+        );
     }
 
     /// fails if a release directory is deployed without anyone checking that
