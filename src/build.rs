@@ -558,6 +558,30 @@ fn copy_artifact(
         return Ok(());
     }
 
+    // Resolved once more, because every line between the first check and this
+    // open is a window a backgrounded build job can act in, and the first
+    // check is several syscalls back: a `create_dir_all`, the source's own
+    // open and two stats. `O_NOFOLLOW` below does not cover this - the kernel
+    // honours it on the last component and follows every directory above it,
+    // so a component swapped for a link during that window was followed.
+    //
+    // What is left is the gap between this line and the open itself. Closing
+    // that needs `openat2`'s `RESOLVE_NO_SYMLINKS` or a per-component
+    // `openat` walk, both of which need the unsafe this crate forbids, so it
+    // is a recorded decision rather than an oversight.
+    //
+    // A component that is ALREADY a link when the first check runs is caught
+    // there rather than here, at any depth, because `resolve_deepest` follows
+    // the whole chain. Refusing every symlinked component instead was tried
+    // and is wrong: `shared::link_cache` makes `release/target` a link at the
+    // dog's own cache, so that refusal broke the ordinary cargo arrangement.
+    if !lands_within(&roots, &to) {
+        return Err(Error::Config(format!(
+            "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
+            artifact.display()
+        )));
+    }
+
     let mut sink = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1091,6 +1115,55 @@ mod tests {
             std::fs::read_to_string(outside.path().join("victim")).expect("still there"),
             "original",
             "the file outside the release must be untouched"
+        );
+    }
+
+    /// fails if a symlinked component BELOW `target` can carry a write out.
+    ///
+    /// `a_committed_target_symlink_cannot_carry_a_write_out` covers `target`
+    /// itself. This covers a component one level deeper, which is where the
+    /// round-7 review expected the guard to end: `O_NOFOLLOW` is honoured on
+    /// the leaf only, and `create_dir_all` treats an existing
+    /// symlink-to-directory as a job already done. What actually holds the
+    /// line here is neither of those, it is `lands_within` resolving the
+    /// deepest existing ancestor before anything is created, so the depth of
+    /// the component does not matter.
+    ///
+    /// Verified 2026-08-28 that the equivalent link pointing INSIDE the
+    /// release does copy through, and that this is correct rather than a
+    /// second hole: `shared::link_cache` makes `release/target` a link at the
+    /// dog's own cache, so refusing every symlinked component would refuse
+    /// the ordinary cargo arrangement.
+    #[tokio::test]
+    async fn a_symlinked_component_below_target_cannot_carry_a_write_out() {
+        let rel = fixtures::fixture_release(&[]);
+        let cache = fixtures::tempdir();
+        std::fs::create_dir(cache.path().join("sub")).expect("build output dir");
+        std::fs::write(cache.path().join("sub/out"), b"ARTIFACT").expect("build output");
+
+        let outside = fixtures::tempdir();
+        std::fs::create_dir(rel.path().join("target")).expect("target");
+        std::os::unix::fs::symlink(outside.path(), rel.path().join("target/sub")).expect("link");
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/sub/out")],
+        };
+        let err = run("web", rel.path(), &spec, None, &[], cache.path())
+            .await
+            .expect_err("a write through a symlinked component must be refused");
+        assert!(
+            format!("{err}").contains("outside the release"),
+            "must say why: {err}"
+        );
+        assert!(
+            !outside.path().join("out").exists(),
+            "nothing may be written outside the release"
         );
     }
 
