@@ -101,7 +101,67 @@ pub struct BuildSpec {
     pub env: BTreeMap<String, String>,
     /// Paths, relative to the release, to copy back in after a successful
     /// build. See the module doc for why this exists at all.
+    ///
+    /// Refused at parse time if absolute or containing `..` - see
+    /// [`contained_artifacts`] for why that refusal is a security boundary
+    /// and not a tidiness rule.
+    #[serde(deserialize_with = "contained_artifacts")]
     pub artifacts: Vec<PathBuf>,
+}
+
+/// Refuses any artifact path that could name something outside the release.
+///
+/// This runs at parse time, before a build is spawned, because by the time
+/// [`copy_artifact`] runs the privilege drop is already behind us: `uid` and
+/// `gid` are set on the build's `Command`, so they bound the CHILD, and the
+/// copy-back loop runs in this process afterwards at the dog's own uid. Under
+/// the arrangement shep's docs recommend, that is root.
+///
+/// The escape is not hypothetical and the naive case hides it. With no
+/// `CARGO_TARGET_DIR`, source and destination are the same expression, so any
+/// `..` collapses to `from == to` and [`copy_artifact`]'s self-copy guard
+/// returns early. Set `CARGO_TARGET_DIR` and the same string resolves against
+/// a different base, so the two differ and the copy proceeds. Measured
+/// 2026-08-28: `artifacts = ["target/../../../deploy.toml"]` with
+/// `CARGO_TARGET_DIR` set writes through to the tree's own `deploy.toml`,
+/// whose `remote` every later fetch reads. A commit on the tracked branch
+/// could therefore repoint the deploy at a repository of its own choosing.
+///
+/// Refused rather than sanitised, matching
+/// [`crate::flockfile`]'s treatment of a committed `user`: a path that cannot
+/// mean what it says is an operator error worth naming, and silently
+/// rewriting one would leave a Flockfile whose text and behaviour disagree.
+///
+/// # Errors
+/// A deserialization error naming the offending path, if any entry is
+/// absolute or contains a `..` component.
+fn contained_artifacts<'de, D>(deserializer: D) -> Result<Vec<PathBuf>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let artifacts = Vec::<PathBuf>::deserialize(deserializer)?;
+    for artifact in &artifacts {
+        if artifact.is_absolute() {
+            return Err(D::Error::custom(format!(
+                "build.artifacts entry `{}` is an absolute path; artifacts are \
+                 copied into the release and must be relative to it",
+                artifact.display()
+            )));
+        }
+        if artifact
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(D::Error::custom(format!(
+                "build.artifacts entry `{}` contains `..`, which would name a \
+                 path outside the release",
+                artifact.display()
+            )));
+        }
+    }
+    Ok(artifacts)
 }
 
 /// `Debug` does not print `env`'s values (IR-41).
@@ -289,15 +349,34 @@ fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Pa
 /// this function exists to preserve.
 ///
 /// # Errors
-/// [`Error::Io`], naming the destination's parent, if that directory
-/// cannot be created. [`Error::Io`], naming the source, if it cannot be
-/// copied - most likely because the build never produced it at the path
-/// declared.
+/// [`Error::Config`], naming the entry, if `artifact` is absolute or
+/// contains `..`; see [`contained_artifacts`] for why that is a security
+/// boundary. [`Error::Io`], naming the destination's parent, if that
+/// directory cannot be created. [`Error::Io`], naming the source, if it
+/// cannot be copied - most likely because the build never produced it at
+/// the path declared.
 fn copy_artifact(
     release: &Path,
     env: &BTreeMap<String, String>,
     artifact: &Path,
 ) -> Result<(), Error> {
+    // Checked again here, not only in `contained_artifacts`, because a
+    // `BuildSpec` can be built in code without going through the parser -
+    // every test in this module does exactly that. Placed BEFORE the
+    // `create_dir_all` below so a refused artifact cannot leave directories
+    // behind on its way out, and before the `from == to` guard because that
+    // guard is what hides the escape in the no-`CARGO_TARGET_DIR` case.
+    if artifact.is_absolute()
+        || artifact
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(Error::Config(format!(
+            "build.artifacts entry `{}` would name a path outside the release",
+            artifact.display()
+        )));
+    }
+
     let from = artifact_source(release, env, artifact);
     let to = release.join(artifact);
 
@@ -611,6 +690,76 @@ mod tests {
         };
         run("web", rel.path(), &spec, None).await.expect("builds");
         assert!(rel.path().join("target/release/koji").exists());
+    }
+
+    /// fails if a `..` in a declared artifact can reach outside the release.
+    ///
+    /// This is a security boundary, not tidiness. `copy_artifact` runs in
+    /// THIS process after the child exited, so the `uid`/`gid` set on the
+    /// build's `Command` never applied to it; under the arrangement shep's
+    /// docs recommend that is root. Measured 2026-08-28 against the unfixed
+    /// code: this exact spec overwrote the tree's own `deploy.toml`, whose
+    /// `remote` every later fetch reads, so a commit on the tracked branch
+    /// could repoint the deploy at a repository of its own.
+    ///
+    /// `CARGO_TARGET_DIR` is load-bearing here and the test is worthless
+    /// without it. With no override, `from` and `to` are the same expression,
+    /// so the `..` collapses to `from == to` and the self-copy guard returns
+    /// `Ok` before reaching anything this test is about. The unfixed code
+    /// passes a version of this test that omits the override.
+    #[tokio::test]
+    async fn an_artifact_that_escapes_the_release_is_refused() {
+        let tree = tempdir();
+        let release = tree.path().join("releases/abc123");
+        std::fs::create_dir_all(&release).unwrap();
+        let sentinel = tree.path().join("deploy.toml");
+        std::fs::write(&sentinel, b"remote = \"https://real.example/repo.git\"").unwrap();
+
+        let cache = tempdir();
+        let stolen = cache.path().join("deploy.toml");
+        std::fs::write(&stolen, b"remote = \"https://attacker.example/evil.git\"").unwrap();
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().join("a/b/c").display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
+        };
+
+        let err = run("web", &release, &spec, None)
+            .await
+            .expect_err("an escaping artifact must be refused");
+        assert!(
+            format!("{err}").contains("outside the release"),
+            "the refusal must say why, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "remote = \"https://real.example/repo.git\"",
+            "the tree's own state file must be untouched"
+        );
+    }
+
+    /// fails if an escaping artifact reaches a build at all.
+    ///
+    /// The refusal above is the last line; this is the first. A Flockfile
+    /// naming such a path is refused when it is parsed, so no build is ever
+    /// spawned for it, matching how `crate::flockfile` refuses a committed
+    /// `user` rather than ignoring it.
+    #[test]
+    fn an_escaping_artifact_is_refused_at_parse_time() {
+        for bad in ["target/../../../deploy.toml", "/etc/passwd"] {
+            let toml = format!("command = \"true\"\nartifacts = [\"{bad}\"]\n");
+            let err = toml::from_str::<BuildSpec>(&toml)
+                .expect_err("an escaping artifact must not parse");
+            assert!(
+                format!("{err}").contains(bad),
+                "the refusal must name the entry, got: {err}"
+            );
+        }
     }
 
     /// fails if `Debug` stops redacting `env`'s values, or starts hiding a
