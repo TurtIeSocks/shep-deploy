@@ -259,10 +259,6 @@ pub fn worktree_prune(git_dir: &Path) -> Result<(), Error> {
 mod tests {
     use crate::fixtures;
 
-    /// A budget the test tier can never legitimately hit.
-    ///
-    /// These fetches are between two local directories, so anything slower
-    /// than this is a hang worth failing on rather than waiting out.
     use super::*;
     use std::fs;
     use std::process::Command;

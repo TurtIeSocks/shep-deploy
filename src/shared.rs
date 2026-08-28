@@ -22,23 +22,6 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 
-/// Runs `git <args>` in `dir` and returns its stdout as a `String`.
-///
-/// `pub(crate)` rather than private: [`crate::git`] shells out to git for a
-/// second directory this crate cares about - the bare clone under
-/// [`crate::paths::Tree::git`] - and needs the exact same error mapping this
-/// module already built, so it reuses this rather than growing a second
-/// copy. The parameter is named `dir`, not `checkout`, because it is called
-/// with both: this module's own functions always pass the operator's
-/// checkout, `crate::git`'s pass the deploy engine's own bare clone.
-///
-/// Launching a subprocess and decoding what it printed are not filesystem
-/// calls, but they fail with the same shape of error - an
-/// [`std::io::Error`] and a path worth naming - and this crate has nowhere
-/// else for that shape to live, so both come back as [`Error::Io`] naming
-/// `dir`. A `git` invocation that launches but exits non-zero is
-/// [`Error::Git`] instead, since `git`'s own stderr is worth keeping
-/// separate from "could not even run it".
 /// [`run_git`], abandoning the subprocess if it outlives `budget`.
 ///
 /// Only [`crate::git::fetch`] uses this, and only because it is the one git
@@ -53,6 +36,24 @@ use crate::error::Error;
 ///
 /// The child is killed on expiry rather than left to finish, because a git
 /// process still holding the bare clone's lock would fail the next tick too.
+///
+/// ## Why the pipes are drained on threads
+///
+/// A pipe holds about 64 KiB before a writer blocks in `write(2)`. Reading
+/// only after the child exits therefore deadlocks any child that says more
+/// than that: it blocks writing, `try_wait` reports it still running forever,
+/// and the budget kills a process that was healthy and nearly finished.
+///
+/// Measured 2026-08-28 while reviewing this function's first version, which
+/// had exactly that bug: a child writing 200 KB and then exiting was killed at
+/// a three-second deadline, having been ready to exit in milliseconds. It
+/// would have turned a `git fetch --prune` against a repository with many
+/// refs into a target reported as an unreachable remote, which is a worse
+/// failure than the hang this exists to prevent.
+///
+/// So each pipe gets a thread that reads to EOF, which is what
+/// `wait_with_output` does internally and the reason it cannot be used here:
+/// it also waits, and waiting is what this function needs to bound.
 ///
 /// Residual, stated rather than hidden: this still occupies the caller for up
 /// to `budget`. The runtime is single-threaded, so a target whose remote is a
@@ -74,8 +75,13 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
             source,
         })?;
 
+    // Taken before the loop so the child always has a reader, whatever the
+    // loop then decides about the clock. See the doc above.
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+
     let deadline = Instant::now() + budget;
-    loop {
+    let status = loop {
         match child.try_wait() {
             Err(source) => {
                 let _ = child.kill();
@@ -84,31 +90,49 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
                     source,
                 });
             }
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {}
         }
         if Instant::now() >= deadline {
             // Killed, then reaped: leaving it would keep the bare clone's
             // lock and fail the next tick for a reason that looks unrelated.
+            // Killing also closes the pipes, so both reader threads finish.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(Error::Git {
-                command: format!("git {}", args.join(" ")),
-                status: None,
-                stderr: format!(
-                    "no answer within {}s; abandoned so the other targets keep deploying",
-                    budget.as_secs()
-                ),
-            });
+            break None;
         }
         thread::sleep(POLL);
-    }
+    };
 
-    let output = child.wait_with_output().map_err(|source| Error::Io {
-        path: dir.to_owned(),
-        source,
-    })?;
-    decode(dir, args, &output)
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+
+    let Some(status) = status else {
+        return Err(Error::Git {
+            command: format!("git {}", args.join(" ")),
+            status: None,
+            stderr: format!(
+                "no answer within {}s; abandoned so the other targets keep deploying",
+                budget.as_secs()
+            ),
+        });
+    };
+
+    decode(dir, args, status, stdout, stderr)
+}
+
+/// Reads one of a child's pipes to EOF on its own thread.
+///
+/// A free function rather than a closure because the two pipes are different
+/// types and a closure cannot be generic over them.
+fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
 }
 
 /// How often [`run_git_within`] asks whether the child has finished.
@@ -118,6 +142,30 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
 /// syscalls rather than a busy loop.
 const POLL: Duration = Duration::from_millis(50);
 
+/// Runs `git <args>` in `dir` and returns its stdout as a `String`.
+///
+/// `pub(crate)` rather than private: [`crate::git`] shells out to git for a
+/// second directory this crate cares about - the bare clone under
+/// [`crate::paths::Tree::git`] - and needs the exact same error mapping this
+/// module already built, so it reuses this rather than growing a second
+/// copy. The parameter is named `dir`, not `checkout`, because it is called
+/// with both: this module's own functions always pass the operator's
+/// checkout, `crate::git`'s pass the deploy engine's own bare clone.
+///
+/// Launching a subprocess and decoding what it printed are not filesystem
+/// calls, but they fail with the same shape of error - an
+/// [`std::io::Error`] and a path worth naming - and this crate has nowhere
+/// else for that shape to live, so both come back as [`Error::Io`] naming
+/// `dir`. A `git` invocation that launches but exits non-zero is
+/// [`Error::Git`] instead, since `git`'s own stderr is worth keeping
+/// separate from "could not even run it".
+///
+/// Unbounded on purpose: see [`run_git_within`] for the one caller that
+/// cannot afford that, and why the other ten can.
+///
+/// # Errors
+/// [`Error::Io`] naming `dir` if git cannot be launched or printed something
+/// that is not UTF-8. [`Error::Git`] if it ran and exited non-zero.
 pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
     let output = Command::new("git")
         .current_dir(dir)
@@ -128,7 +176,7 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
             source,
         })?;
 
-    decode(dir, args, &output)
+    decode(dir, args, output.status, output.stdout, output.stderr)
 }
 
 /// Turns a finished `git` invocation into stdout or the error it earned.
@@ -137,16 +185,29 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
 /// two differ only in how they wait for the child, and a second copy of this
 /// is how the bounded path would drift into reporting failures differently
 /// from the unbounded one.
-fn decode(dir: &Path, args: &[&str], output: &std::process::Output) -> Result<String, Error> {
-    if !output.status.success() {
+///
+/// Takes the buffers by value because both callers own an `Output` they never
+/// look at again, so borrowing would only force a copy of stdout back out.
+///
+/// # Errors
+/// [`Error::Git`] if `status` is non-zero, carrying git's own stderr.
+/// [`Error::Io`] naming `dir` if stdout is not UTF-8.
+fn decode(
+    dir: &Path,
+    args: &[&str],
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<String, Error> {
+    if !status.success() {
         return Err(Error::Git {
             command: format!("git {}", args.join(" ")),
-            status: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         });
     }
 
-    String::from_utf8(output.stdout.clone()).map_err(|err| Error::Io {
+    String::from_utf8(stdout).map_err(|err| Error::Io {
         path: dir.to_owned(),
         source: io::Error::other(err),
     })
@@ -402,6 +463,48 @@ pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use crate::fixtures;
+
+    /// fails if a chatty-but-healthy git subprocess is killed as if it hung.
+    ///
+    /// A pipe holds about 64 KiB before a writer blocks. The first version of
+    /// `run_git_within` read the pipes only after `try_wait` reported the
+    /// child exited, so a child saying more than that blocked in `write(2)`,
+    /// never exited, and was killed at the deadline having done nothing wrong.
+    ///
+    /// Measured 2026-08-28 against that version: a child writing 200 KB and
+    /// then exiting was killed at a three-second deadline, when reading its
+    /// pipe would have let it finish in milliseconds. `git fetch --prune`
+    /// against a repository with many refs says far more than 64 KiB, so this
+    /// would have reported healthy remotes as unreachable ones: a worse
+    /// failure than the hang the budget exists to prevent.
+    ///
+    /// `git ls-remote` on the crate's own repository is the chatty subject
+    /// because it is guaranteed local, needs no network, and prints one line
+    /// per ref.
+    #[test]
+    fn a_chatty_subprocess_is_not_mistaken_for_a_hung_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_git(dir.path(), &["init", "-q", "-b", "main"]).expect("init");
+        run_git(dir.path(), &["config", "user.email", "t@example.invalid"]).expect("email");
+        run_git(dir.path(), &["config", "user.name", "t"]).expect("name");
+        // Comfortably past a 64 KiB pipe buffer, and one write rather than
+        // thousands of git invocations.
+        std::fs::write(dir.path().join("big.txt"), "x".repeat(400_000)).expect("big file");
+        run_git(dir.path(), &["add", "big.txt"]).expect("add");
+        run_git(dir.path(), &["commit", "-q", "-m", "big"]).expect("commit");
+
+        let out = run_git_within(
+            dir.path(),
+            &["show", "HEAD:big.txt"],
+            Duration::from_secs(20),
+        )
+        .expect("a chatty command must not be mistaken for a hung one");
+        assert!(
+            out.len() > 100_000,
+            "the fixture must exceed a pipe buffer or this proves nothing, got {} bytes",
+            out.len()
+        );
+    }
 
     /// fails if a git subprocess can outlive its budget.
     ///
