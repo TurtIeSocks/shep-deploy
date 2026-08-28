@@ -257,28 +257,16 @@ pub fn worktree_prune(git_dir: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     /// A budget the test tier can never legitimately hit.
     ///
     /// These fetches are between two local directories, so anything slower
     /// than this is a hang worth failing on rather than waiting out.
-    const TEST_BUDGET: Duration = Duration::from_secs(60);
-
     use super::*;
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
-
-    /// Runs a git subcommand for fixture setup and panics if it fails -
-    /// fixture setup that fails silently just produces a baffling assertion
-    /// two lines later.
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
 
     /// A throwaway non-bare repo with `commits` commits on its initial
     /// branch, named `main` explicitly - `init.defaultBranch` is a user
@@ -286,14 +274,14 @@ mod tests {
     /// itself rather than trusting whatever a host happens to default to.
     fn fixture_repo_with_commits(commits: u32) -> TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        run(dir.path(), &["init", "-q", "-b", "main"]);
-        run(dir.path(), &["config", "user.email", "test@example.com"]);
-        run(dir.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
 
         for n in 0..commits {
             fs::write(dir.path().join(format!("file-{n}.txt")), "x").expect("write fixture file");
-            run(dir.path(), &["add", "."]);
-            run(dir.path(), &["commit", "-q", "-m", &format!("commit {n}")]);
+            fixtures::run_git(dir.path(), &["add", "."]);
+            fixtures::run_git(dir.path(), &["commit", "-q", "-m", &format!("commit {n}")]);
         }
 
         dir
@@ -302,14 +290,14 @@ mod tests {
     /// Detaches `repo`'s `HEAD` from its branch, leaving it pointed straight
     /// at a commit instead.
     fn detach_head(repo: &TempDir) {
-        run(repo.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        fixtures::run_git(repo.path(), &["checkout", "-q", "--detach", "HEAD"]);
     }
 
     /// A bare repository with no branches yet, standing in for
     /// `Tree::git()`'s bare clone.
     fn bare_git_dir() -> TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        run(dir.path(), &["init", "-q", "--bare"]);
+        fixtures::run_git(dir.path(), &["init", "-q", "--bare"]);
         dir
     }
 
@@ -349,7 +337,7 @@ mod tests {
     #[test]
     fn remote_url_reads_the_origin_remote() {
         let repo = fixture_repo_with_commits(1);
-        run(
+        fixtures::run_git(
             repo.path(),
             &["remote", "add", "origin", "https://example.com/x.git"],
         );
@@ -379,7 +367,7 @@ mod tests {
         fetch(
             git_dir.path(),
             origin.path().to_str().expect("utf-8 path"),
-            TEST_BUDGET,
+            fixtures::TEST_BUDGET,
         )
         .expect("fetches");
 
@@ -410,14 +398,14 @@ mod tests {
         let git_dir = bare_git_dir();
         let url = origin.path().to_str().expect("utf-8 path");
 
-        fetch(git_dir.path(), url, TEST_BUDGET).expect("first fetch");
+        fetch(git_dir.path(), url, fixtures::TEST_BUDGET).expect("first fetch");
         let first = remote_head(git_dir.path(), "main").expect("resolves after first fetch");
 
         fs::write(origin.path().join("second.txt"), "y").expect("write second commit's file");
-        run(origin.path(), &["add", "."]);
-        run(origin.path(), &["commit", "-q", "-m", "second"]);
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "second"]);
 
-        fetch(git_dir.path(), url, TEST_BUDGET).expect("second fetch");
+        fetch(git_dir.path(), url, fixtures::TEST_BUDGET).expect("second fetch");
         let second = remote_head(git_dir.path(), "main").expect("resolves after second fetch");
 
         assert_ne!(first, second);
@@ -434,15 +422,15 @@ mod tests {
     #[test]
     fn a_branch_deleted_upstream_stops_resolving_after_a_pruning_fetch() {
         let origin = fixture_repo_with_commits(1);
-        run(origin.path(), &["branch", "feature"]);
+        fixtures::run_git(origin.path(), &["branch", "feature"]);
         let git_dir = bare_git_dir();
         let url = origin.path().to_str().expect("utf-8 path");
 
-        fetch(git_dir.path(), url, TEST_BUDGET).expect("first fetch sees feature");
+        fetch(git_dir.path(), url, fixtures::TEST_BUDGET).expect("first fetch sees feature");
         remote_head(git_dir.path(), "feature").expect("feature resolves before deletion");
 
-        run(origin.path(), &["branch", "-D", "feature"]);
-        fetch(git_dir.path(), url, TEST_BUDGET).expect("second fetch prunes feature");
+        fixtures::run_git(origin.path(), &["branch", "-D", "feature"]);
+        fetch(git_dir.path(), url, fixtures::TEST_BUDGET).expect("second fetch prunes feature");
 
         let err =
             remote_head(git_dir.path(), "feature").expect_err("a deleted branch must not resolve");
@@ -459,7 +447,7 @@ mod tests {
         fetch(
             git_dir.path(),
             origin.path().to_str().expect("utf-8 path"),
-            TEST_BUDGET,
+            fixtures::TEST_BUDGET,
         )
         .expect("fetches");
 

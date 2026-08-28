@@ -565,24 +565,9 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     use super::*;
-    use tempfile::TempDir;
-
-    /// Builds a release directory containing the given files - mirrors
-    /// every other module's own `fixture_release`, e.g. `flockfile.rs`'s.
-    fn fixture_release(files: &[(&str, &str)]) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (name, contents) in files {
-            fs::write(dir.path().join(name), contents).expect("write fixture file");
-        }
-        dir
-    }
-
-    /// A bare tempdir, for the tests below that need one standing in for a
-    /// build cache rather than a release.
-    fn tempdir() -> TempDir {
-        tempfile::tempdir().expect("tempdir")
-    }
 
     /// The username running this test process, via `id -un` rather than
     /// the `USER` environment variable - not every CI runner is guaranteed
@@ -694,7 +679,7 @@ mod tests {
     /// different directory.
     #[tokio::test]
     async fn a_failing_build_is_an_error() {
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
             command: Some("exit 3".into()),
             ..Default::default()
@@ -707,7 +692,7 @@ mod tests {
     /// no build at all; the readiness probe covers it.
     #[tokio::test]
     async fn an_absent_build_command_is_not_an_error() {
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec::default();
         assert!(run("web", rel.path(), &spec, None, &[]).await.is_ok());
     }
@@ -718,8 +703,8 @@ mod tests {
     /// nothing.
     #[tokio::test]
     async fn declared_artifacts_are_copied_into_the_release() {
-        let rel = fixture_release(&[]);
-        let cache = tempdir();
+        let rel = fixtures::fixture_release(&[]);
+        let cache = fixtures::tempdir();
         std::fs::create_dir_all(cache.path().join("release")).unwrap();
         std::fs::write(cache.path().join("release/koji"), b"binary").unwrap();
         let spec = BuildSpec {
@@ -757,7 +742,7 @@ mod tests {
             std::env::var("CARGO_PKG_NAME").is_ok(),
             "the probe variable must exist in this process or the test proves nothing"
         );
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
             command: Some("printenv CARGO_PKG_NAME > leaked.txt; true".into()),
             env: BTreeMap::new(),
@@ -780,7 +765,7 @@ mod tests {
     /// the exposure is readable rather than inherited.
     #[tokio::test]
     async fn a_named_passthrough_variable_reaches_the_build() {
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
             command: Some("printenv CARGO_PKG_NAME > passed.txt; true".into()),
             env: BTreeMap::new(),
@@ -820,13 +805,13 @@ mod tests {
     /// passes a version of this test that omits the override.
     #[tokio::test]
     async fn an_artifact_that_escapes_the_release_is_refused() {
-        let tree = tempdir();
+        let tree = fixtures::tempdir();
         let release = tree.path().join("releases/abc123");
         std::fs::create_dir_all(&release).unwrap();
         let sentinel = tree.path().join("deploy.toml");
         std::fs::write(&sentinel, b"remote = \"https://real.example/repo.git\"").unwrap();
 
-        let cache = tempdir();
+        let cache = fixtures::tempdir();
         let stolen = cache.path().join("deploy.toml");
         std::fs::write(&stolen, b"remote = \"https://attacker.example/evil.git\"").unwrap();
 
@@ -910,8 +895,8 @@ mod tests {
     /// were deleted entirely.
     #[tokio::test]
     async fn an_absent_command_skips_artifacts_too() {
-        let rel = fixture_release(&[]);
-        let cache = tempdir();
+        let rel = fixtures::fixture_release(&[]);
+        let cache = fixtures::tempdir();
         let spec = BuildSpec {
             command: None,
             env: [(
@@ -933,7 +918,7 @@ mod tests {
     /// primary gid is, definitionally, whatever `gid_for` will resolve.
     #[tokio::test]
     async fn running_as_the_current_user_succeeds() {
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
             command: Some("true".into()),
             ..Default::default()
@@ -963,7 +948,7 @@ mod tests {
     /// to call first.
     #[tokio::test]
     async fn an_unknown_as_user_is_a_config_error() {
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
             command: Some("true".into()),
             ..Default::default()
@@ -1040,7 +1025,7 @@ mod tests {
     /// back empty rather than what the build actually wrote.
     #[tokio::test]
     async fn an_artifact_already_in_the_release_is_left_intact() {
-        let rel = fixture_release(&[]);
+        let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
             command: Some("mkdir -p dist && printf hello > dist/app.js".into()),
             artifacts: vec![PathBuf::from("dist/app.js")],

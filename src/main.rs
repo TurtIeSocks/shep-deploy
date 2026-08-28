@@ -45,6 +45,10 @@ mod config;
 mod daemon;
 mod deploy;
 mod error;
+/// Test helpers shared by every module's own `mod tests`; see its own doc for
+/// why a binary crate needs this declared here.
+#[cfg(test)]
+mod fixtures;
 mod flockfile;
 mod git;
 mod optin;

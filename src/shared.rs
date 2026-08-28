@@ -401,6 +401,8 @@ pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     /// fails if a git subprocess can outlive its budget.
     ///
     /// Without the bound this hangs forever rather than failing, which is the
@@ -448,9 +450,9 @@ mod tests {
     /// every test here needs: something tracked, something ignored.
     fn fixture_repo(entries: &[(&str, &str)]) -> TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        run(dir.path(), &["init", "-q"]);
-        run(dir.path(), &["config", "user.email", "test@example.com"]);
-        run(dir.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(dir.path(), &["init", "-q"]);
+        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
 
         for (path, contents) in entries {
             let full = dir.path().join(path);
@@ -460,21 +462,9 @@ mod tests {
             fs::write(&full, contents).expect("write fixture file");
         }
 
-        run(dir.path(), &["add", "."]);
-        run(dir.path(), &["commit", "-q", "-m", "seed"]);
+        fixtures::run_git(dir.path(), &["add", "."]);
+        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "seed"]);
         dir
-    }
-
-    /// Runs a git subcommand for [`fixture_repo`] and panics if it fails -
-    /// fixture setup that fails silently just produces a baffling assertion
-    /// failure two lines later.
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
     }
 
     /// Guards `link_into_resolves_even_when_checkout_is_relative`, the one

@@ -671,6 +671,8 @@ async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     /// The config every test that is not about a config value runs on.
     fn test_config() -> crate::config::DogConfig {
         crate::config::DogConfig {
@@ -684,7 +686,6 @@ mod tests {
     // For `Error::source` on the variant the quiet-shepherd path returns.
     use core::error::Error as _;
     use std::cell::{Cell, RefCell};
-    use std::process::Command;
     use std::time::Duration;
 
     use shep_client::RequestError;
@@ -749,29 +750,6 @@ mod tests {
         }
     }
 
-    /// Runs a git subcommand for fixture setup, panicking if it fails.
-    fn git_in(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    /// `dir`'s current `HEAD` sha.
-    fn head_sha(dir: &Path) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("rev-parse");
-        String::from_utf8(out.stdout)
-            .expect("utf-8 sha")
-            .trim()
-            .to_owned()
-    }
-
     /// A tempdir that is a git checkout, on branch `main`, with an `origin`
     /// remote pointing at itself and one commit declaring an app named
     /// `bpm` whose script is `./run.sh`.
@@ -782,10 +760,10 @@ mod tests {
     /// history.
     fn checkout_with_commit() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        git_in(dir.path(), &["init", "-q", "-b", "main"]);
-        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
-        git_in(dir.path(), &["config", "user.name", "test"]);
-        git_in(
+        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(
             dir.path(),
             &[
                 "remote",
@@ -800,8 +778,8 @@ mod tests {
         )
         .expect("write Flockfile");
         std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho hi\n").expect("write run.sh");
-        git_in(dir.path(), &["add", "."]);
-        git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
+        fixtures::run_git(dir.path(), &["add", "."]);
+        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "initial"]);
         dir
     }
 
@@ -876,7 +854,7 @@ mod tests {
     async fn the_branch_comes_from_the_checkouts_own_head() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        git_in(checkout.path(), &["checkout", "-q", "-b", "stable"]);
+        fixtures::run_git(checkout.path(), &["checkout", "-q", "-b", "stable"]);
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
@@ -919,8 +897,8 @@ mod tests {
     async fn a_detached_checkout_is_refused() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        let head = head_sha(checkout.path());
-        git_in(checkout.path(), &["checkout", "-q", &head]);
+        let head = fixtures::head_of(checkout.path());
+        fixtures::run_git(checkout.path(), &["checkout", "-q", &head]);
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 

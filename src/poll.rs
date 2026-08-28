@@ -323,8 +323,7 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
 
 #[cfg(test)]
 mod tests {
-    /// A budget the test tier can never legitimately hit; see `git`'s own.
-    const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    use crate::fixtures;
 
     use super::*;
 
@@ -333,7 +332,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use shep_client::RequestError;
     use shep_client::shep_core::config::AppConfig;
@@ -352,29 +350,6 @@ mod tests {
             "[[app]]\nname = '{sheep}'\nscript = './run.sh'\n\n\
              [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n"
         )
-    }
-
-    /// `dir`'s current `HEAD` sha.
-    fn head_of(dir: &Path) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("rev-parse");
-        String::from_utf8(out.stdout)
-            .expect("utf-8 sha")
-            .trim()
-            .to_owned()
-    }
-
-    /// Runs a git subcommand for fixture setup, panicking if it fails.
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
     }
 
     /// The config every test that is not about the interval runs on.
@@ -420,18 +395,18 @@ mod tests {
     /// repository the deploy fetches from, so tests hold it.
     fn write_target_ready(home: &Path, sheep: &str, watch: Watch) -> TempDir {
         let origin = tempfile::tempdir().expect("tempdir");
-        git(origin.path(), &["init", "-q", "-b", "main"]);
-        git(origin.path(), &["config", "user.email", "test@example.com"]);
-        git(origin.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
         fs::write(origin.path().join("Flockfile.toml"), flockfile(sheep)).expect("Flockfile");
-        git(origin.path(), &["add", "."]);
-        git(origin.path(), &["commit", "-q", "-m", "first"]);
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "first"]);
 
         let tree = Tree::for_sheep(home, sheep);
         fs::create_dir_all(tree.git()).expect("create the git dir");
-        git(&tree.git(), &["init", "-q", "--bare"]);
+        fixtures::run_git(&tree.git(), &["init", "-q", "--bare"]);
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
-        crate::git::fetch(&tree.git(), &remote, TEST_BUDGET).expect("fetch");
+        crate::git::fetch(&tree.git(), &remote, fixtures::TEST_BUDGET).expect("fetch");
 
         let first = crate::git::remote_head(&tree.git(), "main").expect("head");
         crate::git::worktree_add(&tree.git(), &tree.release(&first), &first).expect("worktree");
@@ -454,8 +429,8 @@ mod tests {
         // `UpToDate` and the tests below would pass on a loop that does
         // nothing at all.
         fs::write(origin.path().join("second.txt"), "x").expect("write");
-        git(origin.path(), &["add", "."]);
-        git(origin.path(), &["commit", "-q", "-m", "second"]);
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "second"]);
 
         origin
     }
@@ -571,8 +546,8 @@ mod tests {
                 "the loop ticked far more than the interval allows: it is not sleeping"
             );
             fs::write(self.origin.join(format!("{asked}.txt")), "x").expect("write");
-            git(&self.origin, &["add", "."]);
-            git(&self.origin, &["commit", "-q", "-m", "another"]);
+            fixtures::run_git(&self.origin, &["add", "."]);
+            fixtures::run_git(&self.origin, &["commit", "-q", "-m", "another"]);
             Err(Error::Protocol("the shepherd stopped answering".to_owned()))
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
@@ -665,7 +640,7 @@ mod tests {
         let origin = write_target_ready(home.path(), "held", Watch::Auto);
         let tree = Tree::for_sheep(home.path(), "held");
         let mut state = State::read(&tree.state_file()).expect("reads");
-        state.failed = Some(head_of(origin.path()));
+        state.failed = Some(fixtures::head_of(origin.path()));
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = Ready::new();
@@ -921,7 +896,7 @@ mod tests {
     async fn a_deploy_is_written_to_the_log_it_belongs_in() {
         let home = tempfile::tempdir().expect("tempdir");
         let origin = write_target_ready(home.path(), "fine", Watch::Auto);
-        let head = head_of(origin.path());
+        let head = fixtures::head_of(origin.path());
         let (mut out, mut err) = (Vec::new(), Vec::new());
 
         let _ = tokio::time::timeout(

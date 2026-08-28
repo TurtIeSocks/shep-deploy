@@ -299,25 +299,16 @@ fn select_app(merged: &Value, sheep: &str) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
+    use crate::fixtures;
 
-    /// Builds a release directory containing the given files - typically
-    /// `Flockfile.toml` and/or `Flockfile.override.toml` - for one test.
-    fn fixture_release(files: &[(&str, &str)]) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (name, contents) in files {
-            fs::write(dir.path().join(name), contents).expect("write fixture file");
-        }
-        dir
-    }
+    use super::*;
 
     /// fails if the override stops winning. The override is the user's file
     /// and the committed one is upstream's; a user who pins script must not
     /// have it changed underneath them by a pull.
     #[test]
     fn the_override_wins_on_merge() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='upstream.js'\n",
@@ -337,7 +328,7 @@ mod tests {
     /// is the boundary.
     #[test]
     fn a_committed_flockfile_cannot_set_user() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
             "[[app]]\nname='web'\nscript='x.js'\nuser='root'\n",
         )]);
@@ -352,7 +343,7 @@ mod tests {
     /// would still pass it.
     #[test]
     fn a_committed_flockfile_cannot_set_group() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
             "[[app]]\nname='web'\nscript='x.js'\ngroup='wheel'\n",
         )]);
@@ -370,7 +361,7 @@ mod tests {
     /// committed file alone, before the override was ever opened.
     #[test]
     fn an_override_present_does_not_launder_a_committed_user_field() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='x.js'\nuser='root'\n",
@@ -393,7 +384,7 @@ mod tests {
     /// override actually names.
     #[test]
     fn apps_in_different_files_merge_by_name_not_position() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='web.js'\n\n[[app]]\nname='worker'\nscript='worker.js'\n",
@@ -415,7 +406,7 @@ mod tests {
     /// app available rather than being silently dropped.
     #[test]
     fn an_override_can_add_a_new_app_not_in_the_committed_file() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             ("Flockfile.toml", "[[app]]\nname='web'\nscript='web.js'\n"),
             (
                 "Flockfile.override.toml",
@@ -430,7 +421,10 @@ mod tests {
     /// something instead of a named refusal.
     #[test]
     fn app_config_refuses_an_unknown_sheep_name() {
-        let rel = fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x.js'\n")]);
+        let rel = fixtures::fixture_release(&[(
+            "Flockfile.toml",
+            "[[app]]\nname='web'\nscript='x.js'\n",
+        )]);
         let err = app_config(rel.path(), "ghost").expect_err("no such app");
         assert!(err.to_string().contains("ghost"));
     }
@@ -442,7 +436,7 @@ mod tests {
     /// of those would still break rollback.
     #[test]
     fn a_build_block_parses_into_a_spec() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
             "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\nenv = {              CARGO_TARGET_DIR = '/srv/cache' }\nartifacts = ['target/release/koji']\n",
         )]);
@@ -464,7 +458,8 @@ mod tests {
     /// has to cover.
     #[test]
     fn an_absent_build_block_is_the_default_spec() {
-        let rel = fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x'\n")]);
+        let rel =
+            fixtures::fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x'\n")]);
         assert_eq!(
             build_spec(rel.path()).expect("parses"),
             BuildSpec::default()
@@ -477,7 +472,7 @@ mod tests {
     /// this block at all.
     #[test]
     fn the_override_wins_on_the_build_block() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\n",
@@ -500,7 +495,7 @@ mod tests {
     /// a deploy that swaps in a release nothing built.
     #[test]
     fn an_unknown_build_key_is_refused() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
             "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommands = 'make build'\n",
         )]);

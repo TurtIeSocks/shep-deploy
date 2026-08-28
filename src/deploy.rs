@@ -1046,6 +1046,8 @@ fn sha_of(release: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     use shep_client::shep_core::protocol::RpcErrorCode;
 
     /// [`test_config`] with a retention the caller cares about.
@@ -1070,16 +1072,12 @@ mod tests {
         }
     }
 
-    /// A budget the test tier can never legitimately hit; see `git`'s own.
-    const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
-
     use super::*;
 
     use core::error::Error as _;
     use std::cell::Cell;
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::path::PathBuf;
 
     use shep_client::shep_core::config::AppConfig;
     use shep_client::shep_core::protocol::{ProcessInfo, RpcError};
@@ -1098,29 +1096,6 @@ mod tests {
     /// lazy: what these tests need is an app that HAS a probe.
     const FLOCKFILE: &str = "[[app]]\nname = 'web'\nscript = './run.sh'\n\n\
                              [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n";
-
-    /// Runs a git subcommand for fixture setup, panicking if it fails.
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    /// `dir`'s current `HEAD` sha.
-    fn head_of(dir: &Path) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("rev-parse");
-        String::from_utf8(out.stdout)
-            .expect("utf-8 sha")
-            .trim()
-            .to_owned()
-    }
 
     /// A deploy target with a bare clone, an origin repo, and one release
     /// already live.
@@ -1151,19 +1126,19 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let origin = tempfile::tempdir().expect("tempdir");
 
-        run(origin.path(), &["init", "-q", "-b", "main"]);
-        run(origin.path(), &["config", "user.email", "test@example.com"]);
-        run(origin.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
         fs::write(origin.path().join("Flockfile.toml"), FLOCKFILE).expect("write Flockfile");
-        run(origin.path(), &["add", "."]);
-        run(origin.path(), &["commit", "-q", "-m", "first"]);
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "first"]);
 
         let tree = Tree::for_sheep(home.path(), "web");
         fs::create_dir_all(tree.git()).expect("create git dir");
-        run(&tree.git(), &["init", "-q", "--bare"]);
+        fixtures::run_git(&tree.git(), &["init", "-q", "--bare"]);
 
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
-        crate::git::fetch(&tree.git(), &remote, TEST_BUDGET).expect("fetch");
+        crate::git::fetch(&tree.git(), &remote, fixtures::TEST_BUDGET).expect("fetch");
 
         let state = State {
             remote,
@@ -1219,9 +1194,9 @@ mod tests {
     /// Adds a commit to the fixture's origin and returns its sha.
     fn commit_on_origin(fixture: &Fixture, name: &str) -> String {
         fs::write(fixture.origin.path().join(name), "x").expect("write");
-        run(fixture.origin.path(), &["add", "."]);
-        run(fixture.origin.path(), &["commit", "-q", "-m", name]);
-        head_of(fixture.origin.path())
+        fixtures::run_git(fixture.origin.path(), &["add", "."]);
+        fixtures::run_git(fixture.origin.path(), &["commit", "-q", "-m", name]);
+        fixtures::head_of(fixture.origin.path())
     }
 
     /// A [`Daemon`] that models what a reload actually does to the flock:
@@ -2456,7 +2431,12 @@ mod tests {
 
         // What an interrupted deploy leaves behind: the swap happened, the
         // record write did not.
-        crate::git::fetch(&fixture.tree.git(), &fixture.state.remote, TEST_BUDGET).expect("fetch");
+        crate::git::fetch(
+            &fixture.tree.git(),
+            &fixture.state.remote,
+            fixtures::TEST_BUDGET,
+        )
+        .expect("fetch");
         install_release(&fixture, &second);
         assert_eq!(fixture.state.deployed.as_deref(), Some(live.as_str()));
 
@@ -2543,7 +2523,12 @@ mod tests {
 
         // The same interrupted deploy as above, except that retention has
         // since swept the release the record names.
-        crate::git::fetch(&fixture.tree.git(), &fixture.state.remote, TEST_BUDGET).expect("fetch");
+        crate::git::fetch(
+            &fixture.tree.git(),
+            &fixture.state.remote,
+            fixtures::TEST_BUDGET,
+        )
+        .expect("fetch");
         install_release(&fixture, &second);
         crate::git::worktree_remove(&fixture.tree.git(), &fixture.tree.release(&live))
             .expect("retention removes the old worktree");
@@ -2670,7 +2655,12 @@ mod tests {
     async fn a_previous_release_under_another_path_is_not_a_rollback_target() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
-        crate::git::fetch(&fixture.tree.git(), &fixture.state.remote, TEST_BUDGET).expect("fetch");
+        crate::git::fetch(
+            &fixture.tree.git(),
+            &fixture.state.remote,
+            fixtures::TEST_BUDGET,
+        )
+        .expect("fetch");
         install_release(&fixture, &second);
         // What an interrupted deploy leaves: `current` is on `second` and
         // the record still names an older release, one retention has since

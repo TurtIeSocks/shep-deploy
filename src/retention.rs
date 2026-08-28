@@ -131,8 +131,7 @@ fn sha_of(release: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    /// A budget the test tier can never legitimately hit; see `git`'s own.
-    const TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    use crate::fixtures;
 
     use super::*;
     use std::process::Command;
@@ -153,17 +152,6 @@ mod tests {
             .collect()
     }
 
-    /// Runs a git subcommand for fixture setup, panicking if it fails - as
-    /// `crate::git`'s own fixtures do.
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     /// A real bare repo with `n` commits, a worktree per commit under
     /// `tree.releases()` in commit order, each written into so it is dirty
     /// the way a built release is, with `current` pointed at the newest.
@@ -172,13 +160,13 @@ mod tests {
     /// always the one `current` names.
     fn fixture_tree_with_releases(n: u32) -> (Tree, Vec<String>) {
         let origin = tempfile::tempdir().expect("tempdir");
-        run(origin.path(), &["init", "-q", "-b", "main"]);
-        run(origin.path(), &["config", "user.email", "test@example.com"]);
-        run(origin.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
         for i in 0..n {
             fs::write(origin.path().join(format!("file-{i}.txt")), "x").expect("write");
-            run(origin.path(), &["add", "."]);
-            run(
+            fixtures::run_git(origin.path(), &["add", "."]);
+            fixtures::run_git(
                 origin.path(),
                 &["commit", "-q", "-m", &format!("commit {i}")],
             );
@@ -187,9 +175,9 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let tree = Tree::for_sheep(home.path(), "web");
         fs::create_dir_all(tree.git()).expect("create git dir");
-        run(&tree.git(), &["init", "-q", "--bare"]);
+        fixtures::run_git(&tree.git(), &["init", "-q", "--bare"]);
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
-        git::fetch(&tree.git(), &remote, TEST_BUDGET).expect("fetch");
+        git::fetch(&tree.git(), &remote, fixtures::TEST_BUDGET).expect("fetch");
 
         let log = Command::new("git")
             .current_dir(tree.git())
