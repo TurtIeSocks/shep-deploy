@@ -56,6 +56,21 @@ pub enum Restored {
         /// Where it was put back to.
         to: PathBuf,
     },
+    /// A cutover that never landed, so the sheep was never moved and is
+    /// already running where it belongs.
+    ///
+    /// `optin::prepare` writes `origin_cwd` and `origin_script` and then
+    /// stops; `cut_over` is what re-registers the sheep against `current`.
+    /// Between the two, a tree exists and names an origin for a sheep that
+    /// is still running exactly where it always was. Restoring it would
+    /// delete and restart a healthy app to put it back where it already is,
+    /// and a `Start` that then failed would leave it stopped.
+    NeverMoved {
+        /// The sheep that was never moved.
+        sheep: String,
+        /// Where it has been running the whole time.
+        at: PathBuf,
+    },
     /// The dog bootstrapped this sheep, so there was nowhere to restore it
     /// to. Left running from `current`, unchanged.
     LeftRunning {
@@ -177,6 +192,8 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
         // tool was uninstalled would be much worse than leaving it. This
         // needs no roll at all, so a roll that failed to read does not
         // touch it.
+        // Read before the origin fields move out below.
+        let never_moved = state.deployed.is_none();
         let (Some(cwd), Some(script)) = (state.origin_cwd, state.origin_script) else {
             results.push(Restored::LeftRunning {
                 sheep,
@@ -184,6 +201,15 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             });
             continue;
         };
+
+        // An origin recorded is not the same as a sheep moved. `prepare`
+        // writes both origin fields, and only a landed cutover writes
+        // `deployed`, so this is the tree of an abandoned cutover: the sheep
+        // never left its own checkout.
+        if never_moved {
+            results.push(Restored::NeverMoved { sheep, at: cwd });
+            continue;
+        }
 
         let Ok(registered) = &registered else {
             blocked_by_roll.push(sheep);
@@ -339,6 +365,13 @@ pub fn report(results: &[Restored]) -> String {
             // indistinguishable from "quietly abandoned somewhere you will
             // not think to look", which is the failure this whole module
             // exists to prevent.
+            Restored::NeverMoved { sheep, at } => {
+                format!(
+                    "{sheep} was never moved - its cutover did not land - and is still running \
+                     from {}\n",
+                    at.display()
+                )
+            }
             Restored::LeftRunning { sheep, from } => {
                 format!("{sheep} still running from {}\n", from.display())
             }
@@ -742,6 +775,56 @@ mod tests {
         let text = report(&results);
         assert!(text.contains("ctm still running from"), "{text}");
         assert!(text.contains("deploy/ctm/current"), "{text}");
+    }
+
+    /// fails if a tree whose cutover never landed is "restored".
+    ///
+    /// `optin::prepare` writes `origin_cwd` and `origin_script` and then
+    /// stops. `cut_over` is what actually moves the sheep. So between them a
+    /// tree exists naming an origin for a sheep that never left its own
+    /// checkout, and the branch here read those two fields alone: it could
+    /// not tell that tree from a sheep genuinely cut over.
+    ///
+    /// Restoring it deletes and restarts a healthy app to put it back where
+    /// it already is. Worse if the `Start` then fails, because the delete has
+    /// already landed and the app is simply stopped. `deployed` is the field
+    /// that says a cutover landed.
+    #[tokio::test]
+    async fn a_cutover_that_never_landed_is_not_restored() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_never_cut_over(home.path(), "ctm", "/srv/ctm", "./run.sh");
+        let daemon = Recording::with_registered(&["ctm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            daemon.calls().is_empty(),
+            "a sheep that never moved must not be stopped or started: {:?}",
+            daemon.calls()
+        );
+        let text = report(&results);
+        assert!(text.contains("ctm was never moved"), "{text}");
+        assert!(text.contains("/srv/ctm"), "{text}");
+    }
+
+    /// Writes a `deploy.toml` as `optin::prepare` leaves one when its cutover
+    /// never ran: an origin recorded, and no `deployed`.
+    fn write_target_never_cut_over(home: &Path, sheep: &str, origin_cwd: &str, script: &str) {
+        let tree = Tree::for_sheep(home, sheep);
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let state = State {
+            remote: "https://example.com/x".to_owned(),
+            branch: "main".to_owned(),
+            deployed: None,
+            failed: None,
+            verify: Verify::default(),
+            watch: Watch::default(),
+            origin_cwd: Some(PathBuf::from(origin_cwd)),
+            origin_script: Some(script.to_owned()),
+            checkout: PathBuf::from(origin_cwd),
+        };
+        state.write(&tree.state_file()).expect("write state");
     }
 
     /// fails if one target's failure stops the others being restored, or
