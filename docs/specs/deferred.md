@@ -202,3 +202,43 @@ refuses a subscription.
 If it is worth pursuing, the shape that keeps what already works is a second,
 optional trait method on `Daemon` feeding an event-driven path, with the
 polling path as the fallback, rather than a replacement.
+
+## An advisory lock, so two processes cannot deploy one sheep at once
+
+There is no lock of any kind between processes. The poll loop guarantees a tick
+never overlaps another tick in the same process, and that is all it guarantees.
+
+Two processes is a documented workflow rather than a corner case. README.md
+tells an operator that `shep-deploy deploy <sheep>` retries a held commit, and
+the dog is polling the whole time. Round 10 of the founder's review ran both
+against one tree and reproduced two collisions with real processes: `git
+worktree add` losing to git's own index lock, and `git fetch` refusing with
+`cannot lock ref 'refs/heads/main'`.
+
+Git refusing is the good news, since it means neither writes a half-finished
+checkout. The bad news is what the operator sees, which is raw git plumbing
+with nothing saying a second shep-deploy caused it, and what the loser then
+records. That second half is fixed: `record` re-reads before writing and will
+not mark a sha failed that the record already says is deployed.
+
+The fix narrows the window and does not close it. Two processes can still
+interleave between that read and the write.
+
+What closes it is an advisory exclusive lock on a file in the tree, taken
+before any git or filesystem mutation and held for the whole of `go`, with the
+loser refusing in words rather than running into git. `flock(2)` is the right
+primitive because the kernel drops it when the holder dies, so a killed dog
+leaves nothing behind. Round 9 was entirely about state a kill leaves behind,
+and a lockfile that survived one would be a poor trade.
+
+**This is Rin's call, because it needs a dependency.** The crate has four:
+shep-client, tokio, toml, serde plus serde_json. None of them expose `flock`,
+and `#![forbid(unsafe_code)]` at `src/main.rs:33` rules out calling libc
+directly. So it means adding something like `fs2` or `rustix`, in a crate whose
+stated purpose is finding out whether a dog can be built from a minimal
+published surface.
+
+The alternative that needs nothing new is a `create_new` lockfile, and it is
+worse: it does not survive a kill cleanly, so a dog killed mid-deploy would
+strand every later deploy behind a lock nobody holds. Trading a rare race for a
+routine outage is the wrong direction.
