@@ -203,3 +203,42 @@ If it is worth pursuing, the shape that keeps what already works is a second,
 optional trait method on `Daemon` feeding an event-driven path, with the
 polling path as the fallback, rather than a replacement.
 
+## shep marks a reload's replacement Online without the readiness probe
+
+Found by deploying real repositories against a real shepherd, which twelve
+rounds of code review could not find: every test in this crate drives a fake
+`Daemon` whose `describe` answers whatever the test wants, and `verify.rs`'s
+own doc already says a fake like that is how an earlier bug survived two
+rounds.
+
+Measured 2026-08-28, shep 0.1.8 with shep-deploy at this branch. A testbed app
+declares an HTTP `readiness_probe` at a port it then stops listening on. The
+probe is registered and confirmed present in shep's `flock.json`. On reload:
+
+```text
+t+0.0s  probe answers YES  status=online  pid=7349   (the old release)
+t+1.0s  probe answers no   status=online  pid=7745   (the new one, already Online)
+t+25.8s probe answers no   status=online  pid=7745
+```
+
+One second, against a `listen_timeout` of ten, with the probe never passing.
+`shep-deploy deploy` reported `deployed` and exited 0. A control run of `shep
+reload` by hand, with no dog involved, behaves identically and also exits 0, so
+this is shep's own path rather than anything the dog does.
+
+**What it costs.** `verify = "probed"` is documented as the safe default and
+watches for a new process reaching `Online`. Since shep grants `Online` without
+the probe, a release that starts and never becomes ready is verified, recorded
+as deployed, and never rolled back. The app is down and the record says it is
+fine. That is the exact failure automatic rollback exists to prevent.
+
+**Where the fix goes.** shep, not here. `reload_ready_result` in
+`shep-daemon/src/supervisor.rs` already aborts a reload when readiness reports
+`TimedOut` and an old instance survives, so the machinery exists; what needs
+establishing is why a failing probe does not produce `TimedOut` on this path.
+
+Nothing in this crate can work around it honestly. Polling the probe target
+itself would mean shep-deploy reimplementing readiness, and it would still be
+guessing: the probe's definition lives in the Flockfile shep owns. So the
+README now says what the verification actually checks rather than what it was
+intended to check.

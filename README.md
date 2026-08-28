@@ -205,8 +205,22 @@ readiness probe. shep reports a freshly started process `Online` once its
 whose replacement was not ready. So `setup` checks what it can: a new process
 started and was still the same process, not errored and not restarted, ten
 seconds later. A release that starts, stays up and serves nothing passes that.
-Every deploy after the first is verified properly, against the probe, with
-automatic rollback.
+Every deploy after the first is verified against a new process reaching
+`Online`.
+
+**That is weaker than it sounds today, and the gap is shep's rather than this
+crate's.** Measured 2026-08-28 against a real shepherd: a sheep with an HTTP
+`readiness_probe` that never passes is marked `Online` by shep about a second
+into a reload, well inside its `listen_timeout`, and stays there. `shep reload`
+on its own does it too, with no deploy dog involved, and exits 0. So a release
+that starts and never becomes ready is verified, recorded as deployed, and not
+rolled back, and the app is down while the record says otherwise. Reproduced
+with the probe still registered and confirmed present in shep's own snapshot.
+
+Until shep gates a reload's replacement on the probe, treat `verify = "probed"`
+as "a new process started and stayed up", which is what `verify = "alive"`
+already promises. Rollback still works for a release that CRASHES; it is
+readiness specifically that is not caught.
 
 ## Removing it
 
