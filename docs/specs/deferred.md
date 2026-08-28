@@ -157,3 +157,48 @@ An earlier attempt refused every symlinked component outright. That is
 recorded here because it looks correct and is not: `shared::link_cache` makes
 `release/target` a link at the dog's own cache, so the refusal broke the
 ordinary cargo arrangement rather than an attack.
+
+## Two things shep should export, so a dog stops copying them
+
+Round 9 of the founder's review audited the boundary this crate exists to
+test: whether somebody outside shep's workspace can build a dog from what shep
+publishes. Both findings are gaps in shep, not bugs here, so neither is fixed
+in this repository.
+
+**The reload deadline slack.** `deploy::RELOAD_DEADLINE_SLACK` is five seconds,
+and its own doc says it is copied from `RELOAD_DEADLINE_SLACK` in shep's
+`supervisor.rs`. That one is a private `const` in shep-daemon, which dogs
+correctly do not depend on. So the value a dog uses to size its reload budget
+is a transcription, and it goes wrong silently if shep ever retunes it.
+
+What would fix it is shep exporting the slack from shep-core, or better the
+whole `listen_timeout + graceful_timeout + slack` formula, so a dog asks for a
+reload budget instead of computing one. shep-client already sets the
+precedent: its own source calls `spawn::DAEMON_ALREADY_RUNNING` an exit-code
+contract worth exporting.
+
+**The exit-code taxonomy.** `main::code_for` hardcodes 4 for a config refusal
+and 5 for a failure to connect, sourced from `docs/specs/shep-v1.md` in a
+different repository that is not vendored here. Nothing checks the copy at
+compile time. The same fix applies: name the taxonomy publicly alongside
+`DAEMON_ALREADY_RUNNING` so a dog writes a constant rather than a literal
+copied out of somebody else's documentation.
+
+Until then both copies stay, documented, which is the honest state rather than
+a fix.
+
+## Whether verification should read the bus instead of polling
+
+`verify.rs` decides a reload finished by polling `Describe` and diffing pid
+sets between generations. shep's own bus already reports both outcomes by
+name, as `ProcessEventKind::Reloaded` and `ProcessEventKind::ReloadAbandoned`,
+and `Client::subscribe` is exported.
+
+So the crate infers something it could be told. Round 9 raised it as a
+question rather than a defect, and it is Rin's call: the polling path works,
+is covered by fake-based tests, and answers correctly for a shepherd that
+refuses a subscription.
+
+If it is worth pursuing, the shape that keeps what already works is a second,
+optional trait method on `Daemon` feeding an event-driven path, with the
+polling path as the fallback, rather than a replacement.
