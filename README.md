@@ -147,15 +147,19 @@ removed and the original left serving. Every deploy after the first replaces
 the instance rather than joining it, and does not meet this.
 
 A cutover that was abandoned leaves the tree behind, and a sheep is not a
-deploy target until a cutover lands. Its record names no deployed release, so
-`shep deploy` against it does not stop: it builds, swaps, reloads the sheep at
-its own checkout, sees a real turnover, and reports success for a release
-nothing served. Remove its tree and run `setup` again once the cause is fixed.
-Both `setup` and the failure message say this, and both print the resolved path
-to remove rather than a `$SHEP_HOME` you would have to expand yourself. `shep
-deploy` refuses such a target outright, `setup` leaves it `watch = manual` until
-the cutover lands, and `--watch auto` on one is refused for the same reason: it
-would ask for that deploy once every interval, unattended.
+deploy target until a cutover lands. `shep-deploy deploy` refuses such a target
+before anything at all happens, because its record names no deployed release.
+
+That refusal is load-bearing rather than tidy. Without it the deploy would not
+stop: it would build, swap, reload the sheep at its own checkout, see a real
+turnover, and report success for a release nothing served.
+
+Remove its tree and run `setup` again once the cause is fixed. Both `setup` and
+the failure message say this, and both print the resolved path to remove rather
+than a `$SHEP_HOME` you would have to expand yourself. `setup` leaves it
+`watch = manual` until the cutover lands, and `--watch auto` on one is refused
+for the same reason: it would ask for that deploy once every interval,
+unattended.
 
 ## Verification
 
