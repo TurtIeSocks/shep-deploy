@@ -47,6 +47,16 @@ gap on 2026-08-28 and reached the deploy tree's own `deploy.toml`, whose
 `remote` every later fetch reads. Absolute and `..`-bearing artifact paths are
 refused at parse time now, and again before the copy.
 
+A residual remains on the destination and is worth naming. The copy resolves
+where an artifact's destination really lands, then opens it. A component
+swapped for a symlink between those two steps is followed, because the kernel
+honours `O_NOFOLLOW` on a path's last component and on nothing above it. A
+component that is already a link when the first check runs is refused at any
+depth, and the destination is resolved again immediately before the open, so
+the window is one call wide. Closing the rest needs `openat2` with
+`RESOLVE_NO_SYMLINKS`, which needs the unsafe this crate forbids.
+`docs/specs/deferred.md` records it.
+
 **The cleared environment bounds what a build inherits from this process.** A
 build gets `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, whatever `passthrough` names
 in `[dog.deploy]`, and the release's own `[build] env`. Nothing else. Dropping

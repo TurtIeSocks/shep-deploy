@@ -125,3 +125,35 @@ declaration has to come from somewhere the operator controls: an
 repository can then name paths under but cannot extend. Same shape as the
 environment allowlist, for the same reason. Not built, because nothing has
 asked for it yet and the narrowing costs nothing until something does.
+
+## Resolve an artifact's destination without a race
+
+`copy_artifact` checks where a destination really lands, then opens it.
+Between those two steps a build's backgrounded job can swap a directory
+component for a symlink, and the kernel follows it: `O_NOFOLLOW` governs the
+last component of a path and nothing above it.
+
+Round 7 of the founder's review raised this from two independent lenses.
+Neither won the race in a harness. This crate has measured a comparable one
+being won in 0.03s, so treat it as narrow rather than as theatre.
+
+Two things narrow it already. A component that is a symlink when the first
+check runs is refused at any depth, because `lands_within` resolves the
+deepest existing ancestor rather than trusting the spelling. And the
+destination is resolved again immediately before the open, so what is left is
+one call rather than the several syscalls it was.
+
+Closing it needs `openat2` with `RESOLVE_NO_SYMLINKS`, or walking each
+component with its own `openat`. Both need `unsafe`, against the
+`#![forbid(unsafe_code)]` at `src/main.rs:33`. Lifting that for one function
+is the decision to make, and a crate with its own unsafe only moves the
+review rather than removing it. `openat2` is Linux 5.6 and later, so macOS
+keeps the current shape whichever way it goes.
+
+Not built, because the window is one call wide and what gets written through
+it is the build's own output.
+
+An earlier attempt refused every symlinked component outright. That is
+recorded here because it looks correct and is not: `shared::link_cache` makes
+`release/target` a link at the dog's own cache, so the refusal broke the
+ordinary cargo arrangement rather than an attack.
