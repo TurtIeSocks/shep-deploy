@@ -750,6 +750,55 @@ mod tests {
         assert!(!ok);
     }
 
+    /// fails if the dwell settles for SOME instance still being the one that
+    /// came up, rather than all of them.
+    ///
+    /// The module argues this for the turnover phase and
+    /// `a_draining_old_instance_is_not_a_finished_turnover` pins it there.
+    /// The identical requirement in the post-dwell check had no test with more
+    /// than one instance in it, so round 9 of the founder's review changed
+    /// that `.all` to `.any` and both existing dwell tests stayed green: over
+    /// a one-element iterator the two are the same function.
+    ///
+    /// A scaled sheep is why it matters. One replica of two coming up, dying
+    /// and being restarted under a new pid inside the dwell is a release that
+    /// does not work, and `.any` calls it verified because its sibling is
+    /// fine.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_one_replica_of_two_restarting_during_the_dwell() {
+        let daemon = Listings::new(vec![
+            // Turned over: both replicas are new, so `settled` is {200, 201}.
+            vec![
+                instance(1, ProcStatus::Starting, 200),
+                instance(2, ProcStatus::Starting, 201),
+            ],
+            // After the dwell 201 has died and come back as 202. The first
+            // replica still holds, which is exactly what `.any` would accept.
+            vec![
+                instance(1, ProcStatus::Starting, 200),
+                instance(2, ProcStatus::Starting, 202),
+            ],
+        ]);
+        let before = Generation {
+            pids: [100, 101].into_iter().collect(),
+        };
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &before,
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !ok,
+            "every instance must still be the one that came up, not merely one of them"
+        );
+    }
+
     /// fails if the dwell stops noticing a process that is gone entirely by
     /// the end of it - the other half of
     /// `alive_rejects_a_process_that_dies_during_the_dwell`, where shep has
