@@ -60,7 +60,6 @@ use tokio::time::{Instant, sleep};
 
 use shep_client::RequestError;
 use shep_client::shep_core::config::AppConfig;
-use shep_client::shep_core::protocol::RpcErrorCode;
 
 use crate::config::DogConfig;
 use crate::daemon::Daemon;
@@ -985,7 +984,7 @@ async fn restore<D: Daemon>(
         // release. A failure that could never clear is not - it is just
         // that failure, and dressing it as a split would claim a running
         // process that a `NotFound` says is not there.
-        Err(source) if is_retryable(&source) => Err(Error::Split {
+        Err(source) if source.is_retryable() => Err(Error::Split {
             sheep: sheep.to_owned(),
             on: to,
             running: attempted.to_owned(),
@@ -999,37 +998,6 @@ async fn restore<D: Daemon>(
 /// How long to leave between attempts at a reload the shepherd would not
 /// take.
 const RETRY_EVERY: Duration = Duration::from_millis(500);
-
-/// Whether a failed request is worth asking again.
-///
-/// The refusal this whole retry exists for is `ReloadInFlight`, which shep
-/// maps to [`RpcErrorCode::Internal`] under protest: it carries no code of
-/// its own, so `Internal` is as close as this crate can get to naming it,
-/// and everything else that arrives as `Internal` is at least plausibly
-/// transient too. [`RequestError::Timeout`] and `DeadlineExceeded` are the
-/// same shape of answer from the other two layers.
-///
-/// Everything else is refused at once, which is the half that was missing.
-/// `NotFound` means the selector matched nothing, and asking a second time
-/// cannot make a sheep exist: retrying it burned the entire budget and then
-/// reported a split state claiming a running process there was none of, with
-/// a suggested `shep reload` that fails identically. `Closed` cannot clear
-/// either - this client's connection is gone and nothing here reconnects.
-///
-/// An unrecognised code is NOT retried. [`RpcErrorCode`] is
-/// `#[non_exhaustive]`, so this arm is the one a future variant lands in,
-/// and failing fast on an unknown code is the mistake that costs a bounded
-/// delay rather than the one that costs an operator a wrong diagnosis.
-fn is_retryable(err: &Error) -> bool {
-    match err {
-        Error::Request(RequestError::Timeout { .. }) => true,
-        Error::Request(RequestError::Rpc(rpc)) => matches!(
-            rpc.code,
-            RpcErrorCode::Internal | RpcErrorCode::DeadlineExceeded
-        ),
-        _ => false,
-    }
-}
 
 /// Reloads `sheep`, retrying a failure that could clear until `patience`
 /// runs out.
@@ -1050,7 +1018,7 @@ async fn reload_until<D: Daemon>(daemon: &D, sheep: &str, patience: Duration) ->
         match daemon.reload(sheep).await {
             Ok(()) => return Ok(()),
             Err(err) => {
-                if !is_retryable(&err) || Instant::now() >= deadline {
+                if !err.is_retryable() || Instant::now() >= deadline {
                     return Err(err);
                 }
                 sleep(RETRY_EVERY).await;
@@ -1078,6 +1046,8 @@ fn sha_of(release: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use shep_client::shep_core::protocol::RpcErrorCode;
+
     /// [`test_config`] with a retention the caller cares about.
     ///
     /// Separate because the retention tests are the only ones for which the
@@ -1942,33 +1912,6 @@ mod tests {
             .expect("completes");
 
         assert_eq!(outcome, Outcome::Deployed { sha: second });
-    }
-
-    /// fails if a request that can never succeed is retried anyway. The
-    /// retry exists for `ReloadInFlight`, which shep can only report as
-    /// `Internal`; a `NotFound` means the selector matched nothing, and
-    /// asking again cannot make a sheep exist. Retrying it burned the whole
-    /// budget and then reported a split state claiming a running process
-    /// there was none of.
-    #[test]
-    fn only_a_failure_that_could_clear_is_retried() {
-        let rpc = |code| {
-            Error::Request(RequestError::Rpc(RpcError {
-                code,
-                message: "web is already being reloaded".to_owned(),
-            }))
-        };
-
-        assert!(is_retryable(&rpc(RpcErrorCode::Internal)));
-        assert!(is_retryable(&rpc(RpcErrorCode::DeadlineExceeded)));
-        assert!(is_retryable(&Error::Request(RequestError::Timeout {
-            after: Duration::from_secs(1)
-        })));
-
-        assert!(!is_retryable(&rpc(RpcErrorCode::NotFound)));
-        assert!(!is_retryable(&rpc(RpcErrorCode::InvalidConfig)));
-        assert!(!is_retryable(&Error::Request(RequestError::Closed)));
-        assert!(!is_retryable(&Error::Protocol("nonsense".to_owned())));
     }
 
     /// fails if a rollback gives up the first time the shepherd says it is

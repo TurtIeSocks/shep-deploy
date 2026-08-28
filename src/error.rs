@@ -8,7 +8,7 @@
 use core::fmt;
 use std::path::PathBuf;
 
-use shep_client::shep_core::protocol::SmitError;
+use shep_client::shep_core::protocol::{RpcErrorCode, SmitError};
 use shep_client::{ConnectError, RequestError};
 
 /// Anything that can go wrong in one deploy.
@@ -290,6 +290,45 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether a failed request is worth asking again.
+    ///
+    /// The refusal this whole retry exists for is `ReloadInFlight`, which shep
+    /// maps to [`RpcErrorCode::Internal`] under protest: it carries no code of
+    /// its own, so `Internal` is as close as this crate can get to naming it,
+    /// and everything else that arrives as `Internal` is at least plausibly
+    /// transient too. [`RequestError::Timeout`] and `DeadlineExceeded` are the
+    /// same shape of answer from the other two layers.
+    ///
+    /// Everything else is refused at once, which is the half that was missing.
+    /// `NotFound` means the selector matched nothing, and asking a second time
+    /// cannot make a sheep exist: retrying it burned the entire budget and then
+    /// reported a split state claiming a running process there was none of, with
+    /// a suggested `shep reload` that fails identically. `Closed` cannot clear
+    /// either - this client's connection is gone and nothing here reconnects.
+    ///
+    /// An unrecognised code is NOT retried. [`RpcErrorCode`] is
+    /// `#[non_exhaustive]`, so this arm is the one a future variant lands in,
+    /// and failing fast on an unknown code is the mistake that costs a bounded
+    /// delay rather than the one that costs an operator a wrong diagnosis.
+    ///
+    /// Moved here from `crate::deploy` on 2026-08-28: it is a property of the
+    /// error, not of deploying, and `crate::verify` needed the same judgement
+    /// for the same RPC over the same socket. A second copy there would have
+    /// been the third place this line gets drawn.
+    #[must_use]
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Request(RequestError::Timeout { .. }) => true,
+            Self::Request(RequestError::Rpc(rpc)) => matches!(
+                rpc.code,
+                RpcErrorCode::Internal | RpcErrorCode::DeadlineExceeded
+            ),
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -499,7 +538,6 @@ impl From<RequestError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     // For `Error::source` on the wrapping variants.
     use core::error::Error as _;
 
@@ -724,5 +762,38 @@ mod tests {
     fn a_build_error_names_a_signal_kill_distinctly() {
         let err = Error::Build { status: None };
         assert!(err.to_string().contains("signal"));
+    }
+
+    /// fails if a request that can never succeed is retried anyway.
+    ///
+    /// The retry exists for `ReloadInFlight`, which shep can only report as
+    /// `Internal`; a `NotFound` means the selector matched nothing, and asking
+    /// again cannot make a sheep exist. Retrying it burned the whole budget
+    /// and then reported a split state claiming a running process there was
+    /// none of.
+    ///
+    /// Moved here from `crate::deploy` with the function it tests.
+    #[test]
+    fn only_a_failure_that_could_clear_is_retried() {
+        let rpc = |code| {
+            Error::Request(RequestError::Rpc(RpcError {
+                code,
+                message: "web is already being reloaded".to_owned(),
+            }))
+        };
+
+        assert!(rpc(RpcErrorCode::Internal).is_retryable());
+        assert!(rpc(RpcErrorCode::DeadlineExceeded).is_retryable());
+        assert!(
+            Error::Request(RequestError::Timeout {
+                after: core::time::Duration::from_secs(1)
+            })
+            .is_retryable()
+        );
+
+        assert!(!rpc(RpcErrorCode::NotFound).is_retryable());
+        assert!(!rpc(RpcErrorCode::InvalidConfig).is_retryable());
+        assert!(!Error::Request(RequestError::Closed).is_retryable());
+        assert!(!Error::Protocol("nonsense".to_owned()).is_retryable());
     }
 }

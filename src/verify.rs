@@ -253,7 +253,10 @@ pub async fn wait<D: Daemon>(
 /// failure both modes report.
 ///
 /// # Errors
-/// Whatever [`Daemon::describe`] returns.
+/// Whatever [`Daemon::describe`] returns, once a failure is either fatal or
+/// the budget has run out. A retryable failure inside the budget is polled
+/// through rather than reported: see the body for why one blip must not cost
+/// a live reload.
 async fn turnover<D: Daemon>(
     daemon: &D,
     sheep: &str,
@@ -263,7 +266,24 @@ async fn turnover<D: Daemon>(
 ) -> Result<Option<Generation>, Error> {
     let deadline = Instant::now() + budget;
     loop {
-        let flock = daemon.describe(sheep).await?;
+        // A transient answer is not a verdict. This polls roughly a hundred
+        // and fifty times over a ten-to-twenty second budget, so a single
+        // `Timeout` or `Internal` anywhere in that run used to abort
+        // verification and send `land` down the rollback path: a second real
+        // reload, under live traffic, for a release that was healthy.
+        //
+        // Same judgement `Error::is_retryable` already made for `reload` over
+        // the same socket. Retried inside the budget rather than beyond it,
+        // so a shepherd that is genuinely gone still fails at the deadline
+        // instead of hanging.
+        let flock = match daemon.describe(sheep).await {
+            Ok(flock) => flock,
+            Err(err) if err.is_retryable() && Instant::now() < deadline => {
+                sleep(POLL).await;
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if before.has_turned_over(&flock, accept) {
             return Ok(Some(Generation {
                 pids: flock.iter().filter_map(|info| info.pid).collect(),
@@ -294,6 +314,7 @@ pub(crate) fn is_alive(info: &ProcessInfo) -> bool {
 mod tests {
     use std::cell::Cell;
 
+    use shep_client::RequestError;
     use shep_client::shep_core::config::AppConfig;
 
     use super::*;
@@ -334,6 +355,83 @@ mod tests {
                 next: Cell::new(0),
             }
         }
+    }
+
+    /// A daemon that fails its first `describe` with a retryable error, then
+    /// answers with a flock that has turned over.
+    struct Blips {
+        calls: Cell<u32>,
+        after: Vec<ProcessInfo>,
+    }
+
+    impl Daemon for Blips {
+        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
+            unimplemented!()
+        }
+        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
+            unimplemented!()
+        }
+        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            if n == 0 {
+                return Err(Error::Request(RequestError::Timeout {
+                    after: Duration::from_secs(1),
+                }));
+            }
+            Ok(self.after.clone())
+        }
+        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn delete(&self, _id: u32) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
+            unimplemented!()
+        }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
+    }
+
+    /// fails if one transient `describe` failure costs a live reload.
+    ///
+    /// `turnover` polls roughly a hundred and fifty times over a ten-second
+    /// budget. Propagating any one of those used to make `land` report
+    /// `Landed::Failed`, which rolls back: `current` is put back and the sheep
+    /// is reloaded a SECOND time, under live traffic, for a release that was
+    /// healthy and one poll from Online.
+    ///
+    /// The error here is `Timeout`, which `Error::is_retryable` already
+    /// classifies as transient for `reload` over the same socket. A fatal code
+    /// must still fail, which `only_a_failure_that_could_clear_is_retried` in
+    /// `crate::error` pins from the other side.
+    #[tokio::test]
+    async fn a_transient_describe_failure_does_not_fail_verification() {
+        let before = Generation {
+            pids: [111].into_iter().collect(),
+        };
+        let daemon = Blips {
+            calls: Cell::new(0),
+            after: vec![instance(0, ProcStatus::Online, 222)],
+        };
+
+        let seen = turnover(&daemon, "web", &before, is_online, Duration::from_secs(10))
+            .await
+            .expect("a retryable blip must not end verification");
+
+        assert!(
+            seen.is_some(),
+            "the turnover after the blip must still be seen"
+        );
+        assert!(daemon.calls.get() >= 2, "it must have asked again");
     }
 
     impl Daemon for Listings {
