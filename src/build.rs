@@ -63,6 +63,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -478,7 +480,45 @@ fn copy_artifact(
         })?;
     }
 
-    fs::copy(&from, &to).map_err(|source| Error::Io { path: from, source })?;
+    // Opened BEFORE the last containment check, and the check then runs
+    // against the object actually opened rather than against the name again.
+    //
+    // The build's own command can leave a background job running: `sh -c`
+    // exits, `run` returns, and that job keeps going. It can swap a component
+    // for a symlink in the gap between a name being approved and the same name
+    // being followed a second time by `fs::copy`. Checking a path, then using
+    // the path, is the check-then-use shape this whole review has been about.
+    //
+    // Comparing device and inode is what makes the two the same thing: the
+    // handle cannot be redirected once open, so if the file it refers to is
+    // the same file the resolved-and-contained path names, the read is of
+    // something that passed the check.
+    let mut source = fs::File::open(&from).map_err(|err| Error::Io {
+        path: from.clone(),
+        source: err,
+    })?;
+    let opened = source.metadata().map_err(|err| Error::Io {
+        path: from.clone(),
+        source: err,
+    })?;
+    let resolved = resolve_deepest(&from)
+        .and_then(|real| fs::metadata(real).ok())
+        .filter(|named| named.dev() == opened.dev() && named.ino() == opened.ino());
+    if resolved.is_none() || !lands_within(&roots, &from) {
+        return Err(Error::Config(format!(
+            "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
+            artifact.display()
+        )));
+    }
+
+    let mut sink = fs::File::create(&to).map_err(|err| Error::Io {
+        path: to.clone(),
+        source: err,
+    })?;
+    io::copy(&mut source, &mut sink).map_err(|err| Error::Io {
+        path: from,
+        source: err,
+    })?;
 
     Ok(())
 }

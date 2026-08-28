@@ -137,11 +137,27 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
     // Measured 2026-08-28 before this change: a git alias forking
     // `sh -c 'sleep 8 &'` returned Ok after 8.02 seconds against a 600ms
     // budget, having reported success the whole time.
-    let left = deadline.saturating_duration_since(Instant::now());
-    let (Ok(stdout), Ok(stderr)) = (out.recv_timeout(left), err.recv_timeout(left)) else {
-        // Something still holds the pipe. Signal the group so it stops, and
-        // report the budget rather than the output we never got.
-        abandon(&mut child);
+    // Each wait re-reads the clock. Computing the remaining time once and
+    // spending it twice is how a two-pipe collect quietly doubles the budget:
+    // if the first pipe consumes all of it, the second is handed a fresh copy.
+    // Found while re-reading this function on 2026-08-28, having written the
+    // same class of overrun into it three times already.
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let (Ok(stdout), Ok(stderr)) = (out.recv_timeout(remaining()), err.recv_timeout(remaining()))
+    else {
+        // NOT `abandon` here. That signals the process group by negating
+        // `child.id()`, which is only safe while the child is alive: by this
+        // point `try_wait` has reaped it, and the wait above can have taken
+        // the whole budget, which `[dog.deploy]` allows to be minutes. A pid
+        // recycled in that window would put a SIGKILL into an unrelated
+        // process group, and the dog runs as root under the arrangement
+        // shep's own docs recommend, so the usual same-uid check would not
+        // stop it.
+        //
+        // Nothing is signalled instead. What still holds the pipe is an
+        // orphan git left behind, the reader threads are detached, and both
+        // finish and drop whenever it does. Leaking two threads is a smaller
+        // price than killing a stranger's process group.
         return Err(Error::Git {
             command: format!("git {}", args.join(" ")),
             status: None,

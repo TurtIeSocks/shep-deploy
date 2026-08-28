@@ -113,8 +113,54 @@ fn merged_document(release: &Path) -> Result<Value, Error> {
     let committed = read_required(&release.join("Flockfile.toml"))?;
     refuse_repo_privilege(&committed)?;
 
-    let override_doc = read_optional(&release.join("Flockfile.override.toml"))?;
+    let override_path = release.join("Flockfile.override.toml");
+    let override_doc = read_optional(&override_path)?;
+
+    // The override is exempt from the privilege refusal only because it is the
+    // OPERATOR's file. Nothing checked that, and the exemption is worthless
+    // without it: a repository that simply commits a `Flockfile.override.toml`
+    // had `user = "root"` honoured, which is the one thing this module's own
+    // doc calls the real boundary. Measured 2026-08-28, before this check
+    // existed: `app_config` returned `user = Some("root")` from a committed
+    // override.
+    //
+    // Provenance is checkable rather than assumed. The operator's file reaches
+    // a release as a SYMLINK, made by `crate::shared::link_into` out of their
+    // own checkout, and `link_into` already refuses when something is in the
+    // way, so a committed file cannot displace a shared one. What it cannot
+    // catch is the case where the operator has no override at all: then
+    // nothing is shared under that name, nothing collides, and the committed
+    // file arrives unopposed as an ordinary worktree file.
+    //
+    // So an override that does not resolve outside the release is treated as
+    // what it is, part of the repository, and held to the same refusal. That
+    // covers a plain committed file and a committed symlink pointing back
+    // inside the release alike.
+    if !override_doc.as_table().is_none_or(toml::Table::is_empty)
+        && !is_operators(release, &override_path)
+    {
+        refuse_repo_privilege(&override_doc)?;
+    }
+
     Ok(deep_merge(committed, override_doc))
+}
+
+/// Whether `path` reaches the release from outside it, as the operator's own
+/// shared file rather than as something the repository committed.
+///
+/// `link_into` shares the operator's gitignored files by symlink, so theirs
+/// resolves into their checkout. A committed file resolves inside the release,
+/// and so does a committed symlink pointing at another tracked file, which is
+/// why this asks where the path LANDS rather than whether it is a symlink.
+///
+/// Refusing to guess: a path that cannot be resolved at all is treated as the
+/// repository's, because the exemption it would otherwise buy is the ability
+/// to choose which unix user a process runs as.
+fn is_operators(release: &Path, path: &Path) -> bool {
+    let (Ok(real), Ok(inside)) = (path.canonicalize(), release.canonicalize()) else {
+        return false;
+    };
+    !real.starts_with(inside)
 }
 
 /// Reads and parses a Flockfile that must exist.
@@ -299,6 +345,64 @@ fn select_app(merged: &Value, sheep: &str) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a committed override can grant a unix user.
+    ///
+    /// The override is exempt from `refuse_repo_privilege` because it is the
+    /// operator's file. Nothing checked that it was, and the exemption is
+    /// worthless without the check: measured 2026-08-28, a repository that
+    /// simply committed `Flockfile.override.toml` had `user = "root"`
+    /// honoured, straight past the boundary this module's own doc calls the
+    /// one real one.
+    ///
+    /// `link_into` refuses when something is already in the way, so a
+    /// committed file cannot displace an override the operator does share.
+    /// This is the case it cannot cover: an operator with no override at all,
+    /// where nothing collides and the committed file simply arrives.
+    #[test]
+    fn a_committed_override_cannot_grant_a_user() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::fs::write(
+            rel.path().join("Flockfile.override.toml"),
+            "[[app]]\nname = \"web\"\nuser = \"root\"\n",
+        )
+        .expect("committed override");
+
+        let err =
+            app_config(rel.path(), "web").expect_err("a committed override must not grant a user");
+        assert!(
+            format!("{err}").contains("user"),
+            "the refusal must name the field: {err}"
+        );
+    }
+
+    /// fails if the operator's own override stops being able to pin a user.
+    ///
+    /// The counterpart. Theirs reaches a release as a symlink into their
+    /// checkout, so it resolves outside the release and keeps the exemption,
+    /// which is the whole "pin it so upstream cannot change it" mechanism.
+    #[test]
+    fn the_operators_own_override_still_pins_a_user() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        let theirs = checkout.path().join("Flockfile.override.toml");
+        std::fs::write(&theirs, "[[app]]\nname = \"web\"\nuser = \"svc\"\n").expect("theirs");
+        std::os::unix::fs::symlink(&theirs, rel.path().join("Flockfile.override.toml"))
+            .expect("shared in");
+
+        let app = app_config(rel.path(), "web").expect("the operator's override is honoured");
+        assert_eq!(app.user.as_deref(), Some("svc"));
+    }
+
     use crate::fixtures;
 
     use super::*;
