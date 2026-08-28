@@ -15,6 +15,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::symlink;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -69,6 +70,10 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Its own process group, so the whole tree can be signalled rather
+        // than just git. See `abandon` for why that is the difference between
+        // bounded and not.
+        .process_group(0)
         .spawn()
         .map_err(|source| Error::Io {
             path: dir.to_owned(),
@@ -93,32 +98,62 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
         }
-        if Instant::now() >= deadline {
-            // Killed, then reaped: leaving it would keep the bare clone's
-            // lock and fail the next tick for a reason that looks unrelated.
-            // Killing also closes the pipes, so both reader threads finish.
-            let _ = child.kill();
-            let _ = child.wait();
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            abandon(&mut child);
             break None;
         }
-        thread::sleep(POLL);
+        // Never sleep past the deadline: `POLL` is 50ms, and a budget smaller
+        // than that would otherwise overshoot to 50ms whatever was asked for.
+        thread::sleep(POLL.min(left));
+    };
+
+    let Some(status) = status else {
+        // Returning WITHOUT joining, deliberately. The reader threads exist to
+        // keep the child unblocked, and their output is not wanted on this
+        // path. Joining here would reintroduce the unbounded wait this whole
+        // function exists to remove: a grandchild holding the pipe means the
+        // read end never sees EOF, and `abandon` signalling the group makes
+        // that unlikely rather than impossible. They finish and drop on their
+        // own when the last writer goes.
+        return Err(Error::Git {
+            command: format!("git {}", args.join(" ")),
+            status: None,
+            stderr: format!(
+                "no answer within {budget:?}; abandoned so the other targets keep deploying"
+            ),
+        });
     };
 
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
 
-    let Some(status) = status else {
-        return Err(Error::Git {
-            command: format!("git {}", args.join(" ")),
-            status: None,
-            stderr: format!(
-                "no answer within {}s; abandoned so the other targets keep deploying",
-                budget.as_secs()
-            ),
-        });
-    };
-
     decode(dir, args, status, stdout, stderr)
+}
+
+/// Kills a timed-out child and everything it spawned, then reaps it.
+///
+/// The group, not just the pid. `Child::kill` signals the immediate process
+/// only, and `git fetch` over `ssh://` forks an `ssh` that inherits our pipe
+/// write-ends. Killing git alone leaves that `ssh` holding the pipe open, so
+/// the read end never sees EOF. Demonstrated 2026-08-28: a reader thread on a
+/// pipe a grandchild still holds does not finish, so joining it would hang
+/// past the budget, which is the exact failure this function exists to
+/// prevent.
+///
+/// `kill` the command rather than `libc::killpg`, because the crate forbids
+/// unsafe outright. Same "ask the host rather than reimplement its answer"
+/// idiom `crate::build` uses for `id`, and for the same reason.
+///
+/// Reaped afterwards: leaving a zombie git would keep the bare clone's lock
+/// and fail the next tick for a reason that looks unrelated.
+fn abandon(child: &mut std::process::Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+    // The group signal is the one that matters; this covers a host whose
+    // `kill` refuses the group form.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Reads one of a child's pipes to EOF on its own thread.
@@ -503,6 +538,46 @@ mod tests {
             out.len() > 100_000,
             "the fixture must exceed a pipe buffer or this proves nothing, got {} bytes",
             out.len()
+        );
+    }
+
+    /// fails if a process git spawned can extend the budget past its end.
+    ///
+    /// `Child::kill` signals the immediate pid only. `git fetch` over `ssh://`
+    /// forks an `ssh` that inherits our pipe write-ends, so killing git alone
+    /// leaves that `ssh` holding the pipe and the read end never sees EOF.
+    /// Demonstrated 2026-08-28: a reader thread on a pipe a grandchild still
+    /// holds does not finish, so joining it hangs past the budget, which is
+    /// the exact failure this function exists to prevent.
+    ///
+    /// Uses `sh` rather than git because git is hard to make fork on demand,
+    /// and the mechanism under test is the process group, not git.
+    ///
+    /// The assertion is on ELAPSED TIME, not on the error. An error alone
+    /// would be returned by the broken version too, eventually; the whole
+    /// claim is that it comes back near the budget rather than near the
+    /// grandchild's own lifetime.
+    #[test]
+    fn a_grandchild_cannot_extend_the_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `git -c alias.x=!<shell>` is how you make git fork something that
+        // outlives it while still being a git invocation.
+        let started = Instant::now();
+        let err = run_git_within(
+            dir.path(),
+            &["-c", "alias.hang=!sh -c 'sleep 30 &' && sleep 30", "hang"],
+            Duration::from_millis(600),
+        )
+        .expect_err("must not succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{err}").contains("no answer within"),
+            "must fail on the budget: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must return near the budget, not wait out the grandchild; took {elapsed:?}"
         );
     }
 
