@@ -1,40 +1,60 @@
 # release-plz owns the changelog, the version bump, the tag, the GitHub
 # release and the upload. Merging the release pull request is the whole
-# release; there is no tag to push by hand.
+# release, and since 2026-08-27 even that merge is automatic.
 #
-# ## Why this is not split
+# ## Rewritten on 2026-08-27 to match zendriver-rs
 #
-# shep and shep-log-rotate both started with release-plz opening the pull
-# request and a hand-written release.yml publishing behind a `v*` tag. The
-# argument was that publishing cannot be undone, and that a push to main is an
-# easier bar to clear by accident than a tag.
+# Rin's call: zendriver-rs's setup is the one to copy, across shep and both
+# dogs. This repository was already the closest of the three, since it was
+# written after the others and skipped their mistakes. What changed:
 #
-# That has the risk backwards. Publishing under the standard setup means
-# merging a pull request TITLED "chore: release vX.Y.Z", a reviewed, named,
-# visible artifact. Pushing a tag is a command someone types.
+#   changelog_update    unset -> true, with an explicit template. It was
+#                       already defaulting to true; what is new is
+#                       release-plz-changelog.toml, which skips docs, test,
+#                       ci, chore and style commits so a generated section
+#                       stays short and reads like a hand-written one.
+#   semver_check        unset -> true. cargo-semver-checks against the
+#                       published version, so an accidental breaking change
+#                       fails the release PR rather than shipping in a patch.
+#                       This crate is at 0.1.0 with consumers to come, which
+#                       is exactly when that starts to matter.
+#   git_release_enable  unset -> true. Was already the default; stated so it
+#                       survives a future default change.
+#   publish_no_verify   new, false. Also the default. Stated because the
+#                       opposite skips the pre-upload build, and an upload
+#                       cannot be undone.
 #
-# shep paid for it on 2026-08-26: its release pull request was merged, nothing
-# published, and main sat a version ahead of crates.io waiting on a step
-# nobody knew was missing. Both repositories were changed to this shape the
-# same day. This one is written that way from the start.
+# `release_always` is left unset, which is release-plz's default of true, so
+# any push to main naming an unpublished version publishes it. shep and
+# shep-log-rotate both set it to false and both regretted it: release-plz
+# decides a commit "came from a release PR" by the branch name prefix
+# `release-plz-`, so a version bump merged from any other branch is stranded,
+# bumped in Cargo.toml and absent from crates.io. shep hit that twice, on
+# 2026-08-26 and again on 2026-08-27.
 #
-# The `crates-io` environment exists so a required reviewer can be added there
-# if this ever wants a human gate between merging and spending a version.
+# What keeps the default safe is not in this file. The `main` ruleset requires
+# lint, docs, msrv, integration and the test matrix, so an untested commit
+# cannot reach main to be published. Delete the ruleset and nothing checks
+# anything before an upload.
 #
 # ## Before the first release
 #
-# This repository needs two secrets set, and neither exists until somebody
-# creates them: CARGO_REGISTRY_TOKEN, and optionally RELEASE_PLZ_TOKEN. The
-# workflow falls back to GITHUB_TOKEN without the second, which works only if
-# "Allow GitHub Actions to create and approve pull requests" is enabled for
-# the repository. shep-log-rotate's first release-plz run failed on exactly
-# that, with a 403 saying "GitHub Actions is not permitted to create or
-# approve pull requests".
+# Both secrets are set: CARGO_REGISTRY_TOKEN and RELEASE_PLZ_TOKEN. The second
+# is not optional now that the workflow auto-merges, and it must be a PAT: a
+# GITHUB_TOKEN-authored pull request does not start its own checks, so
+# `gh pr merge --auto` would queue behind checks that never run.
 
 [workspace]
 # Marks a GitHub release as a pre-release when the version carries a SemVer
 # pre-release tag. Inert for an ordinary version, and kept for the next one
 # that is not.
 git_release_type = "auto"
+git_release_enable = true
+
+changelog_update = true
+changelog_config = "release-plz-changelog.toml"
+
+semver_check = true
+publish_no_verify = false
 
 # No `[[package]]` sections: one crate, nothing to group or exclude.

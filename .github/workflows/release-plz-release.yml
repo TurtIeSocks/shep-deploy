@@ -1,0 +1,53 @@
+name: Release
+# Tags the commit, creates the GitHub release, and uploads to crates.io.
+#
+# Runs on every push to main and does nothing unless Cargo.toml names a
+# version that is not on crates.io. That is what makes merging the release
+# pull request the act that publishes: the merge is the only thing that moves
+# the version.
+#
+# There is no test gate here, and that is deliberate rather than an omission.
+# This job never had a gate: it was written before either repository had a ruleset, and published on any push to main.
+# main now has a ruleset requiring lint, docs, msrv, integration and the test
+# matrix, so an untested commit cannot reach main in the first place. Removing
+# that ruleset without restoring a gate would leave this publishing whatever
+# lands on main.
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-plz-release
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # An environment, so a required reviewer can be added here if this ever
+    # wants a human gate between merging and spending a version number.
+    # Inert until one is configured.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-plz needs the history to know what is already released.
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same commit pin as release-plz-pr.yml, for the same reason.
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
