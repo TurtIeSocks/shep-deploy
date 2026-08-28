@@ -141,10 +141,19 @@ enum Route<'a> {
 /// named `survey` needs the explicit form, `shep deploy deploy survey`,
 /// which is the escape hatch [`USAGE`] documents rather than a silent trap.
 fn route<'a>(args: &[&'a str]) -> Route<'a> {
-    match args {
+    let route = match args {
         [] => Route::Poll,
         ["on-remove"] => Route::OnRemove,
         ["survey"] => Route::Survey,
+        // A verb whose sheep is missing, before the bare-name arm below can
+        // read the verb itself as a sheep. `shep-deploy setup` used to mean
+        // "deploy the sheep called setup", which is a different command
+        // against a sheep that almost never exists.
+        //
+        // A sheep genuinely named `setup` or `deploy` is reached the same way
+        // one named `survey` already is, by spelling the verb out:
+        // `shep deploy setup`. That is the escape hatch USAGE documents.
+        ["setup" | "deploy"] => Route::Usage,
         ["setup", sheep] => Route::Setup(sheep),
         ["deploy", sheep] => Route::Deploy(sheep),
         ["deploy", sheep, "--watch", mode] => Route::Watch { sheep, mode },
@@ -155,6 +164,16 @@ fn route<'a>(args: &[&'a str]) -> Route<'a> {
         [sheep] => Route::Deploy(sheep),
         [sheep, "--watch", mode] => Route::Watch { sheep, mode },
         _ => Route::Usage,
+    };
+
+    // Every name that reaches a `Tree` comes through here, so this is the one
+    // place it has to be a name rather than a path. `Tree::for_sheep` joins it
+    // onto `$SHEP_HOME/deploy`, and an absolute name replaces that root
+    // outright rather than traversing out of it.
+    match route {
+        Route::Setup(sheep) | Route::Deploy(sheep) if !paths::is_sheep_name(sheep) => Route::Usage,
+        Route::Watch { sheep, .. } if !paths::is_sheep_name(sheep) => Route::Usage,
+        named => named,
     }
 }
 
@@ -685,5 +704,45 @@ mod tests {
     fn on_remove_routes_to_its_own_hook() {
         assert_eq!(route(&["on-remove"]), Route::OnRemove);
         assert_eq!(route(&["deploy", "on-remove"]), Route::Deploy("on-remove"));
+    }
+
+    /// fails if a verb with its sheep missing is read as a sheep named after
+    /// the verb.
+    ///
+    /// `shep-deploy setup` fell through the two-element arms to the bare-name
+    /// catch-all and became `Deploy("setup")`: a different command, aimed at a
+    /// sheep that almost certainly does not exist. Usage is what an operator
+    /// who forgot the argument needs, and it is what every other verb already
+    /// does.
+    #[test]
+    fn a_verb_without_its_sheep_is_a_usage_error() {
+        assert_eq!(route(&["setup"]), Route::Usage);
+        assert_eq!(route(&["deploy"]), Route::Usage);
+
+        // And the escape hatch still reaches a sheep really called that, the
+        // same one a sheep named `survey` or `on-remove` uses.
+        assert_eq!(route(&["deploy", "setup"]), Route::Deploy("setup"));
+        assert_eq!(route(&["deploy", "deploy"]), Route::Deploy("deploy"));
+    }
+
+    /// fails if a sheep name that is really a path reaches a `Tree`.
+    ///
+    /// `Tree::for_sheep` joins the name onto `$SHEP_HOME/deploy`, and
+    /// `PathBuf::join` REPLACES the path when given an absolute one. So an
+    /// absolute name does not traverse out of the tree, it discards the tree
+    /// and roots itself wherever it points, taking everything that later
+    /// prunes and removes inside it along.
+    #[test]
+    fn a_sheep_name_that_is_a_path_is_refused() {
+        for name in ["/tmp/anywhere", "../sibling", "a/b", "", ".", ".."] {
+            assert_eq!(route(&[name]), Route::Usage, "bare: {name}");
+            assert_eq!(route(&["deploy", name]), Route::Usage, "deploy: {name}");
+            assert_eq!(route(&["setup", name]), Route::Usage, "setup: {name}");
+            assert_eq!(
+                route(&[name, "--watch", "auto"]),
+                Route::Usage,
+                "watch: {name}"
+            );
+        }
     }
 }

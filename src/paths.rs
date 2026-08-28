@@ -16,7 +16,7 @@
 //! └── deploy.toml          the sheep's `State` - see `crate::state`
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::Error;
 
@@ -67,6 +67,32 @@ pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
 pub struct Tree {
     root: PathBuf,
     sheep: String,
+}
+
+/// Whether `sheep` names one sheep, rather than a path.
+///
+/// [`Tree::for_sheep`] joins this onto `$SHEP_HOME/deploy`, and `PathBuf::join`
+/// REPLACES the whole path when what it is given is absolute. So a sheep name
+/// of `/tmp/anywhere` does not traverse out of the tree, it discards the tree
+/// entirely and roots itself wherever it says. `..` traverses out the ordinary
+/// way. Either one puts a deploy tree, and everything that later prunes and
+/// removes inside it, somewhere the operator did not point it.
+///
+/// Checked at the one place a name arrives from outside, which is the command
+/// line. The poll loop's names come from directory entries under
+/// `$SHEP_HOME/deploy` that this crate created, so they are already inside.
+///
+/// The test is that the string is exactly one ordinary path component: that
+/// rejects the empty string, `.`, `..`, anything absolute, and anything with a
+/// separator in it, without a charset rule that would have to guess at what an
+/// operator may call their app.
+#[must_use]
+pub fn is_sheep_name(sheep: &str) -> bool {
+    let mut components = Path::new(sheep).components();
+    let one_ordinary_component =
+        matches!(components.next(), Some(Component::Normal(only)) if only == sheep);
+
+    one_ordinary_component && components.next().is_none()
 }
 
 impl Tree {
