@@ -160,7 +160,11 @@ fn is_operators(shared: &[PathBuf]) -> bool {
 }
 
 /// The override's name, in the one place both the check and the read use it.
-const OVERRIDE: &str = "Flockfile.override.toml";
+///
+/// `crate::shared::to_link` needs it too, to keep a repo-committed
+/// `.shepignore` from filtering the operator's own file out of the list this
+/// module then treats as proof of provenance.
+pub(crate) const OVERRIDE: &str = "Flockfile.override.toml";
 
 /// Reads and parses a Flockfile that must exist.
 ///

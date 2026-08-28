@@ -412,7 +412,8 @@ fn pattern_matches(path: &Path, pattern: &str) -> bool {
     }
 }
 
-/// [`ignored_present`], minus whatever `.shepignore` names.
+/// [`ignored_present`], minus whatever `.shepignore` names, except the
+/// operator's own `Flockfile.override.toml`, which nothing can filter out.
 ///
 /// This subtraction is the entire reason `.shepignore` exists. `.gitignore`
 /// conflates config that must be shared, caches that may be, and build
@@ -433,9 +434,19 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(ignored
         .into_iter()
         .filter(|path| {
-            !patterns
-                .iter()
-                .any(|pattern| pattern_matches(path, pattern))
+            // The operator's override is the one entry `.shepignore` cannot
+            // reach. `.shepignore` is committed by the deployed repository,
+            // and this list is the whole of the evidence
+            // `flockfile::is_operators` has that the override came from the
+            // operator rather than from the repo. A repo that can delete the
+            // entry deletes every pin the operator wrote in the override,
+            // `user` among them, and a build pinned to an unprivileged
+            // account runs as the dog's own uid instead. Silently: nothing
+            // errors, because an absent override is a legitimate state.
+            path == Path::new(crate::flockfile::OVERRIDE)
+                || !patterns
+                    .iter()
+                    .any(|pattern| pattern_matches(path, pattern))
         })
         .collect())
 }
@@ -785,6 +796,38 @@ mod tests {
         let linked = to_link(repo.path()).expect("computes");
         assert!(linked.iter().any(|p| p.ends_with("config/local.json")));
         assert!(!linked.iter().any(|p| p.ends_with("dist")));
+    }
+
+    /// fails if a committed `.shepignore` can drop the operator's own
+    /// override out of the shared list.
+    ///
+    /// `.shepignore` is a repo-committed file, so the deployed repository
+    /// writes it. `Flockfile.override.toml` is the operator's, and
+    /// `flockfile::is_operators` treats presence in this list as the whole
+    /// proof of that. Letting the repo delete the entry silently drops every
+    /// pin the operator put in the override, `user` included, which is the
+    /// one that keeps a build off the dog's own uid. One innocuous-looking
+    /// line, and a build the operator pinned to `svc` runs as root instead.
+    #[test]
+    fn a_committed_shepignore_cannot_drop_the_operators_override() {
+        let repo = fixture_repo(&[
+            (".gitignore", "Flockfile.override.toml\n"),
+            (".shepignore", "Flockfile.override.toml\n"),
+        ]);
+        // The operator's own, present on disk and never committed, exactly
+        // like the `config/local.json` the other fixtures here use.
+        fs::write(
+            repo.path().join("Flockfile.override.toml"),
+            "[[app]]\nname = \"web\"\nuser = \"svc\"\n",
+        )
+        .expect("the operator's override");
+
+        let linked = to_link(repo.path()).expect("computes");
+
+        assert!(
+            linked.iter().any(|p| p.ends_with("Flockfile.override.toml")),
+            "the override must survive a repo-committed .shepignore: {linked:?}"
+        );
     }
 
     /// fails if a repo with no `.shepignore` stops sharing everything
