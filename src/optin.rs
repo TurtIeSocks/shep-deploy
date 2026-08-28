@@ -244,6 +244,7 @@ pub async fn prepare<D: Daemon>(
         app.user.as_deref(),
         &config.passthrough,
         &tree.cache_target(),
+        config.build_timeout,
     )
     .await?;
 
@@ -688,6 +689,7 @@ mod tests {
             interval: std::time::Duration::from_secs(30),
             retention: 5,
             git_timeout: std::time::Duration::from_secs(60),
+            build_timeout: std::time::Duration::from_secs(60),
             passthrough: Vec::new(),
         }
     }

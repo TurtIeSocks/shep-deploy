@@ -48,6 +48,21 @@ const DEFAULT_RETENTION: usize = 5;
 /// than a late failure on a remote that was never going to answer.
 const DEFAULT_GIT_TIMEOUT: UpDuration = UpDuration::from_millis(300_000);
 
+/// How long a build may run before it is abandoned.
+///
+/// An hour, which is far longer than any build this is meant to bound and is
+/// deliberate. The purpose is to turn a build that will NEVER finish into an
+/// ordinary per-target failure, not to put a schedule on honest work: a cold
+/// Rust build of a large workspace legitimately runs tens of minutes, and
+/// failing one of those would be a worse bug than the one this fixes.
+///
+/// Without it a build that hangs stops the whole dog, not just its own target.
+/// `crate::poll::tick` deploys targets one at a time, so a single hung build
+/// holds the loop forever: no other target deploys, no smit refreshes, and
+/// nothing is logged, because nothing has failed. That is exactly the shape
+/// `git_timeout` was added for, one subprocess over.
+const DEFAULT_BUILD_TIMEOUT: UpDuration = UpDuration::from_millis(3_600_000);
+
 /// The fewest releases a target can keep and still be able to roll back.
 ///
 /// Two: the one that is live, and the one before it. Retention keeps the
@@ -76,6 +91,8 @@ pub struct DogConfig {
     pub retention: usize,
     /// How long any single git subprocess may run before it is abandoned.
     pub git_timeout: Duration,
+    /// How long a build may run before it is abandoned.
+    pub build_timeout: Duration,
     /// Environment variables copied from this process into a build, by name.
     ///
     /// A build otherwise starts from a cleared environment plus a small fixed
@@ -93,6 +110,7 @@ struct Raw {
     interval: UpDuration,
     retention: usize,
     git_timeout: UpDuration,
+    build_timeout: UpDuration,
     passthrough: Vec<String>,
 }
 
@@ -102,6 +120,7 @@ impl Default for Raw {
             interval: DEFAULT_INTERVAL,
             retention: DEFAULT_RETENTION,
             git_timeout: DEFAULT_GIT_TIMEOUT,
+            build_timeout: DEFAULT_BUILD_TIMEOUT,
             passthrough: Vec::new(),
         }
     }
@@ -118,7 +137,7 @@ impl DogConfig {
     /// [`Error::Config`] if the text is not valid TOML, carries a key this
     /// dog does not know, gives a value of the wrong type, asks for a
     /// retention below two, asks for a zero interval, or asks for a zero
-    /// `git_timeout`.
+    /// `git_timeout` or `build_timeout`.
     ///
     /// Every case except the first names the offending key, because the
     /// section is one an operator edited by hand and a complaint they cannot
@@ -157,10 +176,21 @@ impl DogConfig {
             ));
         }
 
+        let build_timeout = raw.build_timeout.as_duration();
+        if build_timeout.is_zero() {
+            return Err(Error::Config(
+                "build_timeout = \"0\" would abandon every build the moment it started; \
+                 the point of the bound is to turn a build that never finishes into an \
+                 ordinary per-target failure, not to disable building"
+                    .to_owned(),
+            ));
+        }
+
         Ok(Self {
             interval,
             retention: raw.retention,
             git_timeout,
+            build_timeout,
             passthrough: raw.passthrough,
         })
     }

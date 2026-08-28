@@ -66,9 +66,11 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::error::Error;
 
@@ -686,6 +688,7 @@ pub async fn run(
     as_user: Option<&str>,
     passthrough: &[String],
     cache: &Path,
+    budget: Duration,
 ) -> Result<(), Error> {
     let Some(command) = spec.command.as_deref() else {
         return Ok(());
@@ -731,10 +734,40 @@ pub async fn run(
         child.uid(uid_for(release, user).await?);
     }
 
-    let status = child.status().await.map_err(|source| Error::Io {
+    // Its own process group, so a build that has to be abandoned can be
+    // abandoned whole. `sh -c` is a shell, and what hangs is usually something
+    // it started rather than the shell itself, so killing only the shell would
+    // leave the real process running while the deploy reports a failure. Same
+    // shape and same reason as `crate::shared::run_git_within`.
+    child.process_group(0);
+
+    let mut child = child.spawn().map_err(|source| Error::Io {
         path: release.to_owned(),
         source,
     })?;
+
+    // Bounded, because an unbounded wait here does not stop one target, it
+    // stops the dog. `crate::poll::tick` deploys targets one at a time, so a
+    // build that never finishes holds that loop forever: no other target
+    // deploys, no smit is refreshed, and nothing is logged, because from the
+    // loop's point of view nothing has gone wrong. That is the failure
+    // `git_timeout` was added for, one subprocess along.
+    //
+    // A test that drives a real build cannot use `#[tokio::test(start_paused
+    // = true)]` because of this line. Paused time advances to the next
+    // deadline whenever the runtime is idle, and a real subprocess makes it
+    // idle, so the budget expires at once whatever it is set to. See
+    // `crate::deploy`'s `a_current_that_moved_during_the_build_is_not_swapped_over`.
+    let status = match timeout(budget, child.wait()).await {
+        Ok(waited) => waited.map_err(|source| Error::Io {
+            path: release.to_owned(),
+            source,
+        })?,
+        Err(_) => {
+            abandon(&mut child).await;
+            return Err(Error::BuildTimedOut { after: budget });
+        }
+    };
 
     if !status.success() {
         return Err(Error::Build {
@@ -749,8 +782,80 @@ pub async fn run(
     Ok(())
 }
 
+/// Kills an abandoned build's whole process group.
+///
+/// The group, not the child: `run` spawns `sh -c`, and a hung build is
+/// normally something the shell started. Killing the shell alone leaves that
+/// running against the release the deploy is about to give up on.
+///
+/// Failures are ignored throughout. This runs on the path where the build has
+/// already been given up on, and a kill that cannot be delivered leaves
+/// nothing this function can do about it that the caller has not already
+/// decided.
+async fn abandon(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        let group = format!("-{pid}");
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &group])
+            .status()
+            .await;
+    }
+    // The group signal is the one that matters; this covers a host whose
+    // `kill` refuses the group form.
+    let _ = child.kill().await;
+}
+
 #[cfg(test)]
 mod tests {
+    /// fails if a build that never finishes is waited on forever.
+    ///
+    /// It does not stop one target, it stops the dog. `crate::poll::tick`
+    /// deploys targets one at a time, so a build that hangs holds that loop
+    /// with no other target deploying, no smit refreshed and nothing logged,
+    /// because from the loop's point of view nothing has failed. The same
+    /// shape `git_timeout` exists to prevent for a fetch.
+    ///
+    /// Not `start_paused`, and it cannot be: see the note on the timeout in
+    /// `run` for why a real subprocess and a paused clock cannot be combined.
+    #[tokio::test]
+    async fn a_build_that_never_finishes_is_abandoned() {
+        let rel = fixtures::fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("sleep 600".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![],
+        };
+
+        let err = run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            Duration::from_millis(250),
+        )
+        .await
+        .expect_err("a build that never finishes must be abandoned");
+
+        assert!(
+            matches!(err, Error::BuildTimedOut { .. }),
+            "must say it timed out rather than that it failed: {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("build_timeout"),
+            "must name the knob that changes it: {err}"
+        );
+    }
+
+    /// A build budget the test tier can never legitimately hit.
+    ///
+    /// Every build here is `true` or a one-line shell command, so anything
+    /// slower than a minute is a hang worth failing on rather than waiting
+    /// out. Distinct from the production default, which is an hour because a
+    /// cold build of a real workspace legitimately runs tens of minutes.
+    const TEST_BUILD_BUDGET: Duration = Duration::from_secs(60);
+
     /// A throwaway stand-in for the dog's own build cache.
     ///
     /// Its own directory, never `release/target`, because that entry is the
@@ -884,9 +989,17 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
-                .await
-                .is_err()
+            run(
+                "web",
+                rel.path(),
+                &spec,
+                None,
+                &[],
+                tempdir_cache().path(),
+                TEST_BUILD_BUDGET
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -898,9 +1011,17 @@ mod tests {
         let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec::default();
         assert!(
-            run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
-                .await
-                .is_ok()
+            run(
+                "web",
+                rel.path(),
+                &spec,
+                None,
+                &[],
+                tempdir_cache().path(),
+                TEST_BUILD_BUDGET
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -926,9 +1047,17 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/koji")],
         };
-        run("web", rel.path(), &spec, None, &[], cache.path())
-            .await
-            .expect("builds");
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            cache.path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds");
         assert!(rel.path().join("target/release/koji").exists());
     }
 
@@ -958,9 +1087,17 @@ mod tests {
             env: BTreeMap::new(),
             artifacts: vec![],
         };
-        run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
-            .await
-            .expect("builds");
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds");
         let leaked = std::fs::read_to_string(rel.path().join("leaked.txt")).unwrap_or_default();
         assert!(
             leaked.trim().is_empty(),
@@ -988,6 +1125,7 @@ mod tests {
             None,
             &["CARGO_PKG_NAME".to_owned()],
             tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
         )
         .await
         .expect("builds");
@@ -1028,9 +1166,17 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/koji")],
         };
-        run("web", rel.path(), &spec, None, &[], cache.path())
-            .await
-            .expect("builds");
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            cache.path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds");
 
         assert_eq!(
             std::fs::read(cache.path().join("release/koji")).expect("still there"),
@@ -1065,9 +1211,17 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/id_rsa")],
         };
-        let err = run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
-            .await
-            .expect_err("a source outside the tree must be refused");
+        let err = run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect_err("a source outside the tree must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "must say why: {err}"
@@ -1104,9 +1258,17 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/victim")],
         };
-        let err = run("web", rel.path(), &spec, None, &[], cache.path())
-            .await
-            .expect_err("a write through a committed symlink must be refused");
+        let err = run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            cache.path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect_err("a write through a committed symlink must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "must say why: {err}"
@@ -1154,9 +1316,17 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/sub/out")],
         };
-        let err = run("web", rel.path(), &spec, None, &[], cache.path())
-            .await
-            .expect_err("a write through a symlinked component must be refused");
+        let err = run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            cache.path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect_err("a write through a symlinked component must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "must say why: {err}"
@@ -1204,9 +1374,17 @@ mod tests {
             artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
         };
 
-        let err = run("web", &release, &spec, None, &[], tempdir_cache().path())
-            .await
-            .expect_err("an escaping artifact must be refused");
+        let err = run(
+            "web",
+            &release,
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect_err("an escaping artifact must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "the refusal must say why, got: {err}"
@@ -1286,9 +1464,17 @@ mod tests {
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
         assert!(
-            run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
-                .await
-                .is_ok()
+            run(
+                "web",
+                rel.path(),
+                &spec,
+                None,
+                &[],
+                tempdir_cache().path(),
+                TEST_BUILD_BUDGET
+            )
+            .await
+            .is_ok()
         );
     }
 
@@ -1314,6 +1500,7 @@ mod tests {
             Some(&user),
             &[],
             tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
         )
         .await
         .expect("dropping to one's own user and group is always permitted");
@@ -1350,6 +1537,7 @@ mod tests {
             Some("shep-deploy-test-no-such-user"),
             &[],
             tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
         )
         .await
         .expect_err("no such user");
@@ -1422,9 +1610,17 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run("web", rel.path(), &spec, None, &[], tempdir_cache().path())
-            .await
-            .expect("builds");
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
     }

@@ -434,6 +434,7 @@ async fn attempt<D: Daemon>(
         app.user.as_deref(),
         &config.passthrough,
         &tree.cache_target(),
+        config.build_timeout,
     )
     .await?;
 
@@ -1164,6 +1165,7 @@ mod tests {
             interval: std::time::Duration::from_secs(30),
             retention: 5,
             git_timeout: std::time::Duration::from_secs(60),
+            build_timeout: std::time::Duration::from_secs(60),
             passthrough: Vec::new(),
         }
     }
@@ -2963,11 +2965,19 @@ mod tests {
     /// is live and healthy - and nothing anywhere reports a problem. The
     /// build command below is what a concurrent deploy's swap looks like
     /// from inside this one.
-    // Paused, though nothing here waits on the clock when the guard holds:
-    // if it ever stops holding, this deploy falls through to a real
-    // verification window, and a test that fails in 90 seconds reads as a
-    // hang rather than as the regression it is.
-    #[tokio::test(start_paused = true)]
+    // NOT paused, unlike almost every other test here, and it cannot be.
+    // This is the one test that runs a real build command, and `build::run`
+    // bounds that command with `tokio::time::timeout`. Under `start_paused`
+    // tokio advances the clock to the next deadline whenever the runtime has
+    // nothing to do, and a real subprocess makes it idle, so the build times
+    // out immediately however large the budget is.
+    //
+    // The cost is what the previous comment here was protecting against: if
+    // the raced-swap guard ever stops holding, this falls through to a real
+    // verification window and fails in about ninety seconds, which reads as a
+    // hang rather than as the regression it is. Slow and correct beats fast
+    // and impossible.
+    #[tokio::test]
     async fn a_current_that_moved_during_the_build_is_not_swapped_over() {
         let mut fixture = fixture_with_previous_release();
         let previous = fixture.state.deployed.clone().expect("a previous release");

@@ -85,10 +85,11 @@ moved. Configure it in `shep.toml`:
 interval = "30s"
 retention = 5
 git_timeout = "5m"
+build_timeout = "1h"
 passthrough = ["CARGO_HOME"]
 ```
 
-All four are read once, when the dog starts, so changing any takes a `shep
+All five are read once, when the dog starts, so changing any takes a `shep
 restart deploy`.
 
 `retention` is how many releases each target keeps **besides the live one**, so
@@ -102,6 +103,14 @@ time, so without it a remote that drops packets rather than refusing them stops
 every target and every smit refresh, with no error and no log line. Five
 minutes by default, which is generous enough for a cold clone of a large
 repository.
+
+`build_timeout` bounds the build command, against the same failure and for the
+same reason. A build that never finishes holds that same one-at-a-time loop, so
+no other target deploys and nothing is logged, because from the loop's point of
+view nothing has gone wrong. An hour by default, which no honest build should
+reach: it exists to turn a build that will never finish into an ordinary
+per-target failure, not to put a schedule on slow work. A build past it is
+killed as a process group, so whatever the build command started goes with it.
 
 `passthrough` names environment variables a build may keep from the dog's own
 environment. See Security below for why that list starts empty.

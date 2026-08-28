@@ -7,6 +7,7 @@
 
 use core::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use shep_client::shep_core::protocol::{RpcErrorCode, SmitError};
 use shep_client::{ConnectError, RequestError};
@@ -299,6 +300,16 @@ pub enum Error {
         /// signal instead of exiting.
         status: Option<i32>,
     },
+    /// The build ran longer than `build_timeout` and was abandoned.
+    ///
+    /// Distinct from [`Self::Build`] because the two need different words. A
+    /// build that exits non-zero failed and said so; this one never answered,
+    /// and the operator's next move is to look at what it is waiting on rather
+    /// than at its output.
+    BuildTimedOut {
+        /// The budget it ran past.
+        after: Duration,
+    },
 }
 
 impl Error {
@@ -500,6 +511,11 @@ impl fmt::Display for Error {
                     removes.join(", ")
                 )
             }
+            Self::BuildTimedOut { after } => write!(
+                f,
+                "the build did not finish within {after:?} and was abandoned; raise \
+                 build_timeout in [dog.deploy] if it legitimately needs longer"
+            ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
@@ -527,6 +543,7 @@ impl core::error::Error for Error {
             | Self::Held { .. }
             | Self::Git { .. }
             | Self::Raced { .. }
+            | Self::BuildTimedOut { .. }
             | Self::Unverified { .. }
             | Self::Stranded { .. }
             | Self::Build { .. } => None,
