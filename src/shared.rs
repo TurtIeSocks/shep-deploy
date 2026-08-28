@@ -154,10 +154,19 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         // shep's own docs recommend, so the usual same-uid check would not
         // stop it.
         //
-        // Nothing is signalled instead. What still holds the pipe is an
-        // orphan git left behind, the reader threads are detached, and both
-        // finish and drop whenever it does. Leaking two threads is a smaller
-        // price than killing a stranger's process group.
+        // Nothing is signalled instead: what holds the pipe is an orphan git
+        // left behind, and this process has no safe way to name it.
+        //
+        // The readers are not simply abandoned, though. Dropping the receivers
+        // is what lets them finish: their `send` then fails, which is the
+        // documented shape, and the thread returns. Without that they would
+        // sit in `read_to_end` for as long as the orphan lives, holding a
+        // thread and a pipe fd each. The poll loop runs a fetch per target per
+        // tick forever, so a remote that reliably produces such an orphan
+        // would leak two of each per tick until the process ran out, taking
+        // every other target down with it.
+        drop(out);
+        drop(err);
         return Err(Error::Git {
             command: format!("git {}", args.join(" ")),
             status: None,

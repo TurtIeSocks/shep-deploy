@@ -364,15 +364,15 @@ async fn attempt<D: Daemon>(
         git::worktree_add(&tree.git(), &release, head)?;
     }
     shared::link_cache(&release, &tree.cache_target())?;
-    shared::link_into(
-        &release,
-        &state.checkout,
-        &shared::to_link(&state.checkout)?,
-    )?;
+    // Held, not recomputed. This is the only record of which files came from
+    // the operator's own checkout rather than from the repository, and
+    // `flockfile` needs it to know whether an override is theirs.
+    let shared_paths = shared::to_link(&state.checkout)?;
+    shared::link_into(&release, &state.checkout, &shared_paths)?;
 
-    let app = flockfile::app_config(&release, sheep)?;
+    let app = flockfile::app_config(&release, sheep, &shared_paths)?;
     refuse_ungated_verification(sheep, &app, state.verify)?;
-    let spec = flockfile::build_spec(&release)?;
+    let spec = flockfile::build_spec(&release, &shared_paths)?;
     build::run(
         sheep,
         &release,

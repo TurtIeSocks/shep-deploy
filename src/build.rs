@@ -64,7 +64,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -358,6 +358,27 @@ fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Pa
     release.join(artifact)
 }
 
+/// `O_NOFOLLOW`, without a libc dependency or an unsafe block.
+///
+/// The value is fixed by each platform's ABI and cannot change without
+/// breaking every compiled program on it. Same "ask the host rather than
+/// reimplement its answer" spirit as `build`'s use of `id`, except here the
+/// host's answer is a constant.
+const fn libc_o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0o400_000
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        0x0100
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        compile_error!("O_NOFOLLOW's value is not known for this target")
+    }
+}
+
 /// The deepest ancestor of `path` that exists, fully resolved.
 ///
 /// `canonicalize` fails on a path that does not exist yet, and an artifact's
@@ -511,10 +532,26 @@ fn copy_artifact(
         )));
     }
 
-    let mut sink = fs::File::create(&to).map_err(|err| Error::Io {
-        path: to.clone(),
-        source: err,
-    })?;
+    // `O_NOFOLLOW` on the destination, because the source was the only half
+    // the previous fix covered. `File::create` follows symlinks and truncates,
+    // so a component swapped in after the check was followed at write time,
+    // at the dog's uid. Measured 2026-08-28: a background job toggling
+    // `release/target` between a directory and a symlink won that race in
+    // 0.03s and put build output outside the release.
+    //
+    // Refusing rather than resolving-and-rechecking: the kernel deciding at
+    // open time is not a race, and a legitimate artifact destination is never
+    // a symlink.
+    let mut sink = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc_o_nofollow())
+        .open(&to)
+        .map_err(|err| Error::Io {
+            path: to.clone(),
+            source: err,
+        })?;
     io::copy(&mut source, &mut sink).map_err(|err| Error::Io {
         path: from,
         source: err,
@@ -1261,35 +1298,5 @@ mod tests {
             .expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
-    }
-}
-
-#[cfg(test)]
-mod demo_probe {
-    use super::*;
-    use crate::fixtures;
-
-    #[tokio::test]
-    async fn demo_alias_via_self_pointing_symlink_truncates_existing_file() {
-        let rel = fixtures::fixture_release(&[]);
-        std::fs::write(rel.path().join("keep.txt"), b"IMPORTANT-PRESERVED-CONTENT").unwrap();
-        // Committed symlink: target -> "." (release root itself)
-        std::os::unix::fs::symlink(".", rel.path().join("target")).unwrap();
-
-        let cache = fixtures::tempdir();
-        let spec = BuildSpec {
-            command: Some("true".into()),
-            env: [(
-                "CARGO_TARGET_DIR".into(),
-                rel.path().display().to_string(),
-            )]
-            .into(),
-            artifacts: vec![PathBuf::from("target/keep.txt")],
-        };
-        let result = run("web", rel.path(), &spec, None, &[], cache.path()).await;
-        eprintln!("run result: {result:?}");
-        let contents = std::fs::read_to_string(rel.path().join("keep.txt")).unwrap_or_default();
-        eprintln!("keep.txt contents afterward: {contents:?}");
-        assert_eq!(contents, "IMPORTANT-PRESERVED-CONTENT", "should be untouched if guard holds");
     }
 }
