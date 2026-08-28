@@ -825,7 +825,9 @@ mod tests {
         let linked = to_link(repo.path()).expect("computes");
 
         assert!(
-            linked.iter().any(|p| p.ends_with("Flockfile.override.toml")),
+            linked
+                .iter()
+                .any(|p| p.ends_with("Flockfile.override.toml")),
             "the override must survive a repo-committed .shepignore: {linked:?}"
         );
     }
