@@ -10,7 +10,7 @@ keywords = ["shep", "process-manager", "deploy", "git"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-shep-client = "0.1.4"
+shep-client = "0.1.10"
 # Already in the tree: shep-core depends on it, so this is a direct edge on
 # something every build of this crate already compiles. Only `fs` is wanted,
 # for `flock(2)`.
