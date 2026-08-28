@@ -542,6 +542,22 @@ fn copy_artifact(
     // Refusing rather than resolving-and-rechecking: the kernel deciding at
     // open time is not a race, and a legitimate artifact destination is never
     // a symlink.
+    // Identity, not spelling. `link_cache` symlinks `release/target` at the
+    // dog's own cache, so a redirect through `CARGO_TARGET_DIR` gives a source
+    // and a destination that differ as strings and name one file. The lexical
+    // `from == to` above cannot see that, and opening the destination for
+    // writing truncates the source before anything is read.
+    //
+    // The original `fs::copy` version carried a comment warning about exactly
+    // this and guarded it lexically, which held only while `fs::copy` was the
+    // route. Replacing it with an explicit open reopened the hole, so the
+    // guard is now on the same footing as the source check above it.
+    if fs::metadata(&to)
+        .is_ok_and(|there| there.dev() == opened.dev() && there.ino() == opened.ino())
+    {
+        return Ok(());
+    }
+
     let mut sink = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -956,6 +972,46 @@ mod tests {
                 .expect("the build wrote it")
                 .trim(),
             "shep-deploy"
+        );
+    }
+
+    /// fails if an artifact can truncate the file it is copying.
+    ///
+    /// `link_cache` symlinks `release/target` at the dog's own cache, so a
+    /// `CARGO_TARGET_DIR` pointing there gives a source and a destination that
+    /// differ as strings and name one file. Opening the destination for
+    /// writing then empties the source before anything is read.
+    ///
+    /// The original `fs::copy` version guarded this lexically and said so in
+    /// its own doc. Replacing the copy with an explicit open reopened the
+    /// hole, which is why the guard now compares device and inode like the
+    /// containment check above it rather than comparing spellings.
+    #[tokio::test]
+    async fn an_artifact_that_is_already_where_it_belongs_is_not_truncated() {
+        let rel = fixtures::fixture_release(&[]);
+        let cache = tempdir_cache();
+        std::fs::create_dir_all(cache.path().join("release")).expect("cache");
+        std::fs::write(cache.path().join("release/koji"), b"binary").expect("built");
+        // Exactly what `link_cache` does.
+        std::os::unix::fs::symlink(cache.path(), rel.path().join("target")).expect("link");
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/release/koji")],
+        };
+        run("web", rel.path(), &spec, None, &[], cache.path())
+            .await
+            .expect("builds");
+
+        assert_eq!(
+            std::fs::read(cache.path().join("release/koji")).expect("still there"),
+            b"binary",
+            "the artifact must survive being copied onto itself"
         );
     }
 

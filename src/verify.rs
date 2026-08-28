@@ -274,8 +274,24 @@ async fn describe_within<D: Daemon>(
     loop {
         match daemon.describe(sheep).await {
             Ok(flock) => return Ok(flock),
-            Err(err) if err.is_retryable() && Instant::now() < deadline => sleep(POLL).await,
-            Err(err) => return Err(err),
+            Err(err) if !err.is_retryable() => return Err(err),
+            Err(err) => {
+                // `budget` bounds the RETRYING, never the asking. The caller
+                // wanted one describe and gets it whatever the clock says;
+                // `turnover` in particular hands over whatever is left of its
+                // own deadline and still expects the question put, because its
+                // loop is what decides that time is up.
+                //
+                // The sleep is clamped so a retry cannot run past the
+                // deadline, which is the part that was genuinely loose:
+                // `POLL` is 100ms and a budget with less than that remaining
+                // used to overshoot it.
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(err);
+                }
+                sleep(POLL.min(left)).await;
+            }
         }
     }
 }
