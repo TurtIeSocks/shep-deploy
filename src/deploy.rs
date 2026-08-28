@@ -53,6 +53,7 @@
 //! the running app keeps serving and the operator's fix is one `rm` once
 //! they have checked no deploy is in flight.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -344,6 +345,61 @@ async fn go<D: Daemon>(
     outcome
 }
 
+/// The file [`checkout_release`] writes once a worktree is fully checked out.
+///
+/// Inside the release rather than beside it, so retention removes it along
+/// with the release it describes and no bookkeeping outlives its subject.
+const COMPLETE: &str = ".shep-complete";
+
+/// Checks `sha` out at `release`, unless a FINISHED checkout is already there.
+///
+/// `release.exists()` was the test until round 9 of the founder's review, and
+/// it cannot tell a finished checkout from one that died partway. `git
+/// worktree add` writes a commit's files one at a time, so a kill leaves the
+/// directory present holding an arbitrary subset of them. Measured on an
+/// 800-file repository, three SIGKILLs 12ms in left 249, 358 and 0 files.
+///
+/// The next tick against that sha then skipped the checkout and built,
+/// swapped, reloaded and verified against the subset, reporting success.
+/// Nothing downstream catches it. A missing `Flockfile.toml` fails loudly,
+/// and every other missing file is simply absent from a release the operator
+/// has been told is live.
+///
+/// `rev-parse HEAD` is not the check either, which is worth writing down
+/// because it is the obvious one to reach for. The first of those three kills
+/// left a readable HEAD at the right sha next to 249 of 800 files.
+///
+/// So the marker is written here, after `git worktree add` returns, and only
+/// a release carrying it is reused.
+///
+/// # Errors
+/// [`Error::Io`] if a stale directory cannot be removed or the marker cannot
+/// be written. Whatever [`git::worktree_prune`] and [`git::worktree_add`]
+/// return.
+pub(crate) fn checkout_release(git_dir: &Path, release: &Path, sha: &str) -> Result<(), Error> {
+    if release.join(COMPLETE).is_file() {
+        return Ok(());
+    }
+
+    if release.exists() {
+        fs::remove_dir_all(release).map_err(|source| Error::Io {
+            path: release.to_owned(),
+            source,
+        })?;
+        // Removing the directory is not enough on its own: git still has the
+        // path registered and refuses the next add with "missing but already
+        // registered worktree". Verified 2026-08-28.
+        git::worktree_prune(git_dir)?;
+    }
+
+    git::worktree_add(git_dir, release, sha)?;
+    let marker = release.join(COMPLETE);
+    fs::write(&marker, b"").map_err(|source| Error::Io {
+        path: marker,
+        source,
+    })
+}
+
 /// Everything from the release directory to the verdict, for one sha that
 /// is going to be attempted.
 ///
@@ -360,9 +416,7 @@ async fn attempt<D: Daemon>(
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
     let release = tree.release(head);
-    if !release.exists() {
-        git::worktree_add(&tree.git(), &release, head)?;
-    }
+    checkout_release(&tree.git(), &release, head)?;
     shared::link_cache(&release, &tree.cache_target())?;
     // Held, not recomputed. This is the only record of which files came from
     // the operator's own checkout rather than from the repository, and
@@ -1611,6 +1665,60 @@ mod tests {
 
         let written = State::read(&fixture.tree.state_file()).expect("deploy.toml was written");
         assert_eq!(written.deployed.as_deref(), Some(second.as_str()));
+    }
+
+    /// fails if a release directory is deployed without anyone checking that
+    /// the checkout inside it finished.
+    ///
+    /// `git worktree add` writes a commit's files one at a time, so a kill
+    /// partway leaves the directory present holding an arbitrary subset. The
+    /// test used to be `release.exists()`, so the next tick against that sha
+    /// skipped the checkout, then built, swapped, reloaded and verified
+    /// against the partial tree and reported success.
+    ///
+    /// Modelled by checking the release out properly and removing one file,
+    /// which is what a real kill leaves. Measured on an 800-file repository,
+    /// three SIGKILLs 12ms in left 249, 358 and 0 files, and the first of
+    /// those had a readable HEAD at the right sha - so `rev-parse` is not the
+    /// missing check either.
+    ///
+    /// Checking out here needs its own fetch: the bare clone does not have
+    /// `second` until `deploy` fetches, and this has to place the directory
+    /// BEFORE deploy runs.
+    #[tokio::test]
+    async fn a_release_whose_checkout_did_not_finish_is_checked_out_again() {
+        let mut fixture = fixture_with_previous_release();
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        crate::git::fetch(
+            &fixture.tree.git(),
+            &fixture.state.remote,
+            fixtures::TEST_BUDGET,
+        )
+        .expect("fetch so the sha is checkoutable");
+        let release = fixture.tree.release(&second);
+        crate::git::worktree_add(&fixture.tree.git(), &release, &second).expect("worktree");
+        fs::remove_file(release.join("second.txt")).expect("a checkout that did not finish");
+
+        let outcome = deploy(
+            &Shepherd::ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &test_config(),
+        )
+        .await
+        .expect("completes");
+
+        assert_eq!(
+            outcome,
+            Outcome::Deployed {
+                sha: second.clone()
+            }
+        );
+        assert!(
+            release.join("second.txt").exists(),
+            "a deployed release must hold every file of its commit"
+        );
     }
 
     /// fails if a sha whose deploy did not land is not written down. The
