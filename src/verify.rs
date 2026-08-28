@@ -262,6 +262,18 @@ pub async fn wait<D: Daemon>(
 /// `budget` bounds the retrying, so a shepherd that is genuinely gone still
 /// fails rather than hanging.
 ///
+/// It does NOT bound the asking, and that is deliberate rather than loose.
+/// A caller's wall-clock can therefore exceed its own `budget` by one slow
+/// answer, which round 7 of the founder's review raised. Kept, for two
+/// reasons. The overrun is bounded without any help from here: every
+/// `describe` goes through `shep_client`'s `Client::request`, whose
+/// `DEFAULT_DEADLINE` is 5s, matching the daemon's own `DEFAULT_DEADLINE_MS`.
+/// And the obvious fix is worse than the problem: wrapping the call in a
+/// timeout against what is left of the budget means the last poll of a
+/// `turnover` gets almost no time and fails for that reason, which is how a
+/// healthy release gets rolled back at the cost of a second live reload. That
+/// is the exact failure the retry above this line was added to prevent.
+///
 /// # Errors
 /// Whatever [`Daemon::describe`] returns, once a failure is either fatal or
 /// the budget is spent.
