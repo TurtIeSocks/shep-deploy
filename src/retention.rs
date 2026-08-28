@@ -251,7 +251,12 @@ mod tests {
     fn the_live_release_is_never_pruned_whatever_its_age() {
         let all = releases(&["new", "old", "older", "ancient"]);
         assert_eq!(doomed(&all, 2, Some("ancient")), vec!["older"]);
-        assert!(!doomed(&all, 1, Some("ancient")).contains(&"ancient".to_owned()));
+        // At keep = 1 the live release is the ONLY survivor besides the
+        // newest, which is the "whatever its age" the name promises. Asserting
+        // merely that `ancient` is absent restated `doomed`'s unconditional
+        // live filter and would have passed at any keep, including a keep this
+        // function does not honour.
+        assert_eq!(doomed(&all, 1, Some("ancient")), vec!["old", "older"]);
     }
 
     /// fails if the rollback target is pruned along with the rest. The

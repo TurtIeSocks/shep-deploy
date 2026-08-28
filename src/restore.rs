@@ -386,6 +386,36 @@ pub fn report(results: &[Restored]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a `deploy.toml` that cannot be parsed is skipped silently.
+    ///
+    /// This is the one moment the record matters most: removal is when the dog
+    /// puts every sheep back where its operator will look for it, and a target
+    /// it cannot read is a target it cannot restore. Skipping it would leave
+    /// an app running from a path under `$SHEP_HOME` with nothing said about
+    /// it.
+    ///
+    /// `poll.rs` pins the identical shape for `tick` in
+    /// `a_record_that_cannot_be_read_is_reported_rather_than_skipped`; the
+    /// branch here had no equivalent, so a change to `State::read`'s error
+    /// path could have gone quiet on one side and been caught only on the
+    /// other.
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_is_reported_rather_than_skipped() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "garbled");
+        std::fs::create_dir_all(tree.root()).expect("create the tree");
+        std::fs::write(tree.state_file(), "this is not toml").expect("write deploy.toml");
+
+        let results = all(&Recording::new(&[], Refuse::Never), home.path()).await;
+
+        assert_eq!(results.len(), 1, "the target must be reported, not skipped");
+        assert!(
+            matches!(&results[0], Restored::Failed { sheep, .. } if sheep == "garbled"),
+            "an unreadable record must be a reported failure, got: {:?}",
+            results[0]
+        );
+    }
+
     use std::cell::{Cell, RefCell};
     use std::fs;
 

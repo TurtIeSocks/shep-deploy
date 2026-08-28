@@ -93,6 +93,37 @@ pub fn resolve(current: &Path) -> Result<Option<PathBuf>, Error> {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a leftover `current.tmp` stops being a refusal.
+    ///
+    /// `point_at` creates the symlink at a temporary path and then renames it
+    /// over `current`, because rename(2) is the only step that is atomic. If
+    /// something already occupies that temporary path the symlink cannot be
+    /// created, and the swap must fail there rather than proceeding.
+    ///
+    /// Its doc names this failure mode; until now the only test in this module
+    /// exercised the success path, and the refusal was reached only
+    /// transitively through `deploy`'s rollback tests and their fake daemon.
+    /// A resequencing of the rollback would have dropped the coverage
+    /// silently.
+    #[test]
+    fn a_leftover_tmp_path_refuses_the_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let release = dir.path().join("releases/abc");
+        std::fs::create_dir_all(&release).expect("release");
+        let current = dir.path().join("current");
+        std::fs::write(dir.path().join("current.tmp"), b"in the way").expect("blocker");
+
+        let err = point_at(&current, &release).expect_err("an occupied tmp path must refuse");
+        assert!(
+            matches!(&err, Error::Io { path, .. } if path.ends_with("current.tmp")),
+            "the refusal must name the path in the way, got: {err}"
+        );
+        assert!(
+            !current.exists(),
+            "a refused swap must leave `current` exactly as it found it"
+        );
+    }
+
     use super::*;
     use tempfile::tempdir;
 
