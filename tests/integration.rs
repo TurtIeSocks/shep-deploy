@@ -653,7 +653,7 @@ fn a_failing_build_leaves_the_previous_release_serving() {
     fs::write(
         origin.path().join("Flockfile.toml"),
         format!(
-            "{}\n[build]\ncommand = 'exit 3'\n",
+            "{}\n[dog.deploy.build]\ncommand = 'exit 3'\n",
             app_toml(shepherd.home(), false, Readiness::Probe, "")
         ),
     )

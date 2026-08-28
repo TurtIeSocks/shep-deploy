@@ -203,7 +203,25 @@ If it is worth pursuing, the shape that keeps what already works is a second,
 optional trait method on `Daemon` feeding an event-driven path, with the
 polling path as the fallback, rather than a replacement.
 
-## shep marks a reload's replacement Online without the readiness probe
+## A reload's replacement was verified by the instance it replaced -- FIXED in shep 0.1.10
+
+**Fixed upstream on 2026-08-28, the day it was found.** shep now reloads a
+probed app serially: the old instance drains before the replacement starts, so
+the only process that can answer the replacement's probe is the replacement. An
+app that sets `reuse_port` keeps the overlap it asked for and gets a second
+probe once the drained instance is gone. `reuse_port` stopped being refused in
+the same release and is now the opt-in for that overlap.
+
+Verified end to end against the testbed this crate's review built: the same
+broken release that was reported `deployed` with exit 0 while the old instance
+answered its probe is now refused and rolled back with exit 12, and the healthy
+release is what ends up serving. `README.md` describes the working behaviour.
+
+The title below is what this entry was called when it was open, and it was
+wrong in a way worth keeping. shep never ignored the probe. It honoured it, and
+the probe was answered by the wrong process.
+
+### As it was found: shep marks a reload's replacement Online without the readiness probe
 
 Found by deploying real repositories against a real shepherd, which twelve
 rounds of code review could not find: every test in this crate drives a fake
