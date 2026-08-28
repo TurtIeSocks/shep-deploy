@@ -1104,6 +1104,7 @@ mod tests {
     use crate::fixtures;
 
     use shep_client::shep_core::protocol::RpcErrorCode;
+    use shep_client::shep_core::protocol::wire::WireError;
 
     /// [`test_config`] with a retention the caller cares about.
     ///
@@ -2398,6 +2399,14 @@ mod tests {
             message: "web is already being reloaded".to_owned(),
         }));
         assert!(never_reached_the_shepherd(&rpc));
+
+        // The other half of the allowlist, and it had no test at all until
+        // round 9 of the founder's review deleted the `Wire` arm and watched
+        // all 269 tests stay green. A frame this process could not encode
+        // never left it, so the shepherd cannot have acted on it.
+        assert!(never_reached_the_shepherd(&Error::Request(
+            RequestError::Wire(WireError::FrameTooLarge(1 << 30))
+        )));
 
         // Ambiguous: the shepherd may have accepted and acted.
         assert!(!never_reached_the_shepherd(&Error::Request(
