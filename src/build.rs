@@ -493,6 +493,24 @@ fn copy_artifact(
     }
 
     if from == to {
+        // Already where it belongs, which is the ordinary case with no
+        // `CARGO_TARGET_DIR` redirect: the build wrote it into the release
+        // directly and there is nothing to copy.
+        //
+        // Checked rather than assumed, because this branch is reached for
+        // EVERY declared artifact when no redirect is in play, and returning
+        // `Ok` without looking makes an artifact that was never produced
+        // indistinguishable from one that was. A build that exits 0 without
+        // writing what it said it would, or a typo in `artifacts`, then rides
+        // through the swap and the reload and surfaces as a runtime failure in
+        // a release the operator has been told is deployed.
+        if !to.exists() {
+            return Err(Error::Config(format!(
+                "build.artifacts names `{}`, which the build did not leave there; \
+                 either the command did not produce it or the entry is wrong",
+                artifact.display()
+            )));
+        }
         return Ok(());
     }
 
@@ -845,6 +863,43 @@ mod tests {
         assert!(
             format!("{err}").contains("build_timeout"),
             "must name the knob that changes it: {err}"
+        );
+    }
+
+    /// fails if an artifact the build never produced is reported as copied.
+    ///
+    /// With no `CARGO_TARGET_DIR` redirect, `copy_artifact`'s source and
+    /// destination collapse to the same release-relative path, so the
+    /// already-where-it-belongs branch is taken for EVERY declared artifact.
+    /// Returning `Ok` there without looking made an artifact that was never
+    /// written indistinguishable from one that was: a build exiting 0 without
+    /// producing what it declared, or a typo in `artifacts`, rode through the
+    /// swap and the reload and surfaced as a runtime failure in a release the
+    /// operator had been told was deployed.
+    #[tokio::test]
+    async fn an_artifact_the_build_did_not_produce_is_a_failure() {
+        let rel = fixtures::fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![PathBuf::from("dist/app.js")],
+        };
+
+        let err = run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect_err("a declared artifact that is not there must fail the build");
+
+        assert!(
+            format!("{err}").contains("did not leave there"),
+            "must say what is missing and why: {err}"
         );
     }
 
