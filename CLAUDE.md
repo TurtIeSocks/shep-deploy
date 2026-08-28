@@ -34,8 +34,12 @@ SHEP_BIN="$(command -v shep)" cargo test --all-features
 ```
 
 CI already does it right: `cargo test --locked` for the units, then a separate
-job that installs `shep` from the tip of `main` and runs
-`cargo test --features integration`. Only a human running the obvious command
+job that runs `cargo install shep --locked` and then
+`cargo test --features integration`. That installs the PUBLISHED shep from
+crates.io, not a git checkout, and the workflow says so in its own comment: a
+red integration job is a signal against shep's released surface rather than
+against whatever `main` looks like that day. This file claimed "from the tip
+of `main`" until round 8 of the founder's review read the workflow. Only a human running the obvious command
 hits this. Cost me a wrong "baseline is green" call on 2026-08-28.
 
 ### The gate
@@ -61,7 +65,7 @@ SHEP_BIN="$(command -v shep)" cargo test --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-265 unit tests and 7 integration as of 2026-08-28, ~20s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
+269 unit tests and 7 integration as of 2026-08-28, ~20s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
 
 ## Architecture
 
