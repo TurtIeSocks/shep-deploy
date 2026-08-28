@@ -510,13 +510,21 @@ mod tests {
     }
 
     /// fails if the presence of an override makes the committed-file
-    /// refusal disappear. The override here overwrites `user` to a
-    /// different value entirely - if the check ran against the *merged*
-    /// document's value instead of the committed document itself, this is
-    /// exactly the shape that would look laundered: the dangerous value
-    /// `root` is gone from the merged result, replaced by `nobody`. The
-    /// refusal must fire anyway, because it was decided by reading the
-    /// committed file alone, before the override was ever opened.
+    /// refusal disappear. The refusal must fire because it was decided by
+    /// reading the committed file alone, before the override was opened.
+    ///
+    /// The override deliberately does NOT name `user`. It did, set to
+    /// `nobody`, on the theory that a laundered merge would be the shape
+    /// worth catching. That made the test vacuous: `shared` is empty here, so
+    /// `is_operators` is false, so `merged_document` runs
+    /// `refuse_repo_privilege` against the override document too, and THAT
+    /// check produced the error being asserted on. Deleting the
+    /// committed-document check left the test passing. Found in round 8 of
+    /// the founder's review, by deleting that line and re-running.
+    ///
+    /// `script` is the right field precisely because nothing refuses it, so
+    /// the only remaining route to an error is the check this test is named
+    /// for. `a_committed_flockfile_cannot_set_user` covers the other one.
     #[test]
     fn an_override_present_does_not_launder_a_committed_user_field() {
         let rel = fixtures::fixture_release(&[
@@ -526,7 +534,7 @@ mod tests {
             ),
             (
                 "Flockfile.override.toml",
-                "[[app]]\nname='web'\nuser='nobody'\n",
+                "[[app]]\nname='web'\nscript='mine.js'\n",
             ),
         ]);
         let err = app_config(rel.path(), "web", &[]).expect_err("still refuses");
