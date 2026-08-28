@@ -266,8 +266,9 @@ pub async fn wait<D: Daemon>(
 /// A caller's wall-clock can therefore exceed its own `budget` by one slow
 /// answer, which round 7 of the founder's review raised. Kept, for two
 /// reasons. The overrun is bounded without any help from here: every
-/// `describe` goes through `shep_client`'s `Client::request`, whose
-/// `DEFAULT_DEADLINE` is 5s, matching the daemon's own `DEFAULT_DEADLINE_MS`.
+/// `describe` goes through `shep_client`'s `Client::request`, which waits
+/// `DEFAULT_DEADLINE` plus `DEADLINE_GRACE`, five seconds and two, the same
+/// pair `crate::deploy` already names in four places.
 /// And the obvious fix is worse than the problem: wrapping the call in a
 /// timeout against what is left of the budget means the last poll of a
 /// `turnover` gets almost no time and fails for that reason, which is how a
