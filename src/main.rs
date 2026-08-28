@@ -497,21 +497,36 @@ fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
 /// [`Error::Io`] if the path cannot be made absolute, which needs the
 /// current directory to be readable.
 fn shep_home() -> Result<PathBuf, Error> {
-    let home = std::env::home_dir().unwrap_or_default();
-    let resolved = ShepPaths::resolve(&|key| std::env::var(key).ok(), &home).home;
-
-    std::path::absolute(&resolved).map_err(|source| Error::Io {
-        path: resolved,
-        source,
-    })
+    absolute(resolved().home)
 }
 
 /// The shepherd's control socket, from the same layout as [`shep_home`].
 ///
+/// Reads `ShepPaths`'s own `socket` field rather than joining `run/shep.sock`
+/// onto the home. Both spellings agree today, and the point is that only one
+/// of them is shep's to change: the layout belongs to `shep_core::paths`, and
+/// a copy here is a second source of truth that drifts silently the day shep
+/// moves the socket.
+///
 /// # Errors
 /// As [`shep_home`].
 fn socket() -> Result<PathBuf, Error> {
-    Ok(shep_home()?.join("run").join("shep.sock"))
+    absolute(resolved().socket)
+}
+
+/// The shep layout, as this process's environment spells it.
+fn resolved() -> ShepPaths {
+    let home = std::env::home_dir().unwrap_or_default();
+    ShepPaths::resolve(&|key| std::env::var(key).ok(), &home)
+}
+
+/// One path from [`resolved`], made absolute.
+///
+/// # Errors
+/// [`Error::Io`] if the path cannot be made absolute, which needs the current
+/// directory to be readable.
+fn absolute(path: PathBuf) -> Result<PathBuf, Error> {
+    std::path::absolute(&path).map_err(|source| Error::Io { path, source })
 }
 
 /// The sha a target is deployed at, for a message.
