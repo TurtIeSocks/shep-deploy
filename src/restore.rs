@@ -202,19 +202,30 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             continue;
         };
 
-        // An origin recorded is not the same as a sheep moved. `prepare`
-        // writes both origin fields, and only a landed cutover writes
-        // `deployed`, so this is the tree of an abandoned cutover: the sheep
-        // never left its own checkout.
-        if never_moved {
-            results.push(Restored::NeverMoved { sheep, at: cwd });
-            continue;
-        }
-
         let Ok(registered) = &registered else {
             blocked_by_roll.push(sheep);
             continue;
         };
+
+        // An origin recorded is not the same as a sheep moved. `prepare`
+        // writes both origin fields, and only a landed cutover writes
+        // `deployed`, so an absent `deployed` means the cutover did not land.
+        //
+        // It does NOT mean the cutover never ran, which is why the shepherd is
+        // asked as well. `cut_over` writes `deployed` only on the fully
+        // verified path; its `NotVerified` and `Failed` arms return without
+        // touching it, having already run `undo_start`, whose own repair can
+        // fail and leave a newcomer registered. Reading `deployed` alone
+        // called that sheep untouched and reported it as running where it
+        // belongs, at the one moment this module exists to catch exactly that.
+        //
+        // `cwd` is the signal because `cut_over` is the only thing that ever
+        // sets it to the tree's `current`, so the shepherd's own registration
+        // says whether the cutover got as far as registering.
+        if never_moved && !registered_against(registered, &sheep, &tree) {
+            results.push(Restored::NeverMoved { sheep, at: cwd });
+            continue;
+        }
 
         results.push(
             match put_back(daemon, &sheep, registered, &cwd, &script).await {
@@ -416,6 +427,19 @@ pub fn report(results: &[Restored]) -> String {
         })
         .collect()
 }
+/// Whether the shepherd has `sheep` registered against `tree` rather than
+/// against the operator's own checkout.
+///
+/// `crate::optin::cut_over` sets `cwd` to the tree's `current` symlink and
+/// nothing else in this crate does, so this is the shepherd's own answer to
+/// "did the cutover get as far as registering". A tree's record cannot answer
+/// it: `deployed` is written on the verified path only.
+fn registered_against(registered: &BTreeMap<String, AppConfig>, sheep: &str, tree: &Tree) -> bool {
+    registered
+        .get(sheep)
+        .and_then(|app| app.cwd.as_deref())
+        .is_some_and(|cwd| Path::new(cwd) == tree.current())
+}
 
 #[cfg(test)]
 mod tests {
@@ -536,6 +560,10 @@ mod tests {
         describe_fails: bool,
         delete_fails_at: Option<u32>,
         unreadable_roll: bool,
+        /// What the roll says each sheep's `cwd` is, when the default fixed
+        /// path will not do. A cutover that registered points the sheep at its
+        /// tree's own `current`, which only the test knows the path of.
+        registered_cwd: Option<String>,
         calls: RefCell<Vec<&'static str>>,
         starts: RefCell<Vec<AppConfig>>,
         attempts: Cell<usize>,
@@ -551,6 +579,7 @@ mod tests {
                 describe_fails: false,
                 delete_fails_at: None,
                 unreadable_roll: false,
+                registered_cwd: None,
                 calls: RefCell::new(Vec::new()),
                 starts: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
@@ -561,6 +590,13 @@ mod tests {
         /// Every registered sheep accepts every start.
         fn with_registered(sheep: &[&'static str]) -> Self {
             Self::new(sheep, Refuse::Never)
+        }
+
+        /// The same, with every sheep registered against `cwd` rather than
+        /// the fixed path the roll otherwise reports.
+        fn registered_at(mut self, cwd: &std::path::Path) -> Self {
+            self.registered_cwd = Some(cwd.display().to_string());
+            self
         }
 
         /// The very first `start` call, across every sheep, is refused;
@@ -706,9 +742,13 @@ mod tests {
                 .sheep
                 .iter()
                 .map(|name| {
+                    let cwd = self
+                        .registered_cwd
+                        .clone()
+                        .unwrap_or_else(|| "/srv/deploy-tree/current".to_owned());
                     format!(
                         "{{\"app\":{{\"name\":{name:?},\"script\":\"the-shepherds-own-script\",\
-                         \"cwd\":\"/srv/deploy-tree/current\"}}}}"
+                         \"cwd\":{cwd:?}}}}}"
                     )
                 })
                 .collect();
@@ -805,6 +845,40 @@ mod tests {
         let text = report(&results);
         assert!(text.contains("ctm was never moved"), "{text}");
         assert!(text.contains("/srv/ctm"), "{text}");
+    }
+
+    /// fails if a cutover that got as far as registering is called "never
+    /// moved" and left alone.
+    ///
+    /// `cut_over` writes `deployed` only on its fully verified path. Its
+    /// `NotVerified` and `Failed` arms return without touching it, having
+    /// already run `undo_start`, and `undo_start`'s own repair can fail and
+    /// leave a newcomer registered. So an absent `deployed` means the cutover
+    /// did not LAND, not that it never RAN, and reading it alone reported a
+    /// sheep in that state as running where it belongs, doing nothing, at the
+    /// one moment this module exists to catch exactly that.
+    ///
+    /// The shepherd's own registration is what separates the two, because
+    /// `cut_over` is the only thing that ever points a sheep's `cwd` at the
+    /// tree's `current`.
+    #[tokio::test]
+    async fn a_cutover_that_registered_is_restored_even_without_a_deployed_sha() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_never_cut_over(home.path(), "ctm", "/srv/ctm", "./run.sh");
+        let tree = Tree::for_sheep(home.path(), "ctm");
+        let daemon = Recording::with_registered(&["ctm"]).registered_at(&tree.current());
+
+        let results = all(&daemon, home.path()).await;
+
+        let text = report(&results);
+        assert!(
+            !text.contains("never moved"),
+            "a sheep the cutover registered against the tree was moved: {text}"
+        );
+        assert!(
+            !daemon.calls().is_empty(),
+            "it must actually be put back, not merely reported"
+        );
     }
 
     /// Writes a `deploy.toml` as `optin::prepare` leaves one when its cutover
