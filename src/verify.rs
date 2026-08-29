@@ -274,7 +274,12 @@ pub async fn wait<D: Daemon>(
     let deadline = Instant::now() + DWELL;
     loop {
         let flock = describe_within(daemon, sheep, DWELL).await?;
-        let settled_and_ready = !flock.is_empty()
+        // The COUNT as well as the pids. `all` over a listing that shrank is
+        // vacuously happy: with `settled` holding two, a listing of one
+        // `Online` pid from that generation satisfies every element and the
+        // sibling that vanished goes unmentioned. `alive_rejects_a_flock_that_empties_during_the_dwell`
+        // only pins the all-gone case.
+        let settled_and_ready = u32::try_from(flock.len()).is_ok_and(|n| n == settled.instances())
             && flock
                 .iter()
                 .all(|info| settled.holds(info) && is_online(info));
@@ -786,6 +791,45 @@ mod tests {
             .await
             .unwrap()
         );
+    }
+
+    /// fails if the dwell stops counting how many instances are left.
+    ///
+    /// `all` over a listing that shrank is vacuously happy: with `settled`
+    /// holding two pids, a listing of ONE `Online` pid from that generation
+    /// satisfies every element, and the sibling that vanished goes unmentioned.
+    /// A scaled sheep that comes back at half strength is a release that did
+    /// not deploy, and the dwell is the only thing looking.
+    ///
+    /// `alive_rejects_a_flock_that_empties_during_the_dwell` pins the all-gone
+    /// case, which is the easy half.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_a_flock_that_came_back_smaller() {
+        let daemon = Listings::new(vec![
+            vec![
+                instance(1, ProcStatus::Online, 200),
+                instance(2, ProcStatus::Online, 201),
+            ],
+            // One of the two is gone by the dwell. The survivor is healthy and
+            // from the right generation, which is what let this pass without a
+            // count.
+            vec![instance(1, ProcStatus::Online, 200)],
+        ]);
+        let before = Generation {
+            pids: [100, 101].into_iter().collect(),
+        };
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &before,
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+
+        assert!(!ok, "half a flock is not a deployed release");
     }
 
     /// fails if `Alive` believes a replacement shep gave up on.
