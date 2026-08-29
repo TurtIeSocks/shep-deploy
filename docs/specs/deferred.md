@@ -154,8 +154,22 @@ same mistake an earlier attempt already made in code.
 What is wanted is confinement rather than refusal: `openat2` with
 `RESOLVE_IN_ROOT`, which follows a link but cannot leave the root it was given,
 or a per-component walk that opens each part by handle and checks containment
-as it goes. Both keep a link that stays inside the release and the cache, and
-neither can be talked out of the root by one swapped underneath them.
+as it goes.
+
+Which root is the whole question, and the obvious answer is wrong. Rooting at
+the release refuses `release/target`, because `link_cache` points it at
+`<tree>/cache/target`, and the cache is the release's sibling rather than its
+child. `RESOLVE_IN_ROOT` confines each lookup to one `dirfd`, so a
+release-rooted lookup cannot follow that link anywhere useful: an absolute
+target is reinterpreted against the release, and a relative one climbing out is
+clamped. The design would refuse the ordinary cargo arrangement again, one
+layer deeper than the two attempts before it.
+
+The tree root is the answer, since `releases/<sha>` and `cache` are both under
+it, so a single confined lookup spans exactly the two places an artifact may
+legitimately land and nothing else. A two-root walk checking containment
+against release and cache separately works too, and is what `lands_within`
+already does by name today.
 
 This entry used to say that needs `unsafe` and stop there, which was the wrong
 place to stop. `#![forbid(unsafe_code)]` at `src/main.rs:33` rules out calling
