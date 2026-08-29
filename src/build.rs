@@ -724,11 +724,14 @@ fn copy_artifact(
 ///
 /// # Errors
 /// [`Error::Config`] if `as_user` names a user `id -u`/`id -g` cannot
-/// resolve. [`Error::Io`], naming `release`, if the shell (or `id`, for
-/// `as_user`) cannot even be launched, or if a declared artifact cannot be
-/// copied - see [`copy_artifact`]. [`Error::Build`] if the command launches
-/// and exits non-zero, or is killed by a signal, naming the exit status
-/// when there is one.
+/// resolve, if a declared artifact resolves outside the release and the build
+/// cache, or if one the build was meant to produce is not there - see
+/// [`copy_artifact`] for all three. [`Error::Io`], naming `release`, if the
+/// shell (or `id`, for `as_user`) cannot even be launched, or if a declared
+/// artifact cannot be copied. [`Error::Build`] if the command launches and
+/// exits non-zero, or is killed by a signal, naming the exit status when there
+/// is one. [`Error::BuildTimedOut`] if it runs past `budget`, which is
+/// `build_timeout` from `[dog.deploy]`.
 pub async fn run(
     sheep: &str,
     release: &Path,
