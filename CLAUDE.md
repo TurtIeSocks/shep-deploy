@@ -33,6 +33,16 @@ cargo test
 SHEP_BIN="$(command -v shep)" cargo test --all-features
 ```
 
+**And `$SHEP_BIN` has a version floor, which a green local run will not tell
+you about.** The integration tier asserts behaviour shep only has from 0.1.10:
+a probed app reloads serially, and a replacement that never becomes ready is
+left `starting` rather than `online`. Point `SHEP_BIN` at an older shep and
+`a_release_that_cannot_come_up_is_rolled_back_and_the_old_release_serves`
+passes for the wrong reason. That happened on 2026-08-28: the local tier was
+green against an installed 0.1.8 while CI, which installs the current release,
+failed. Check `shep --version` before trusting a green integration run, or
+point `SHEP_BIN` at a build of shep's `main`.
+
 CI already does it right: `cargo test --locked` for the units, then a separate
 job that runs `cargo install shep --locked` and then
 `cargo test --features integration`. That installs the PUBLISHED shep from
