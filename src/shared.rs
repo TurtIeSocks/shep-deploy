@@ -196,9 +196,23 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
 ///
 /// Reaped afterwards: leaving a zombie git would keep the bare clone's lock
 /// and fail the next tick for a reason that looks unrelated.
-fn abandon(child: &mut std::process::Child) {
-    let group = format!("-{}", child.id());
+/// Kills a whole process group by the leader's pid.
+///
+/// One spelling, shared, because two are what drift. `crate::build` abandons a
+/// build the same way and cannot share the rest: its child is a
+/// `tokio::process::Child` and this one is a `std::process::Child`, so the
+/// fallback differs while the signal and the group form must not.
+///
+/// The failure is ignored on purpose. Every caller is already giving up on the
+/// child, and a kill that cannot be delivered leaves nothing they can do about
+/// it that they have not already decided.
+pub(crate) fn kill_group(pid: u32) {
+    let group = format!("-{pid}");
     let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+}
+
+fn abandon(child: &mut std::process::Child) {
+    kill_group(child.id());
     // The group signal is the one that matters; this covers a host whose
     // `kill` refuses the group form.
     let _ = child.kill();
@@ -443,28 +457,6 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
             // `user` among them, and a build pinned to an unprivileged
             // account runs as the dog's own uid instead. Silently: nothing
             // errors, because an absent override is a legitimate state.
-            // Reserved by the dog, the same way the override is reserved for
-            // the operator. `deploy::checkout_release` writes this name inside
-            // every release before `link_into` runs, so a checkout carrying a
-            // gitignored file of the same name met an `AlreadyExists` and a
-            // refusal telling the operator to add it to `.shepignore`, blaming
-            // their repository for a collision with the dog's own bookkeeping.
-            //
-            // Said out loud rather than dropped quietly. Round 12 of the
-            // founder's review made the point against the first version of
-            // this: the old behaviour was wrong but LOUD, and replacing it
-            // with a silent drop takes an operator's file out of every release
-            // with nothing anywhere saying so. A file this name is real and
-            // rare enough to be worth one line.
-            if path == Path::new(crate::deploy::COMPLETE) {
-                eprintln!(
-                    "shep-deploy: not sharing `{}` from the checkout: that name is the dog's own \
-                     inside a release, and the release's copy wins",
-                    path.display()
-                );
-                return false;
-            }
-
             path == Path::new(crate::flockfile::OVERRIDE)
                 || !patterns
                     .iter()
@@ -818,27 +810,6 @@ mod tests {
         let linked = to_link(repo.path()).expect("computes");
         assert!(linked.iter().any(|p| p.ends_with("config/local.json")));
         assert!(!linked.iter().any(|p| p.ends_with("dist")));
-    }
-
-    /// fails if a checkout carrying the dog's own completion marker collides
-    /// with it.
-    ///
-    /// `deploy::checkout_release` writes `.shep-complete` inside every release
-    /// before `link_into` runs. A checkout with a gitignored file of that name
-    /// therefore met an `AlreadyExists` and a refusal telling the operator to
-    /// add it to `.shepignore`, blaming their repository for a collision with
-    /// the dog's own bookkeeping.
-    #[test]
-    fn the_dogs_own_marker_is_never_shared_in() {
-        let repo = fixture_repo(&[(".gitignore", ".shep-complete\n")]);
-        fs::write(repo.path().join(".shep-complete"), "").expect("the operator's own");
-
-        let linked = to_link(repo.path()).expect("computes");
-
-        assert!(
-            !linked.iter().any(|p| p.ends_with(".shep-complete")),
-            "the name is the dog's inside a release: {linked:?}"
-        );
     }
 
     /// fails if a committed `.shepignore` can drop the operator's own

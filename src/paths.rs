@@ -156,6 +156,21 @@ impl Tree {
         self.root.join("current")
     }
 
+    /// Where a release's completion marker lives, keyed by sha.
+    ///
+    /// OUTSIDE the release, and that is the whole point of the path. The
+    /// marker says "this checkout finished", and a marker inside the release
+    /// is a file the DEPLOYED REPOSITORY can commit: `git worktree add` then
+    /// writes it out as part of the checkout it is supposed to vouch for, so
+    /// a kill partway leaves a partial release carrying its own certificate.
+    /// That is the round-9 blocker again with the adversary holding the pen.
+    ///
+    /// Under the tree's own root, which only this dog writes.
+    #[must_use]
+    pub fn completion(&self, sha: &str) -> PathBuf {
+        self.root.join("complete").join(sha)
+    }
+
     /// The file a deploy takes an exclusive `flock` on, so only one process
     /// at a time works on this tree.
     ///

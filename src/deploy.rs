@@ -354,12 +354,6 @@ async fn go<D: Daemon>(
     outcome
 }
 
-/// The file [`checkout_release`] writes once a worktree is fully checked out.
-///
-/// Inside the release rather than beside it, so retention removes it along
-/// with the release it describes and no bookkeeping outlives its subject.
-pub(crate) const COMPLETE: &str = ".shep-complete";
-
 /// Checks `sha` out at `release`, unless a FINISHED checkout is already there.
 ///
 /// `release.exists()` was the test until round 9 of the founder's review, and
@@ -385,24 +379,37 @@ pub(crate) const COMPLETE: &str = ".shep-complete";
 /// [`Error::Io`] if a stale directory cannot be removed or the marker cannot
 /// be written. Whatever [`git::worktree_prune`] and [`git::worktree_add`]
 /// return.
-pub(crate) fn checkout_release(git_dir: &Path, release: &Path, sha: &str) -> Result<(), Error> {
-    if release.join(COMPLETE).is_file() {
+pub(crate) fn checkout_release(tree: &Tree, sha: &str) -> Result<(), Error> {
+    let git_dir = tree.git();
+    let release = tree.release(sha);
+    let marker = tree.completion(sha);
+
+    // BOTH, not either. The marker alone would say a release is finished after
+    // retention had removed it, and the directory alone is what this function
+    // exists to stop trusting.
+    if marker.is_file() && release.exists() {
         return Ok(());
     }
 
     if release.exists() {
-        fs::remove_dir_all(release).map_err(|source| Error::Io {
-            path: release.to_owned(),
+        fs::remove_dir_all(&release).map_err(|source| Error::Io {
+            path: release.clone(),
             source,
         })?;
         // Removing the directory is not enough on its own: git still has the
         // path registered and refuses the next add with "missing but already
         // registered worktree". Verified 2026-08-28.
-        git::worktree_prune(git_dir)?;
+        git::worktree_prune(&git_dir)?;
     }
 
-    git::worktree_add(git_dir, release, sha)?;
-    let marker = release.join(COMPLETE);
+    git::worktree_add(&git_dir, &release, sha)?;
+
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent).map_err(|source| Error::Io {
+            path: parent.to_owned(),
+            source,
+        })?;
+    }
     fs::write(&marker, b"").map_err(|source| Error::Io {
         path: marker,
         source,
@@ -425,7 +432,7 @@ async fn attempt<D: Daemon>(
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
     let release = tree.release(head);
-    checkout_release(&tree.git(), &release, head)?;
+    checkout_release(tree, head)?;
     shared::link_cache(&release, &tree.cache_target())?;
     // Held, not recomputed. This is the only record of which files came from
     // the operator's own checkout rather than from the repository, and
@@ -607,10 +614,15 @@ fn record(
 /// in-memory copy stop being stale too: the poll loop keeps this `State` for
 /// the rest of its life.
 ///
-/// This narrows the window rather than closing it. Two processes can still
-/// interleave between this read and the write, and the real fix is an advisory
-/// lock held across the whole of `go`, which needs a dependency this crate
-/// does not have. `docs/specs/deferred.md` records that decision.
+/// Written when the two-process race was open, which it is not any more: `go`
+/// takes an exclusive `flock` on the tree before anything below it runs, so two
+/// processes cannot both be inside a deploy of one sheep. See `crate::lock`.
+///
+/// Kept anyway, because the lock is per tree and taken by `go`, and this guard
+/// is not. Anything writing the record WITHOUT going through `go` still races:
+/// `set_watch` does, and so would any later writer reaching for `State::write`
+/// directly. One read that refuses to overwrite a fresher record is cheap
+/// enough to keep for those.
 fn landed_elsewhere(tree: &Tree, head: &str, failing: Option<&str>) -> Option<State> {
     failing?;
     let on_disk = State::read(&tree.state_file()).ok()?;
@@ -1798,6 +1810,62 @@ mod tests {
         assert_eq!(
             written.failed, None,
             "a sha another process deployed must not be recorded as failed"
+        );
+    }
+
+    /// fails if a marker the DEPLOYED REPOSITORY committed is trusted.
+    ///
+    /// The completion marker used to live inside the release, which made it a
+    /// path the repository can write. `git worktree add` writes a tracked file
+    /// out as part of the checkout it is meant to vouch for, so a repository
+    /// committing `.shep-complete` hands every partial checkout its own
+    /// certificate: kill the add partway and the next tick finds the marker,
+    /// skips the checkout, and deploys the fragment. That is the round-9
+    /// blocker with the adversary holding the pen.
+    ///
+    /// The marker lives under the tree's own root now, keyed by sha, where
+    /// only this dog writes. A repository can still commit a file by that name
+    /// and it means nothing.
+    #[tokio::test]
+    async fn a_completion_marker_committed_by_the_repository_is_not_trusted() {
+        let mut fixture = fixture_with_previous_release();
+        // The name the marker used to have, which is the point: it is not
+        // special any more, and a repository committing it means nothing.
+        fs::write(fixture.origin.path().join(".shep-complete"), "")
+            .expect("the repository's own marker");
+        fixtures::run_git(fixture.origin.path(), &["add", "-A"]);
+        fixtures::run_git(
+            fixture.origin.path(),
+            &["commit", "-q", "-m", "a forged marker"],
+        );
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        crate::git::fetch(
+            &fixture.tree.git(),
+            &fixture.state.remote,
+            fixtures::TEST_BUDGET,
+        )
+        .expect("fetch");
+        let release = fixture.tree.release(&second);
+        crate::git::worktree_add(&fixture.tree.git(), &release, &second).expect("worktree");
+        assert!(
+            release.join(".shep-complete").is_file(),
+            "the repository's marker must really be in the checkout, or this proves nothing"
+        );
+        fs::remove_file(release.join("second.txt")).expect("a checkout that did not finish");
+
+        deploy(
+            &Shepherd::ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &test_config(),
+        )
+        .await
+        .expect("completes");
+
+        assert!(
+            release.join("second.txt").exists(),
+            "a marker the repository wrote must not vouch for a partial checkout"
         );
     }
 

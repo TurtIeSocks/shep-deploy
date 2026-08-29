@@ -233,7 +233,7 @@ pub async fn prepare<D: Daemon>(
     // that died anywhere from here onward left a release directory that made
     // the next run fail on git rather than resume, which is the opposite of
     // what the doc above promises.
-    crate::deploy::checkout_release(&tree.git(), &release, &sha)?;
+    crate::deploy::checkout_release(&tree, &sha)?;
     shared::link_cache(&release, &tree.cache_target())?;
     // Held, not recomputed. This is the only record of which files came from
     // the operator's own checkout rather than from the repository, and
