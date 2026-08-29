@@ -162,7 +162,27 @@ impl Generation {
     /// Empty is never a turnover: a sheep the shepherd cannot find has not
     /// been verified.
     fn has_turned_over(&self, flock: &[ProcessInfo], accept: fn(&ProcessInfo) -> bool) -> bool {
-        !flock.is_empty() && flock.iter().all(|info| self.is_new(info) && accept(info))
+        // The count as well, measured against what was running BEFORE. A
+        // two-instance sheep that loses a replica during the reload lists one
+        // new instance, and one new instance is "all new": the turnover was
+        // accepted, `settled` became that single pid, and every later check
+        // compared the survivor against itself. A sheep that came back at half
+        // strength verified.
+        //
+        // Checked here rather than at the dwell, though the dwell is where it
+        // was found. `Verify::Probed` returns as soon as the turnover lands and
+        // never reaches a dwell, so a check placed there would leave the
+        // stricter of the two modes the blind one.
+        //
+        // Skipped when nothing was running before, because then there is no
+        // count to hold to and `!flock.is_empty()` is the whole of what can be
+        // asked.
+        let count_holds = self.instances() == 0
+            || u32::try_from(flock.len()).is_ok_and(|listed| listed == self.instances());
+
+        !flock.is_empty()
+            && count_holds
+            && flock.iter().all(|info| self.is_new(info) && accept(info))
     }
 }
 
@@ -791,6 +811,37 @@ mod tests {
             .await
             .unwrap()
         );
+    }
+
+    /// fails if a flock that came back SMALLER is accepted as a turnover.
+    ///
+    /// "All new" is true of one new instance, so a two-instance sheep that
+    /// loses a replica during the reload turns over on the survivor alone.
+    /// `settled` then becomes that single pid and every later check compares
+    /// the survivor against itself, including the dwell's own count. A sheep
+    /// at half strength verified, and both modes believed it.
+    ///
+    /// Pinned at the turnover rather than the dwell because `Verify::Probed`
+    /// returns as soon as the turnover lands and never dwells at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_turnover_that_lost_a_replica_is_not_a_turnover() {
+        // Two before, one after, and that one is new and healthy.
+        let daemon = Listings::new(vec![vec![instance(1, ProcStatus::Online, 200)]]);
+        let before = Generation {
+            pids: [100, 101].into_iter().collect(),
+        };
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Probed,
+            &before,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        assert!(!ok, "one replacement for two instances is not a turnover");
     }
 
     /// fails if the dwell stops counting how many instances are left.
