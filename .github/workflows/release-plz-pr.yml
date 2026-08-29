@@ -95,12 +95,23 @@ jobs:
       # has nothing left to bump and opens a PR carrying only the changelog
       # entry. Leaving that open and red puts a human in front of the decision
       # instead of guessing which case it is.
+      #
+      # `|| '{}'` on the `pr` output is not decoration. An `if:` does not stop
+      # GitHub evaluating a step's `env:`, so both guards below have their
+      # expressions parsed on every run, including the ones where they are
+      # skipped. When release-plz fails, or succeeds with nothing to release,
+      # `outputs.pr` is the empty string and `fromJSON('')` raises "The template
+      # is not valid ... Error reading JToken from JsonReader", failing the job
+      # from a step that never ran. On 2026-08-29 that put two template errors
+      # on top of the real one, which was release-plz refusing to pick a version
+      # because every published version had been yanked. The empty-object
+      # fallback parses, `.number` is then null, and the `if:` does its job.
       - name: Refuse to auto-merge a release PR with nothing in it
         id: noop-guard
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
+          PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr || '{}').number }}
         run: |
           set -euo pipefail
 
@@ -216,7 +227,7 @@ jobs:
         if: ${{ steps.release-plz.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr).number }}
+          PR_NUMBER: ${{ fromJSON(steps.release-plz.outputs.pr || '{}').number }}
           HEAD_SHA: ${{ steps.noop-guard.outputs.head_sha }}
         run: |
           set -euo pipefail
