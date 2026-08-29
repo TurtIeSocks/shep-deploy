@@ -425,12 +425,14 @@ fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
 /// this function exists to preserve.
 ///
 /// # Errors
-/// [`Error::Config`], naming the entry, if `artifact` is absolute or
-/// contains `..`; see [`contained_artifacts`] for why that is a security
-/// boundary. [`Error::Io`], naming the destination's parent, if that
-/// directory cannot be created. [`Error::Io`], naming the source, if it
-/// cannot be copied - most likely because the build never produced it at
-/// the path declared.
+/// [`Error::Config`], naming the entry, in four cases: `artifact` is absolute
+/// or contains `..` (see [`contained_artifacts`] for why that is a security
+/// boundary); either end resolves outside the release and the build cache;
+/// the destination changed underneath the check; or the build never produced
+/// it at the path declared. [`Error::Io`] naming the destination's parent if
+/// that directory cannot be created, naming the source if it cannot be opened
+/// or read, and naming the destination if it cannot be opened, written or
+/// have its permissions set.
 fn copy_artifact(
     release: &Path,
     cache: &Path,
@@ -586,9 +588,11 @@ fn copy_artifact(
     // so a component swapped for a link during that window was followed.
     //
     // What is left is the gap between this line and the open itself. Closing
-    // that needs `openat2`'s `RESOLVE_NO_SYMLINKS` or a per-component
-    // `openat` walk, both of which need the unsafe this crate forbids, so it
-    // is a recorded decision rather than an oversight.
+    // that needs a handle-based walk, which is a dependency and a rewrite
+    // rather than a line this crate can spell: `docs/specs/deferred.md`
+    // records the constraints such a walk has to satisfy, and what three
+    // attempts at describing one got wrong. A recorded decision rather than
+    // an oversight either way.
     //
     // A component that is ALREADY a link when the first check runs is caught
     // there rather than here, at any depth, because `resolve_deepest` follows
@@ -629,6 +633,7 @@ fn copy_artifact(
     // Set from the handle rather than the path, so it lands on the file that
     // was actually written rather than on whatever the name resolves to now.
     // Same reasoning as the `O_NOFOLLOW` open above.
+    //
     // Masked to the ordinary nine bits, which is the difference between
     // copying a mode and copying a privilege. `Permissions` carries setuid,
     // setgid and the sticky bit too, and this copy runs in the PARENT at the
@@ -726,9 +731,11 @@ fn copy_artifact(
 /// [`Error::Config`] if `as_user` names a user `id -u`/`id -g` cannot
 /// resolve, if a declared artifact resolves outside the release and the build
 /// cache, or if one the build was meant to produce is not there - see
-/// [`copy_artifact`] for all three. [`Error::Io`], naming `release`, if the
-/// shell (or `id`, for `as_user`) cannot even be launched, or if a declared
-/// artifact cannot be copied. [`Error::Build`] if the command launches and
+/// [`copy_artifact`] for all three. [`Error::Io`] naming `release` if the shell
+/// (or `id`, for `as_user`) cannot even be launched, and naming the path it
+/// actually failed on - the artifact's source, its destination, or that
+/// destination's parent - if a declared artifact cannot be copied.
+/// [`Error::Build`] if the command launches and
 /// exits non-zero, or is killed by a signal, naming the exit status when there
 /// is one. [`Error::BuildTimedOut`] if it runs past `budget`, which is
 /// `build_timeout` from `[dog.deploy]`.
