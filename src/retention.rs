@@ -81,13 +81,31 @@ pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
         ) else {
             continue;
         };
+        // Only real release directories reach the ordering below. Every
+        // release is a worktree keyed by a full git object id, so anything
+        // else under `releases/` is not this module's to reason about, and
+        // treating it as a release is not harmless: an entry with a fresh
+        // mtime takes one of the `keep` slots and pushes a real release into
+        // the doomed set. The one it pushes out is the second newest, which
+        // is the release a failed deploy rolls back to.
+        if !names_a_release(&entry, &name) {
+            continue;
+        }
         found.push((name, modified));
     }
 
     let mut removed = Vec::new();
+    let mut failure = None;
     for sha in doomed(&found, keep, live.as_deref()) {
-        git::worktree_remove(&tree.git(), &tree.release(&sha))?;
-        removed.push(sha);
+        match git::worktree_remove(&tree.git(), &tree.release(&sha)) {
+            Ok(()) => removed.push(sha),
+            // One release that will not go must not strand the rest, and
+            // must not skip the prune below. A `?` here did both, and it
+            // did them every cycle: whatever made the removal fail was
+            // still there next time, so nothing ordered after it was ever
+            // reclaimed and the registration cleanup never ran at all.
+            Err(err) => failure = failure.or(Some(err)),
+        }
     }
 
     // Unconditionally, not only when this cycle removed something. `prune`
@@ -98,7 +116,25 @@ pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
     // but already registered worktree".
     git::worktree_prune(&tree.git())?;
 
-    Ok(removed)
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(removed),
+    }
+}
+
+/// Whether an entry under `releases/` is a release rather than something else.
+///
+/// A release is a directory named by a full git object id, because that is
+/// the only thing [`crate::paths::Tree::release`] ever creates there. A
+/// stray file, an editor's backup, a directory an operator made by hand: none
+/// of those are releases, and none may occupy one of the `keep` slots.
+///
+/// `file_type` does not follow symlinks, deliberately. A symlinked entry is
+/// not a worktree either.
+fn names_a_release(entry: &fs::DirEntry, name: &str) -> bool {
+    entry.file_type().is_ok_and(|kind| kind.is_dir())
+        && matches!(name.len(), 40 | 64)
+        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Which of `releases` to remove: everything past the newest `keep`, minus
@@ -131,9 +167,95 @@ fn sha_of(release: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     use super::*;
     use std::process::Command;
     use std::time::Duration;
+
+    /// Pins `path`'s modification time, so an ordering test does not depend
+    /// on how far apart two filesystem operations happen to land.
+    ///
+    /// Both tests below did depend on that, and CI caught it: on macOS the
+    /// gaps were wide enough, on ubuntu two entries tied and `doomed`'s
+    /// tiebreak is the name ascending, which put a `0`-prefixed stand-in in
+    /// the KEPT group instead of the doomed one. The test then passed against
+    /// the very bug it was written for.
+    fn at_second(path: &Path, seconds: u64) {
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        fs::File::open(path)
+            .expect("open for set_times")
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .expect("pin the mtime");
+    }
+
+    /// fails if something under `releases/` that is not a release can take
+    /// one of the kept slots.
+    ///
+    /// `prune` read every directory entry's name and mtime and ordered them
+    /// together, with no check that an entry was a release at all. A stray
+    /// file written more recently than the releases therefore sorted to the
+    /// front, held a `keep` slot, and pushed a real release one place down
+    /// into the doomed set.
+    ///
+    /// The one it pushes out is the second newest, which is the release a
+    /// failed deploy rolls back to. `retention` refuses a `keep` below 2 to
+    /// guarantee that release exists; this deleted it anyway.
+    #[test]
+    fn a_stray_file_under_releases_cannot_push_a_release_out() {
+        let (tree, shas) = fixture_tree_with_releases(3);
+        let stray = tree.releases().join("notes.txt");
+        fs::write(&stray, "not a release").expect("stray");
+
+        at_second(&tree.release(&shas[0]), 10);
+        at_second(&tree.release(&shas[1]), 20);
+        at_second(&tree.release(&shas[2]), 30);
+        at_second(&stray, 40);
+
+        prune(&tree, 2).expect("prunes");
+
+        assert!(
+            tree.release(&shas[1]).is_dir(),
+            "the second newest release is the rollback target and must survive"
+        );
+    }
+
+    /// fails if one release that will not go stops the rest of the cycle.
+    ///
+    /// The removal loop used a bare `?`, so the first failure returned
+    /// immediately: every later doomed release stayed, and the
+    /// `worktree_prune` below it never ran, though the comment there says it
+    /// must run unconditionally. Nothing self-corrected either, because
+    /// whatever made the removal fail was still there next cycle.
+    ///
+    /// The stand-in is a sha-named directory that was never a worktree, which
+    /// is what a kill during `git worktree add` leaves behind and what an
+    /// operator copying a release by hand makes. It passes the
+    /// is-this-a-release filter, because it is shaped exactly like one, and
+    /// `git worktree remove` then refuses it.
+    ///
+    /// Its mtime is pinned between the kept releases and the doomed ones so
+    /// it is removed FIRST. Ordered last it would strand nothing and the test
+    /// would pass against the unfixed code.
+    #[test]
+    fn one_release_that_will_not_go_does_not_strand_the_others() {
+        let (tree, shas) = fixture_tree_with_releases(4);
+        let never_a_worktree = tree.releases().join("0".repeat(40));
+        fs::create_dir(&never_a_worktree).expect("a release-shaped directory");
+
+        at_second(&tree.release(&shas[0]), 10);
+        at_second(&tree.release(&shas[1]), 20);
+        at_second(&never_a_worktree, 30);
+        at_second(&tree.release(&shas[2]), 40);
+        at_second(&tree.release(&shas[3]), 50);
+
+        let err = prune(&tree, 2).expect_err("the failure must still be reported");
+
+        assert!(
+            !tree.release(&shas[0]).exists() && !tree.release(&shas[1]).exists(),
+            "the rest of the cycle must run past the failure: {err}"
+        );
+    }
 
     /// Three releases, newest first by the second field.
     fn releases(names: &[&str]) -> Vec<(String, SystemTime)> {
@@ -150,17 +272,6 @@ mod tests {
             .collect()
     }
 
-    /// Runs a git subcommand for fixture setup, panicking if it fails - as
-    /// `crate::git`'s own fixtures do.
-    fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     /// A real bare repo with `n` commits, a worktree per commit under
     /// `tree.releases()` in commit order, each written into so it is dirty
     /// the way a built release is, with `current` pointed at the newest.
@@ -169,13 +280,13 @@ mod tests {
     /// always the one `current` names.
     fn fixture_tree_with_releases(n: u32) -> (Tree, Vec<String>) {
         let origin = tempfile::tempdir().expect("tempdir");
-        run(origin.path(), &["init", "-q", "-b", "main"]);
-        run(origin.path(), &["config", "user.email", "test@example.com"]);
-        run(origin.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
         for i in 0..n {
             fs::write(origin.path().join(format!("file-{i}.txt")), "x").expect("write");
-            run(origin.path(), &["add", "."]);
-            run(
+            fixtures::run_git(origin.path(), &["add", "."]);
+            fixtures::run_git(
                 origin.path(),
                 &["commit", "-q", "-m", &format!("commit {i}")],
             );
@@ -184,9 +295,9 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let tree = Tree::for_sheep(home.path(), "web");
         fs::create_dir_all(tree.git()).expect("create git dir");
-        run(&tree.git(), &["init", "-q", "--bare"]);
+        fixtures::run_git(&tree.git(), &["init", "-q", "--bare"]);
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
-        git::fetch(&tree.git(), &remote).expect("fetch");
+        git::fetch(&tree.git(), &remote, fixtures::TEST_BUDGET).expect("fetch");
 
         let log = Command::new("git")
             .current_dir(tree.git())
@@ -260,7 +371,12 @@ mod tests {
     fn the_live_release_is_never_pruned_whatever_its_age() {
         let all = releases(&["new", "old", "older", "ancient"]);
         assert_eq!(doomed(&all, 2, Some("ancient")), vec!["older"]);
-        assert!(!doomed(&all, 1, Some("ancient")).contains(&"ancient".to_owned()));
+        // At keep = 1 the live release is the ONLY survivor besides the
+        // newest, which is the "whatever its age" the name promises. Asserting
+        // merely that `ancient` is absent restated `doomed`'s unconditional
+        // live filter and would have passed at any keep, including a keep this
+        // function does not honour.
+        assert_eq!(doomed(&all, 1, Some("ancient")), vec!["old", "older"]);
     }
 
     /// fails if the rollback target is pruned along with the rest. The

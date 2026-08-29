@@ -54,6 +54,23 @@
 # pre-release tag. Inert for an ordinary version, and kept for the next one
 # that is not.
 git_release_type = "auto"
+# Attached so .coderabbit.yaml can skip reviewing a release pull request:
+# merging one IS the release, and its diff is a version bump plus a changelog
+# generated from commits already reviewed on their own pull requests.
+#
+# The label has to EXIST in the repository first. release-plz opens the pull
+# request and then calls GitHub's label endpoint, so a name nothing has defined
+# can leave the pull request opened and unlabelled. `release` was created here
+# on 2026-08-28. Renaming or deleting it silently un-skips every release pull
+# request, because .coderabbit.yaml matches the name and nothing checks the two
+# still agree.
+#
+# A title keyword was the other candidate and does not hold: release-plz
+# force-pushes its branch on every push to main, each force-push starts an
+# incremental review, and the title gate is not re-evaluated on those. Learned
+# in shep, on its own release pull request.
+pr_labels = ["release"]
+
 git_release_enable = true
 
 changelog_update = true

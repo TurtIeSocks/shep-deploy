@@ -49,11 +49,13 @@ use shep_client::shep_core::protocol::ProcessInfo;
 use tokio::time::{Instant, sleep};
 
 use crate::build;
+use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::deploy::RELOAD_DEADLINE_SLACK;
 use crate::error::Error;
 use crate::flockfile;
 use crate::git;
+use crate::lock;
 use crate::paths::Tree;
 use crate::roll;
 use crate::shared;
@@ -111,6 +113,7 @@ pub async fn prepare<D: Daemon>(
     daemon: &D,
     shep_home: &Path,
     sheep: &str,
+    config: &DogConfig,
 ) -> Result<Prepared, Error> {
     let tree = Tree::for_sheep(shep_home, sheep);
     if tree.state_file().is_file() {
@@ -208,26 +211,48 @@ pub async fn prepare<D: Daemon>(
         checkout,
     };
 
+    // Same hold a deploy takes, for the same reason: everything below writes
+    // to this tree, and a poll tick can be doing the same at the same moment.
+    // After the directory exists, because that is what the lock file lives in.
+    let _deploying = lock::hold(&tree)?;
+
     std::fs::create_dir_all(tree.releases()).map_err(|source| Error::Io {
         path: tree.releases(),
         source,
     })?;
     git::init_bare(&tree.git())?;
-    git::fetch(&tree.git(), &state.remote)?;
+    git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
     let sha = git::remote_head(&tree.git(), &state.branch)?;
 
     let release = tree.release(&sha);
-    git::worktree_add(&tree.git(), &release, &sha)?;
+    // Shared with `deploy::attempt` rather than a bare `worktree_add`, and
+    // that is what makes this function's own retry story true. `git worktree
+    // add` refuses a path that already exists ("fatal: `<path>` already
+    // exists") and refuses one it still has registered after the directory
+    // was removed ("missing but already registered worktree"). So every run
+    // that died anywhere from here onward left a release directory that made
+    // the next run fail on git rather than resume, which is the opposite of
+    // what the doc above promises.
+    crate::deploy::checkout_release(&tree, &sha)?;
     shared::link_cache(&release, &tree.cache_target())?;
-    shared::link_into(
-        &release,
-        &state.checkout,
-        &shared::to_link(&state.checkout)?,
-    )?;
+    // Held, not recomputed. This is the only record of which files came from
+    // the operator's own checkout rather than from the repository, and
+    // `flockfile` needs it to know whether an override is theirs.
+    let shared_paths = shared::to_link(&state.checkout)?;
+    shared::link_into(&release, &state.checkout, &shared_paths)?;
 
-    let app = flockfile::app_config(&release, sheep)?;
-    let spec = flockfile::build_spec(&release)?;
-    build::run(sheep, &release, &spec, app.user.as_deref()).await?;
+    let app = flockfile::app_config(&release, sheep, &shared_paths)?;
+    let spec = flockfile::build_spec(&release, &shared_paths)?;
+    build::run(
+        sheep,
+        &release,
+        &spec,
+        app.user.as_deref(),
+        &config.passthrough,
+        &tree.cache_target(),
+        config.build_timeout,
+    )
+    .await?;
 
     // `current` now points through a real release carrying the operator's
     // shared files - the whole deliverable of part one. `state.write` comes
@@ -430,7 +455,9 @@ enum CutOver {
 const PORT_COLLISION: &str = "The first cutover is the one deploy that runs two instances at \
      once, so an app that does not bind with SO_REUSEPORT cannot take its own port while the \
      original still holds it. Every deploy after the first replaces the instance rather than \
-     joining it, and does not meet this.";
+     joining it, and does not meet this. If the app cannot set SO_REUSEPORT, `shep stop` it, \
+     remove the tree named above, and run setup again: with the port free the newcomer binds, \
+     and the cutover is the one deploy allowed to be down for a moment anyway.";
 
 /// The `why` for a cutover that ended because the shepherd stopped
 /// answering, rather than because the release failed.
@@ -662,10 +689,22 @@ async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
+    /// The config every test that is not about a config value runs on.
+    fn test_config() -> crate::config::DogConfig {
+        crate::config::DogConfig {
+            interval: std::time::Duration::from_secs(30),
+            retention: 5,
+            git_timeout: std::time::Duration::from_secs(60),
+            build_timeout: std::time::Duration::from_secs(60),
+            passthrough: Vec::new(),
+        }
+    }
+
     // For `Error::source` on the variant the quiet-shepherd path returns.
     use core::error::Error as _;
     use std::cell::{Cell, RefCell};
-    use std::process::Command;
     use std::time::Duration;
 
     use shep_client::RequestError;
@@ -730,29 +769,6 @@ mod tests {
         }
     }
 
-    /// Runs a git subcommand for fixture setup, panicking if it fails.
-    fn git_in(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    /// `dir`'s current `HEAD` sha.
-    fn head_sha(dir: &Path) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("rev-parse");
-        String::from_utf8(out.stdout)
-            .expect("utf-8 sha")
-            .trim()
-            .to_owned()
-    }
-
     /// A tempdir that is a git checkout, on branch `main`, with an `origin`
     /// remote pointing at itself and one commit declaring an app named
     /// `bpm` whose script is `./run.sh`.
@@ -763,10 +779,10 @@ mod tests {
     /// history.
     fn checkout_with_commit() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        git_in(dir.path(), &["init", "-q", "-b", "main"]);
-        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
-        git_in(dir.path(), &["config", "user.name", "test"]);
-        git_in(
+        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(
             dir.path(),
             &[
                 "remote",
@@ -781,8 +797,8 @@ mod tests {
         )
         .expect("write Flockfile");
         std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho hi\n").expect("write run.sh");
-        git_in(dir.path(), &["add", "."]);
-        git_in(dir.path(), &["commit", "-q", "-m", "initial"]);
+        fixtures::run_git(dir.path(), &["add", "."]);
+        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "initial"]);
         dir
     }
 
@@ -819,7 +835,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
         let shown = err.to_string();
@@ -839,7 +855,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm")
+        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect("prepares");
 
@@ -857,14 +873,49 @@ mod tests {
     async fn the_branch_comes_from_the_checkouts_own_head() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        git_in(checkout.path(), &["checkout", "-q", "-b", "stable"]);
+        fixtures::run_git(checkout.path(), &["checkout", "-q", "-b", "stable"]);
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm")
+        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect("prepares");
         assert_eq!(prepared.state.branch, "stable");
+    }
+
+    /// fails if a run that died before writing its record cannot simply be
+    /// run again, which is what this function's own doc promises twice.
+    ///
+    /// The promise was false from `worktree_add` onward. `prepare` had no
+    /// existence guard and no cleanup on any failure path, so the release
+    /// directory a dead run left behind made the next run fail with a raw
+    /// `fatal: '<path>' already exists` from git. Verified 2026-08-28.
+    ///
+    /// Modelled here at the narrowest window the doc calls out by name, a
+    /// kill between `swap::point_at` and `state.write`: the release and
+    /// `current` exist, `deploy.toml` does not, so the "already a deploy
+    /// target" refusal at the top correctly does not fire and the run gets
+    /// as far as the checkout before failing.
+    #[tokio::test]
+    async fn a_prepare_that_died_before_writing_its_record_runs_again() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout_with_commit();
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
+
+        let first = prepare(&daemon, home.path(), "bpm", &test_config())
+            .await
+            .expect("prepares");
+        std::fs::remove_file(first.tree.state_file()).expect("the record a kill never wrote");
+
+        let again = prepare(&daemon, home.path(), "bpm", &test_config())
+            .await
+            .expect("a tree with no record must be resumable, as the doc says");
+        assert_eq!(again.sha, first.sha);
+        assert!(
+            again.tree.state_file().is_file(),
+            "the second run must leave the record the first one never wrote"
+        );
     }
 
     /// fails if `current` does not end up pointing at a real release
@@ -879,7 +930,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm")
+        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect("prepares");
 
@@ -900,12 +951,12 @@ mod tests {
     async fn a_detached_checkout_is_refused() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        let head = head_sha(checkout.path());
-        git_in(checkout.path(), &["checkout", "-q", &head]);
+        let head = fixtures::head_of(checkout.path());
+        fixtures::run_git(checkout.path(), &["checkout", "-q", &head]);
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
         assert!(err.to_string().contains("detached"), "{err}");
@@ -1235,7 +1286,9 @@ mod tests {
         let checkout = checkout_with_commit();
         let entries = [("bpm", checkout.path())];
         let roll = RollOf(&entries);
-        let prepared = prepare(&roll, home.path(), "bpm").await.expect("prepares");
+        let prepared = prepare(&roll, home.path(), "bpm", &test_config())
+            .await
+            .expect("prepares");
 
         (
             CutOverDouble::new(originals, script, refuses),
@@ -1652,7 +1705,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
 
@@ -1688,7 +1741,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm")
+        let err = prepare(&daemon, home.path(), "bpm", &test_config())
             .await
             .expect_err("refuses");
 

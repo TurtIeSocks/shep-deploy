@@ -56,6 +56,21 @@ pub enum Restored {
         /// Where it was put back to.
         to: PathBuf,
     },
+    /// A cutover that never landed, so the sheep was never moved and is
+    /// already running where it belongs.
+    ///
+    /// `optin::prepare` writes `origin_cwd` and `origin_script` and then
+    /// stops; `cut_over` is what re-registers the sheep against `current`.
+    /// Between the two, a tree exists and names an origin for a sheep that
+    /// is still running exactly where it always was. Restoring it would
+    /// delete and restart a healthy app to put it back where it already is,
+    /// and a `Start` that then failed would leave it stopped.
+    NeverMoved {
+        /// The sheep that was never moved.
+        sheep: String,
+        /// Where it has been running the whole time.
+        at: PathBuf,
+    },
     /// The dog bootstrapped this sheep, so there was nowhere to restore it
     /// to. Left running from `current`, unchanged.
     LeftRunning {
@@ -177,6 +192,8 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
         // tool was uninstalled would be much worse than leaving it. This
         // needs no roll at all, so a roll that failed to read does not
         // touch it.
+        // Read before the origin fields move out below.
+        let never_moved = state.deployed.is_none();
         let (Some(cwd), Some(script)) = (state.origin_cwd, state.origin_script) else {
             results.push(Restored::LeftRunning {
                 sheep,
@@ -189,6 +206,26 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             blocked_by_roll.push(sheep);
             continue;
         };
+
+        // An origin recorded is not the same as a sheep moved. `prepare`
+        // writes both origin fields, and only a landed cutover writes
+        // `deployed`, so an absent `deployed` means the cutover did not land.
+        //
+        // It does NOT mean the cutover never ran, which is why the shepherd is
+        // asked as well. `cut_over` writes `deployed` only on the fully
+        // verified path; its `NotVerified` and `Failed` arms return without
+        // touching it, having already run `undo_start`, whose own repair can
+        // fail and leave a newcomer registered. Reading `deployed` alone
+        // called that sheep untouched and reported it as running where it
+        // belongs, at the one moment this module exists to catch exactly that.
+        //
+        // `cwd` is the signal because `cut_over` is the only thing that ever
+        // sets it to the tree's `current`, so the shepherd's own registration
+        // says whether the cutover got as far as registering.
+        if never_moved && !registered_against(registered, &sheep, &tree) {
+            results.push(Restored::NeverMoved { sheep, at: cwd });
+            continue;
+        }
 
         results.push(
             match put_back(daemon, &sheep, registered, &cwd, &script).await {
@@ -339,6 +376,13 @@ pub fn report(results: &[Restored]) -> String {
             // indistinguishable from "quietly abandoned somewhere you will
             // not think to look", which is the failure this whole module
             // exists to prevent.
+            Restored::NeverMoved { sheep, at } => {
+                format!(
+                    "{sheep} was never moved - its cutover did not land - and is still running \
+                     from {}\n",
+                    at.display()
+                )
+            }
             Restored::LeftRunning { sheep, from } => {
                 format!("{sheep} still running from {}\n", from.display())
             }
@@ -383,9 +427,52 @@ pub fn report(results: &[Restored]) -> String {
         })
         .collect()
 }
+/// Whether the shepherd has `sheep` registered against `tree` rather than
+/// against the operator's own checkout.
+///
+/// `crate::optin::cut_over` sets `cwd` to the tree's `current` symlink and
+/// nothing else in this crate does, so this is the shepherd's own answer to
+/// "did the cutover get as far as registering". A tree's record cannot answer
+/// it: `deployed` is written on the verified path only.
+fn registered_against(registered: &BTreeMap<String, AppConfig>, sheep: &str, tree: &Tree) -> bool {
+    registered
+        .get(sheep)
+        .and_then(|app| app.cwd.as_deref())
+        .is_some_and(|cwd| Path::new(cwd) == tree.current())
+}
 
 #[cfg(test)]
 mod tests {
+    /// fails if a `deploy.toml` that cannot be parsed is skipped silently.
+    ///
+    /// This is the one moment the record matters most: removal is when the dog
+    /// puts every sheep back where its operator will look for it, and a target
+    /// it cannot read is a target it cannot restore. Skipping it would leave
+    /// an app running from a path under `$SHEP_HOME` with nothing said about
+    /// it.
+    ///
+    /// `poll.rs` pins the identical shape for `tick` in
+    /// `a_record_that_cannot_be_read_is_reported_rather_than_skipped`; the
+    /// branch here had no equivalent, so a change to `State::read`'s error
+    /// path could have gone quiet on one side and been caught only on the
+    /// other.
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_is_reported_rather_than_skipped() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "garbled");
+        std::fs::create_dir_all(tree.root()).expect("create the tree");
+        std::fs::write(tree.state_file(), "this is not toml").expect("write deploy.toml");
+
+        let results = all(&Recording::new(&[], Refuse::Never), home.path()).await;
+
+        assert_eq!(results.len(), 1, "the target must be reported, not skipped");
+        assert!(
+            matches!(&results[0], Restored::Failed { sheep, .. } if sheep == "garbled"),
+            "an unreadable record must be a reported failure, got: {:?}",
+            results[0]
+        );
+    }
+
     use std::cell::{Cell, RefCell};
     use std::fs;
 
@@ -473,6 +560,10 @@ mod tests {
         describe_fails: bool,
         delete_fails_at: Option<u32>,
         unreadable_roll: bool,
+        /// What the roll says each sheep's `cwd` is, when the default fixed
+        /// path will not do. A cutover that registered points the sheep at its
+        /// tree's own `current`, which only the test knows the path of.
+        registered_cwd: Option<String>,
         calls: RefCell<Vec<&'static str>>,
         starts: RefCell<Vec<AppConfig>>,
         attempts: Cell<usize>,
@@ -488,6 +579,7 @@ mod tests {
                 describe_fails: false,
                 delete_fails_at: None,
                 unreadable_roll: false,
+                registered_cwd: None,
                 calls: RefCell::new(Vec::new()),
                 starts: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
@@ -498,6 +590,13 @@ mod tests {
         /// Every registered sheep accepts every start.
         fn with_registered(sheep: &[&'static str]) -> Self {
             Self::new(sheep, Refuse::Never)
+        }
+
+        /// The same, with every sheep registered against `cwd` rather than
+        /// the fixed path the roll otherwise reports.
+        fn registered_at(mut self, cwd: &std::path::Path) -> Self {
+            self.registered_cwd = Some(cwd.display().to_string());
+            self
         }
 
         /// The very first `start` call, across every sheep, is refused;
@@ -643,9 +742,13 @@ mod tests {
                 .sheep
                 .iter()
                 .map(|name| {
+                    let cwd = self
+                        .registered_cwd
+                        .clone()
+                        .unwrap_or_else(|| "/srv/deploy-tree/current".to_owned());
                     format!(
                         "{{\"app\":{{\"name\":{name:?},\"script\":\"the-shepherds-own-script\",\
-                         \"cwd\":\"/srv/deploy-tree/current\"}}}}"
+                         \"cwd\":{cwd:?}}}}}"
                     )
                 })
                 .collect();
@@ -712,6 +815,90 @@ mod tests {
         let text = report(&results);
         assert!(text.contains("ctm still running from"), "{text}");
         assert!(text.contains("deploy/ctm/current"), "{text}");
+    }
+
+    /// fails if a tree whose cutover never landed is "restored".
+    ///
+    /// `optin::prepare` writes `origin_cwd` and `origin_script` and then
+    /// stops. `cut_over` is what actually moves the sheep. So between them a
+    /// tree exists naming an origin for a sheep that never left its own
+    /// checkout, and the branch here read those two fields alone: it could
+    /// not tell that tree from a sheep genuinely cut over.
+    ///
+    /// Restoring it deletes and restarts a healthy app to put it back where
+    /// it already is. Worse if the `Start` then fails, because the delete has
+    /// already landed and the app is simply stopped. `deployed` is the field
+    /// that says a cutover landed.
+    #[tokio::test]
+    async fn a_cutover_that_never_landed_is_not_restored() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_never_cut_over(home.path(), "ctm", "/srv/ctm", "./run.sh");
+        let daemon = Recording::with_registered(&["ctm"]);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            daemon.calls().is_empty(),
+            "a sheep that never moved must not be stopped or started: {:?}",
+            daemon.calls()
+        );
+        let text = report(&results);
+        assert!(text.contains("ctm was never moved"), "{text}");
+        assert!(text.contains("/srv/ctm"), "{text}");
+    }
+
+    /// fails if a cutover that got as far as registering is called "never
+    /// moved" and left alone.
+    ///
+    /// `cut_over` writes `deployed` only on its fully verified path. Its
+    /// `NotVerified` and `Failed` arms return without touching it, having
+    /// already run `undo_start`, and `undo_start`'s own repair can fail and
+    /// leave a newcomer registered. So an absent `deployed` means the cutover
+    /// did not LAND, not that it never RAN, and reading it alone reported a
+    /// sheep in that state as running where it belongs, doing nothing, at the
+    /// one moment this module exists to catch exactly that.
+    ///
+    /// The shepherd's own registration is what separates the two, because
+    /// `cut_over` is the only thing that ever points a sheep's `cwd` at the
+    /// tree's `current`.
+    #[tokio::test]
+    async fn a_cutover_that_registered_is_restored_even_without_a_deployed_sha() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target_never_cut_over(home.path(), "ctm", "/srv/ctm", "./run.sh");
+        let tree = Tree::for_sheep(home.path(), "ctm");
+        let daemon = Recording::with_registered(&["ctm"]).registered_at(&tree.current());
+
+        let results = all(&daemon, home.path()).await;
+
+        let text = report(&results);
+        assert!(
+            !text.contains("never moved"),
+            "a sheep the cutover registered against the tree was moved: {text}"
+        );
+        assert!(
+            !daemon.calls().is_empty(),
+            "it must actually be put back, not merely reported"
+        );
+    }
+
+    /// Writes a `deploy.toml` as `optin::prepare` leaves one when its cutover
+    /// never ran: an origin recorded, and no `deployed`.
+    fn write_target_never_cut_over(home: &Path, sheep: &str, origin_cwd: &str, script: &str) {
+        let tree = Tree::for_sheep(home, sheep);
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let state = State {
+            remote: "https://example.com/x".to_owned(),
+            branch: "main".to_owned(),
+            deployed: None,
+            failed: None,
+            verify: Verify::default(),
+            watch: Watch::default(),
+            origin_cwd: Some(PathBuf::from(origin_cwd)),
+            origin_script: Some(script.to_owned()),
+            checkout: PathBuf::from(origin_cwd),
+        };
+        state.write(&tree.state_file()).expect("write state");
     }
 
     /// fails if one target's failure stops the others being restored, or

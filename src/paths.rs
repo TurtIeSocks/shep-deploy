@@ -16,7 +16,7 @@
 //! └── deploy.toml          the sheep's `State` - see `crate::state`
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::Error;
 
@@ -67,6 +67,32 @@ pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
 pub struct Tree {
     root: PathBuf,
     sheep: String,
+}
+
+/// Whether `sheep` names one sheep, rather than a path.
+///
+/// [`Tree::for_sheep`] joins this onto `$SHEP_HOME/deploy`, and `PathBuf::join`
+/// REPLACES the whole path when what it is given is absolute. So a sheep name
+/// of `/tmp/anywhere` does not traverse out of the tree, it discards the tree
+/// entirely and roots itself wherever it says. `..` traverses out the ordinary
+/// way. Either one puts a deploy tree, and everything that later prunes and
+/// removes inside it, somewhere the operator did not point it.
+///
+/// Checked at the one place a name arrives from outside, which is the command
+/// line. The poll loop's names come from directory entries under
+/// `$SHEP_HOME/deploy` that this crate created, so they are already inside.
+///
+/// The test is that the string is exactly one ordinary path component: that
+/// rejects the empty string, `.`, `..`, anything absolute, and anything with a
+/// separator in it, without a charset rule that would have to guess at what an
+/// operator may call their app.
+#[must_use]
+pub fn is_sheep_name(sheep: &str) -> bool {
+    let mut components = Path::new(sheep).components();
+    let one_ordinary_component =
+        matches!(components.next(), Some(Component::Normal(only)) if only == sheep);
+
+    one_ordinary_component && components.next().is_none()
 }
 
 impl Tree {
@@ -128,6 +154,32 @@ impl Tree {
     #[must_use]
     pub fn current(&self) -> PathBuf {
         self.root.join("current")
+    }
+
+    /// Where a release's completion marker lives, keyed by sha.
+    ///
+    /// OUTSIDE the release, and that is the whole point of the path. The
+    /// marker says "this checkout finished", and a marker inside the release
+    /// is a file the DEPLOYED REPOSITORY can commit: `git worktree add` then
+    /// writes it out as part of the checkout it is supposed to vouch for, so
+    /// a kill partway leaves a partial release carrying its own certificate.
+    /// That is the round-9 blocker again with the adversary holding the pen.
+    ///
+    /// Under the tree's own root, which only this dog writes.
+    #[must_use]
+    pub fn completion(&self, sha: &str) -> PathBuf {
+        self.root.join("complete").join(sha)
+    }
+
+    /// The file a deploy takes an exclusive `flock` on, so only one process
+    /// at a time works on this tree.
+    ///
+    /// Its own file rather than the record or the root: `flock` is held for
+    /// the life of an open handle, and taking it on `deploy.toml` would tie
+    /// the lock's lifetime to a file the deploy rewrites underneath itself.
+    #[must_use]
+    pub fn lock_file(&self) -> PathBuf {
+        self.root.join("deploy.lock")
     }
 
     /// Where this sheep's [`crate::state::State`] lives.

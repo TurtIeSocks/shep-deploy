@@ -7,8 +7,9 @@
 
 use core::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use shep_client::shep_core::protocol::SmitError;
+use shep_client::shep_core::protocol::{RpcErrorCode, SmitError};
 use shep_client::{ConnectError, RequestError};
 
 /// Anything that can go wrong in one deploy.
@@ -29,8 +30,19 @@ pub enum Error {
     Request(RequestError),
     /// The shepherd answered with a response this dog cannot use.
     Protocol(String),
-    /// A `[dog.deploy]` (or per-sheep override) section could not be
-    /// understood.
+    /// Some operator-supplied input failed validation, and the message says
+    /// which and why.
+    ///
+    /// Deliberately broad, and named for the kind of mistake rather than for
+    /// one file. It is built at 35 sites across ten modules: a `[dog.<name>]`
+    /// section, a `deploy.toml` record, a release's own Flockfile, an
+    /// unresolvable `user`, an artifact path that would escape its release,
+    /// and a bad `--watch` argument, which is not TOML at all.
+    ///
+    /// It said "a `[dog.deploy]` (or per-sheep override) section could not be
+    /// understood" until 2026-08-28, which was true of one site and misleading
+    /// about the other 34. That matters more here than elsewhere: this
+    /// module's own doc says it exists to be read on its own.
     Config(String),
     /// A smit's own text could not become one at all - too long, empty, or
     /// carrying a control character.
@@ -288,6 +300,60 @@ pub enum Error {
         /// signal instead of exiting.
         status: Option<i32>,
     },
+    /// Another process is already deploying this sheep.
+    AlreadyDeploying {
+        /// The sheep whose tree is held.
+        sheep: String,
+    },
+    /// The build ran longer than `build_timeout` and was abandoned.
+    ///
+    /// Distinct from [`Self::Build`] because the two need different words. A
+    /// build that exits non-zero failed and said so; this one never answered,
+    /// and the operator's next move is to look at what it is waiting on rather
+    /// than at its output.
+    BuildTimedOut {
+        /// The budget it ran past.
+        after: Duration,
+    },
+}
+
+impl Error {
+    /// Whether a failed request is worth asking again.
+    ///
+    /// The refusal this whole retry exists for is `ReloadInFlight`, which shep
+    /// maps to [`RpcErrorCode::Internal`] under protest: it carries no code of
+    /// its own, so `Internal` is as close as this crate can get to naming it,
+    /// and everything else that arrives as `Internal` is at least plausibly
+    /// transient too. [`RequestError::Timeout`] and `DeadlineExceeded` are the
+    /// same shape of answer from the other two layers.
+    ///
+    /// Everything else is refused at once, which is the half that was missing.
+    /// `NotFound` means the selector matched nothing, and asking a second time
+    /// cannot make a sheep exist: retrying it burned the entire budget and then
+    /// reported a split state claiming a running process there was none of, with
+    /// a suggested `shep reload` that fails identically. `Closed` cannot clear
+    /// either - this client's connection is gone and nothing here reconnects.
+    ///
+    /// An unrecognised code is NOT retried. [`RpcErrorCode`] is
+    /// `#[non_exhaustive]`, so this arm is the one a future variant lands in,
+    /// and failing fast on an unknown code is the mistake that costs a bounded
+    /// delay rather than the one that costs an operator a wrong diagnosis.
+    ///
+    /// Moved here from `crate::deploy` on 2026-08-28: it is a property of the
+    /// error, not of deploying, and `crate::verify` needed the same judgement
+    /// for the same RPC over the same socket. A second copy there would have
+    /// been the third place this line gets drawn.
+    #[must_use]
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Request(RequestError::Timeout { .. }) => true,
+            Self::Request(RequestError::Rpc(rpc)) => matches!(
+                rpc.code,
+                RpcErrorCode::Internal | RpcErrorCode::DeadlineExceeded
+            ),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -450,6 +516,17 @@ impl fmt::Display for Error {
                     removes.join(", ")
                 )
             }
+            Self::AlreadyDeploying { sheep } => write!(
+                f,
+                "another deploy of {sheep} is already running; this one did nothing. \
+                 The dog polls on its own, so a deploy started by hand while a tick \
+                 is in flight meets this"
+            ),
+            Self::BuildTimedOut { after } => write!(
+                f,
+                "the build did not finish within {after:?} and was abandoned; raise \
+                 build_timeout in [dog.deploy] if it legitimately needs longer"
+            ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
@@ -477,6 +554,8 @@ impl core::error::Error for Error {
             | Self::Held { .. }
             | Self::Git { .. }
             | Self::Raced { .. }
+            | Self::BuildTimedOut { .. }
+            | Self::AlreadyDeploying { .. }
             | Self::Unverified { .. }
             | Self::Stranded { .. }
             | Self::Build { .. } => None,
@@ -499,7 +578,6 @@ impl From<RequestError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     // For `Error::source` on the wrapping variants.
     use core::error::Error as _;
 
@@ -724,5 +802,38 @@ mod tests {
     fn a_build_error_names_a_signal_kill_distinctly() {
         let err = Error::Build { status: None };
         assert!(err.to_string().contains("signal"));
+    }
+
+    /// fails if a request that can never succeed is retried anyway.
+    ///
+    /// The retry exists for `ReloadInFlight`, which shep can only report as
+    /// `Internal`; a `NotFound` means the selector matched nothing, and asking
+    /// again cannot make a sheep exist. Retrying it burned the whole budget
+    /// and then reported a split state claiming a running process there was
+    /// none of.
+    ///
+    /// Moved here from `crate::deploy` with the function it tests.
+    #[test]
+    fn only_a_failure_that_could_clear_is_retried() {
+        let rpc = |code| {
+            Error::Request(RequestError::Rpc(RpcError {
+                code,
+                message: "web is already being reloaded".to_owned(),
+            }))
+        };
+
+        assert!(rpc(RpcErrorCode::Internal).is_retryable());
+        assert!(rpc(RpcErrorCode::DeadlineExceeded).is_retryable());
+        assert!(
+            Error::Request(RequestError::Timeout {
+                after: core::time::Duration::from_secs(1)
+            })
+            .is_retryable()
+        );
+
+        assert!(!rpc(RpcErrorCode::NotFound).is_retryable());
+        assert!(!rpc(RpcErrorCode::InvalidConfig).is_retryable());
+        assert!(!Error::Request(RequestError::Closed).is_retryable());
+        assert!(!Error::Protocol("nonsense".to_owned()).is_retryable());
     }
 }

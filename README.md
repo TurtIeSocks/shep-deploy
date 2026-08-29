@@ -25,6 +25,31 @@ shep adopt shep-deploy
 `shep adopt` registers it with the shepherd, which supervises it from then on.
 `shep dogs` lists what you have adopted.
 
+## Telling it how to build
+
+The build command lives in the deployed repository's own Flockfile, under the
+table shep keeps for a dog's config:
+
+```toml
+[[app]]
+name = "web"
+script = "server.js"
+
+[dog.deploy.build]
+command = "npm ci && npm run build"
+artifacts = ["dist/bundle.js"]
+```
+
+shep reads nothing under `dog` and validates none of it. It only had to stop
+refusing the document for carrying it, which it does as of 0.1.10, so the same
+Flockfile now registers with `shep start` and tells this dog how to build.
+
+That is a change from earlier versions, which put the block at the top level as
+`[build]`. shep refused a Flockfile with an unknown top-level key, so an
+operator following these instructions could not register their app at all. A
+top-level `[build]` is now refused here by name, pointing at the new spelling,
+rather than ignored and silently building nothing.
+
 ## What one deploy does
 
 1. Fetch into a bare clone, and compare the branch head to the last deployed
@@ -84,13 +109,36 @@ moved. Configure it in `shep.toml`:
 [dog.deploy]
 interval = "30s"
 retention = 5
+git_timeout = "5m"
+build_timeout = "1h"
+passthrough = ["CARGO_HOME"]
 ```
 
-Both are read once, when the dog starts, so changing either takes a `shep
-restart deploy`. `retention` is how many releases each target keeps. It cannot
-be below 2: the release a failed deploy rolls back to is the second newest, so
-anything lower would silently disable rollback, and it is refused rather than
-clamped.
+All five are read once, when the dog starts, so changing any takes a `shep
+restart deploy`.
+
+`retention` is how many releases each target keeps **besides the live one**, so
+a target holds up to `retention + 1` directories. The live release is spared
+unconditionally, whatever its age. It cannot be below 2: the release a failed
+deploy rolls back to is the second newest, so anything lower would silently
+disable rollback, and it is refused rather than clamped.
+
+`git_timeout` bounds the fetch, which is the only git call that talks to a network. The rest operate on local directories and cannot hang on a remote. Targets are deployed one at a
+time, so without it a remote that drops packets rather than refusing them stops
+every target and every smit refresh, with no error and no log line. Five
+minutes by default, which is generous enough for a cold clone of a large
+repository.
+
+`build_timeout` bounds the build command, against the same failure and for the
+same reason. A build that never finishes holds that same one-at-a-time loop, so
+no other target deploys and nothing is logged, because from the loop's point of
+view nothing has gone wrong. An hour by default, which no honest build should
+reach: it exists to turn a build that will never finish into an ordinary
+per-target failure, not to put a schedule on slow work. A build past it is
+killed as a process group, so whatever the build command started goes with it.
+
+`passthrough` names environment variables a build may keep from the dog's own
+environment. See Security below for why that list starts empty.
 
 One target's failure never stops the others, and never stops the dog. Each
 target's outcome is reported on its own and the loop carries on. `up to date`
@@ -100,6 +148,13 @@ every target, and a line that repeats is said once rather than every interval.
 A tick never begins while the previous one is still running, so a push landing
 during a build is deployed on the next tick rather than aborting the build in
 flight.
+
+Nor does a second process. Each deploy takes an exclusive `flock` on its own
+tree for as long as it runs, so `shep-deploy deploy web` typed while the dog is
+mid-tick on `web` is refused in one sentence rather than colliding somewhere
+inside git. The lock is per sheep, so other targets are unaffected, and the
+kernel releases it if the holder dies, so a killed dog leaves nothing behind
+holding a sheep hostage.
 
 Every tick also paints each target's smit, so `shep flock` shows which branch
 and sha it is on without a second command:
@@ -146,6 +201,22 @@ its own port while the original still holds it, and the new instance is then
 removed and the original left serving. Every deploy after the first replaces
 the instance rather than joining it, and does not meet this.
 
+Most apps cannot set `SO_REUSEPORT`, and some cannot even be made to: Node
+refuses `reusePort` on macOS outright. For those, stop the sheep before the
+cutover and start it afterwards:
+
+```bash
+shep stop web
+```
+```bash
+shep-deploy setup web
+```
+
+With the port free the newcomer binds and the cutover lands. It costs the
+downtime this section already warns about, and it is the difference between a
+setup that works and one that cannot. Measured 2026-08-28: the same app that
+failed the cutover while running completed it once stopped.
+
 A cutover that was abandoned leaves the tree behind, and a sheep is not a
 deploy target until a cutover lands. `shep-deploy deploy` refuses such a target
 before anything at all happens, because its record names no deployed release.
@@ -175,8 +246,35 @@ readiness probe. shep reports a freshly started process `Online` once its
 whose replacement was not ready. So `setup` checks what it can: a new process
 started and was still the same process, not errored and not restarted, ten
 seconds later. A release that starts, stays up and serves nothing passes that.
-Every deploy after the first is verified properly, against the probe, with
-automatic rollback.
+Every deploy after the first is verified against a new process reaching
+`Online`.
+
+**That used to be weaker than it sounds, and the gap was shep's rather than
+this crate's.** Measured 2026-08-28 against a real shepherd: a sheep with an
+HTTP `readiness_probe` that never passes was marked `Online` about a second
+into a reload, well inside its `listen_timeout`, and stayed there. The cause
+was the reload's overlap. Both instances were up when the replacement's first
+probe landed, the outgoing one answered it, and shep took that as the incoming
+one proving itself. A release that started and never became ready was verified,
+recorded as deployed, and not rolled back, with the app down while the record
+said otherwise.
+
+shep fixed it the same day. A probed app is now reloaded serially: the old
+instance drains first, so the only process that can answer the replacement's
+probe is the replacement. An app that sets `reuse_port` keeps the overlap it
+asks for and gets a second probe once the drained instance is gone. Either way
+a replacement that never answers is left `starting` rather than `online`, which
+is what this crate reads, so `verify = "probed"` now means what it says.
+
+One thing to size correctly. A `reuse_port` app's reload costs one more
+`listen_timeout` than it used to, for that second probe, and the budget in
+`deploy.rs` is `listen_timeout + graceful_timeout + slack` per instance. For
+that one combination the budget can expire mid-check and roll back a release
+that was fine. A false rollback rather than a false success, which is the right
+direction to fail, but it wants a wider budget.
+
+Rollback works for a release that crashes and for one that starts without
+serving. Both are caught.
 
 ## Removing it
 
@@ -226,9 +324,40 @@ shep-deploy warns when it is about to run a build as root with no `user` set.
 It does not refuse. Whether an app runs without a `user` is shep's call and the
 operator's, not a deploy dog's.
 
+A build starts from a cleared environment, not this process's. It gets `PATH`,
+`HOME`, `LANG`, `LC_ALL` and `TZ`, whatever `passthrough` names in
+`[dog.deploy]` in `shep.toml`, and the release's own `[dog.deploy.build] env`.
+Nothing else. Dropping uid and gid bounds what a build can touch; it does
+nothing about what it can read out of its own environment, because those values
+are copied in before the drop happens. A dog started with a registry token in
+its environment would otherwise hand it to every build it runs.
+
+`SSH_AUTH_SOCK` is not in that base set, on purpose. A forwarded agent reaching
+a build lets the build authenticate as you anywhere that agent is trusted.
+Fetching happens in the dog's own process and keeps its own environment, so a
+private repository still clones; only the build loses the socket. Name it in
+`passthrough` if a build genuinely needs it.
+
+`build.artifacts` may only name paths that really land inside the release or
+the dog's own build cache, resolved rather than spelled. A `..`, an absolute
+path, a committed symlink, or a `CARGO_TARGET_DIR` pointing elsewhere are all
+refused. That is narrower than it was: a build whose output genuinely lands
+outside both is no longer copyable, because the copy runs in the dog's own
+process at its own uid, and the `[dog.deploy.build]` block naming the path
+comes from the deployed repository rather than from you.
+
+**What the allowlist does not cover, and cannot.** Your project's own secrets
+are not in the dog's environment, they are in your repository's working tree. A
+`.env` file is gitignored, which is exactly the rule that makes shep-deploy
+symlink it into every release, so the build reads it and so does the app at
+runtime. That is the intended behaviour and the reason shared files exist. It
+does mean a build command can read every secret the app itself can read, no
+matter what this allowlist says. The bound worth having there is `user`, so
+that a build and the app it builds are confined to the same one account.
+
 Nothing else here handles credentials. Git auth is inherited from the user the
-build runs as, so a private repository works exactly as it does in that user's
-own shell, and no token passes through any URL or argument this crate builds.
+dog runs as, so a private repository works as it does in that user's own shell,
+and no token passes through any URL or argument this crate builds.
 
 ## Platform
 

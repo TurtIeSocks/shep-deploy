@@ -34,6 +34,35 @@ const DEFAULT_INTERVAL: UpDuration = UpDuration::from_millis(30_000);
 /// How many releases retention keeps, absent a config saying otherwise.
 const DEFAULT_RETENTION: usize = 5;
 
+/// How long a single git subprocess may run before it is abandoned, absent a
+/// config saying otherwise.
+///
+/// Five minutes. The poll loop deploys targets one at a time on a
+/// single-threaded runtime, so an unbounded git call does not fail a target,
+/// it wedges every target and the smit refresh with it, silently. A bound
+/// turns that into an ordinary per-target error the loop already knows how to
+/// report and carry on from.
+///
+/// Five rather than something tighter because a cold clone of a large
+/// repository legitimately runs minutes, and failing honest work is worse
+/// than a late failure on a remote that was never going to answer.
+const DEFAULT_GIT_TIMEOUT: UpDuration = UpDuration::from_millis(300_000);
+
+/// How long a build may run before it is abandoned.
+///
+/// An hour, which is far longer than any build this is meant to bound and is
+/// deliberate. The purpose is to turn a build that will NEVER finish into an
+/// ordinary per-target failure, not to put a schedule on honest work: a cold
+/// Rust build of a large workspace legitimately runs tens of minutes, and
+/// failing one of those would be a worse bug than the one this fixes.
+///
+/// Without it a build that hangs stops the whole dog, not just its own target.
+/// `crate::poll::tick` deploys targets one at a time, so a single hung build
+/// holds the loop forever: no other target deploys, no smit refreshes, and
+/// nothing is logged, because nothing has failed. That is exactly the shape
+/// `git_timeout` was added for, one subprocess over.
+const DEFAULT_BUILD_TIMEOUT: UpDuration = UpDuration::from_millis(3_600_000);
+
 /// The fewest releases a target can keep and still be able to roll back.
 ///
 /// Two: the one that is live, and the one before it. Retention keeps the
@@ -47,12 +76,30 @@ const MINIMUM_RETENTION: usize = 2;
 /// raw text is a different matter and `crate::daemon::named` already
 /// refuses to print it, because a `[dog.<name>]` section routinely carries
 /// webhook credentials for other dogs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: `passthrough` is a `Vec`. Cloning a config once per tick is
+/// not a cost worth designing around.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DogConfig {
     /// How long the poll loop sleeps between ticks.
     pub interval: Duration,
     /// How many releases per target retention keeps.
+    ///
+    /// This is a count of releases kept *besides* the live one, so a target
+    /// holds up to `retention + 1` directories. See `crate::retention::doomed`
+    /// for why the live release is spared unconditionally.
     pub retention: usize,
+    /// How long any single git subprocess may run before it is abandoned.
+    pub git_timeout: Duration,
+    /// How long a build may run before it is abandoned.
+    pub build_timeout: Duration,
+    /// Environment variables copied from this process into a build, by name.
+    ///
+    /// A build otherwise starts from a cleared environment plus a small fixed
+    /// set (see `crate::build::BASE_ENV`), so anything a build needs from the
+    /// dog's own environment is opted into here by name and is visible in
+    /// `shep.toml` rather than inherited invisibly.
+    pub passthrough: Vec<String>,
 }
 
 /// The wire shape, kept separate from [`DogConfig`] so the validated type
@@ -62,6 +109,9 @@ pub struct DogConfig {
 struct Raw {
     interval: UpDuration,
     retention: usize,
+    git_timeout: UpDuration,
+    build_timeout: UpDuration,
+    passthrough: Vec<String>,
 }
 
 impl Default for Raw {
@@ -69,6 +119,9 @@ impl Default for Raw {
         Self {
             interval: DEFAULT_INTERVAL,
             retention: DEFAULT_RETENTION,
+            git_timeout: DEFAULT_GIT_TIMEOUT,
+            build_timeout: DEFAULT_BUILD_TIMEOUT,
+            passthrough: Vec::new(),
         }
     }
 }
@@ -83,7 +136,8 @@ impl DogConfig {
     /// # Errors
     /// [`Error::Config`] if the text is not valid TOML, carries a key this
     /// dog does not know, gives a value of the wrong type, asks for a
-    /// retention below two, or asks for a zero interval.
+    /// retention below two, asks for a zero interval, or asks for a zero
+    /// `git_timeout` or `build_timeout`.
     ///
     /// Every case except the first names the offending key, because the
     /// section is one an operator edited by hand and a complaint they cannot
@@ -112,9 +166,32 @@ impl DogConfig {
             ));
         }
 
+        let git_timeout = raw.git_timeout.as_duration();
+        if git_timeout.is_zero() {
+            return Err(Error::Config(
+                "git_timeout = \"0\" would abandon every fetch the moment it started; \
+                 the point of the bound is to turn a hung remote into an ordinary \
+                 per-target failure, not to disable git"
+                    .to_owned(),
+            ));
+        }
+
+        let build_timeout = raw.build_timeout.as_duration();
+        if build_timeout.is_zero() {
+            return Err(Error::Config(
+                "build_timeout = \"0\" would abandon every build the moment it started; \
+                 the point of the bound is to turn a build that never finishes into an \
+                 ordinary per-target failure, not to disable building"
+                    .to_owned(),
+            ));
+        }
+
         Ok(Self {
             interval,
             retention: raw.retention,
+            git_timeout,
+            build_timeout,
+            passthrough: raw.passthrough,
         })
     }
 }

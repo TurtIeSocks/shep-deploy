@@ -69,6 +69,7 @@ pub enum Watch {
 /// small enums above. This dog does no credential handling of its own (see
 /// `error::Error`'s own doc comment), so nothing here carries one either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct State {
     /// The git remote this sheep is deployed from.
     pub remote: String,
@@ -171,6 +172,38 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a typo in `deploy.toml` is silently dropped.
+    ///
+    /// This file is not ours alone: `crate::deploy` tells an operator to type
+    /// `verify = "alive"` into it by hand. `verify` is `#[serde(default)]`, so
+    /// without this a `verfiy = "alive"` parses fine, leaves the mode at
+    /// `Probed`, and the next deploy fails on the identical message with
+    /// nothing anywhere indicating the edit did nothing.
+    ///
+    /// Matches what `crate::config` already does to a `[dog.deploy]` typo, and
+    /// for the same stated reason: a setting that silently does something
+    /// other than what it says is worse than one that is refused.
+    #[test]
+    fn an_unknown_key_in_the_record_is_refused_and_named() {
+        // `checkout` is present, and load-bearing: it has no default, so
+        // leaving it out made the document invalid twice over and the test
+        // passed on whichever error serde reported first. It still caught the
+        // guard being removed, but failed with "TOML parse error at line 1"
+        // instead of naming the typo, which sends the next reader to the wrong
+        // place.
+        let toml = r#"
+remote = "https://example.invalid/repo.git"
+branch = "main"
+checkout = "/srv/web"
+verfiy = "alive"
+"#;
+        let err = toml::from_str::<State>(toml).expect_err("a typo must not parse");
+        assert!(
+            format!("{err}").contains("verfiy"),
+            "the refusal must name the key an operator typed: {err}"
+        );
+    }
+
     use super::*;
 
     /// fails if state does not survive a write-then-read. This file is the

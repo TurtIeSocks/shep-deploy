@@ -33,7 +33,7 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use shep_client::shep_core::prelude::AppConfig;
 use toml::{Table, Value};
@@ -57,8 +57,8 @@ use crate::error::Error;
 /// file sets `user` or `group` on any app, if no app named `sheep` exists
 /// after merging, or if that app's table does not match [`AppConfig`]'s
 /// schema.
-pub fn app_config(release: &Path, sheep: &str) -> Result<AppConfig, Error> {
-    let merged = merged_document(release)?;
+pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<AppConfig, Error> {
+    let merged = merged_document(release, shared)?;
 
     let app = select_app(&merged, sheep)?;
     app.try_into().map_err(|source: toml::de::Error| {
@@ -68,34 +68,67 @@ pub fn app_config(release: &Path, sheep: &str) -> Result<AppConfig, Error> {
     })
 }
 
-/// The release's `[build]` block, or the default (no command, which
+/// The release's `[dog.deploy.build]` block, or the default (no command, which
 /// [`crate::build::run`] treats as a no-op) if it declares none.
 ///
 /// Read from the same merged document [`app_config`] reads, so the
-/// operator's override wins here too. That is not incidental: `build.env`
-/// routinely names host-specific paths - a registry token or a `NODE_ENV`,
-/// say - and those are exactly the values a committed file cannot know and
-/// an operator has to pin locally.
+/// operator's override wins here too. That is not incidental: the block's
+/// `env` routinely names host-specific paths - a registry token or a
+/// `NODE_ENV`, say - and those are exactly the values a committed file
+/// cannot know and an operator has to pin locally.
 ///
-/// The block is top-level rather than a key on the app entry, because
-/// `AppConfig` refuses unknown fields: a `build` key inside `[[app]]` would
-/// make shep's own parser reject the entry. One block per Flockfile also
-/// matches what a release actually is - one checkout, built once - even
-/// when several sheep are deployed from the same repository.
+/// Not a key on the app entry, because `AppConfig` refuses unknown fields: a
+/// `build` key inside `[[app]]` would make shep's own parser reject the
+/// entry. One block per Flockfile also matches what a release actually is,
+/// one checkout built once, even when several sheep are deployed from the
+/// same repository.
+///
+/// Under `[dog.deploy.build]` rather than a top-level `[build]`, and that move is
+/// the whole reason this doc changed. shep's `RawFlockfile` denies unknown
+/// fields at the top level too, so a Flockfile carrying `[build]` could not
+/// be registered with shep at all: `shep start Flockfile.toml` answered
+/// "unknown field `build`, expected `$schema` or `app`". An operator
+/// following this crate's own README could not complete step one. shep
+/// gained a `dog` table for exactly this in 0.1.10, and this is the key that
+/// goes in it.
 ///
 /// # Errors
 /// As [`app_config`] for reading and merging the two files, plus
-/// [`Error::Config`] if the `[build]` block does not match
-/// [`BuildSpec`]'s schema - an unknown key, or a value of the wrong type.
-pub fn build_spec(release: &Path) -> Result<BuildSpec, Error> {
-    let merged = merged_document(release)?;
-    let Some(build) = merged.as_table().and_then(|doc| doc.get("build")) else {
+/// [`Error::Config`] if the block does not match [`BuildSpec`]'s schema - an
+/// unknown key, or a value of the wrong type - or if the Flockfile still
+/// carries a top-level `[build]`.
+pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error> {
+    let merged = merged_document(release, shared)?;
+    let doc = merged.as_table();
+
+    // Refused rather than ignored, because ignoring it builds nothing and says
+    // nothing: a release whose build never ran, swapped in and reported as
+    // deployed. The old spelling is in this crate's own published README, so
+    // whoever meets this message is following instructions that were right at
+    // the time.
+    if doc.is_some_and(|doc| doc.contains_key("build")) {
+        return Err(Error::Config(format!(
+            "{}: `[build]` moved to `[dog.deploy.build]`. shep refuses a Flockfile with a \
+             top-level `build` key, so the old spelling could not be registered with \
+             `shep start` at all; `[dog]` is the table shep keeps for a dog's own \
+             config. Rename the block.",
+            release.display()
+        )));
+    }
+
+    let Some(build) = doc
+        .and_then(|doc| doc.get("dog"))
+        .and_then(Value::as_table)
+        .and_then(|dogs| dogs.get("deploy"))
+        .and_then(Value::as_table)
+        .and_then(|deploy| deploy.get("build"))
+    else {
         return Ok(BuildSpec::default());
     };
 
     build.clone().try_into().map_err(|source: toml::de::Error| {
         Error::Config(format!(
-            "{}: `[build]` does not match the build schema: {source}",
+            "{}: `[dog.deploy.build]` does not match the build schema: {source}",
             release.display()
         ))
     })
@@ -109,13 +142,62 @@ pub fn build_spec(release: &Path) -> Result<BuildSpec, Error> {
 ///
 /// # Errors
 /// As [`app_config`], minus the app-selection failures.
-fn merged_document(release: &Path) -> Result<Value, Error> {
+fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
     let committed = read_required(&release.join("Flockfile.toml"))?;
     refuse_repo_privilege(&committed)?;
 
-    let override_doc = read_optional(&release.join("Flockfile.override.toml"))?;
+    let override_path = release.join(OVERRIDE);
+    let override_doc = read_optional(&override_path)?;
+
+    // The override is exempt from the privilege refusal only because it is the
+    // OPERATOR's file, and that has to be established rather than assumed. A
+    // repository that simply committed a `Flockfile.override.toml` had
+    // `user = "root"` honoured, which is the one thing this module's own doc
+    // calls the real boundary. Measured 2026-08-28.
+    //
+    // Asked of `shared`, the list of paths the caller just linked in from the
+    // operator's checkout, because that is the only record of where a file
+    // came from. See `is_operators` for the two filesystem-based versions of
+    // this check that came before, and why neither could work.
+    if !is_operators(shared) {
+        refuse_repo_privilege(&override_doc)?;
+    }
+
     Ok(deep_merge(committed, override_doc))
 }
+
+/// Whether the override in this release is the operator's own file.
+///
+/// Answered from the list of paths the caller just shared, not from the
+/// filesystem. Three versions of this check asked the filesystem and all three
+/// were wrong, the last one subtly enough to be worth recording.
+///
+/// It required the override to resolve OUTSIDE the release, on the grounds
+/// that the operator's arrives as a symlink into their checkout. A repository
+/// can satisfy that in two commits. Release A ships an ordinary tracked file
+/// holding `user = "root"` under some innocuous name, and goes live, which by
+/// this crate's own invariant means `current` points at it. Release B then
+/// commits `Flockfile.override.toml` as a symlink to
+/// `../../current/.deploy-payload.toml`. That resolves into release A, which
+/// is outside release B, so the check passed and the refusal was skipped.
+/// Demonstrated 2026-08-28.
+///
+/// The lesson is not that the rule needed another clause. It is that
+/// provenance cannot be recovered from a path once the path exists: whoever
+/// can write the tree can write the evidence. `crate::shared::link_into` is
+/// the only thing that knows which files came from the operator's checkout,
+/// because it is what put them there, so the answer travels from its caller
+/// instead of being reconstructed here.
+fn is_operators(shared: &[PathBuf]) -> bool {
+    shared.iter().any(|p| p == Path::new(OVERRIDE))
+}
+
+/// The override's name, in the one place both the check and the read use it.
+///
+/// `crate::shared::to_link` needs it too, to keep a repo-committed
+/// `.shepignore` from filtering the operator's own file out of the list this
+/// module then treats as proof of provenance.
+pub(crate) const OVERRIDE: &str = "Flockfile.override.toml";
 
 /// Reads and parses a Flockfile that must exist.
 ///
@@ -299,25 +381,125 @@ fn select_app(merged: &Value, sheep: &str) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::TempDir;
+    /// fails if a committed override can grant a unix user.
+    ///
+    /// The override is exempt from `refuse_repo_privilege` because it is the
+    /// operator's file. Nothing checked that it was, and the exemption is
+    /// worthless without the check: measured 2026-08-28, a repository that
+    /// simply committed `Flockfile.override.toml` had `user = "root"`
+    /// honoured, straight past the boundary this module's own doc calls the
+    /// one real one.
+    ///
+    /// `link_into` refuses when something is already in the way, so a
+    /// committed file cannot displace an override the operator does share.
+    /// This is the case it cannot cover: an operator with no override at all,
+    /// where nothing collides and the committed file simply arrives.
+    #[test]
+    fn a_committed_override_cannot_grant_a_user() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::fs::write(
+            rel.path().join("Flockfile.override.toml"),
+            "[[app]]\nname = \"web\"\nuser = \"root\"\n",
+        )
+        .expect("committed override");
 
-    /// Builds a release directory containing the given files - typically
-    /// `Flockfile.toml` and/or `Flockfile.override.toml` - for one test.
-    fn fixture_release(files: &[(&str, &str)]) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (name, contents) in files {
-            fs::write(dir.path().join(name), contents).expect("write fixture file");
-        }
-        dir
+        let err = app_config(rel.path(), "web", &[])
+            .expect_err("a committed override must not grant a user");
+        assert!(
+            format!("{err}").contains("user"),
+            "the refusal must name the field: {err}"
+        );
     }
+
+    /// fails if a repository can buy the exemption with a symlink out.
+    ///
+    /// The escape the previous version of `is_operators` allowed, in two
+    /// commits and needing nothing from the operator. Release A ships an
+    /// ordinary tracked file holding `user = "root"` and goes live, so
+    /// `current` points at it. Release B commits `Flockfile.override.toml` as
+    /// a symlink to `../../current/.deploy-payload.toml`, which resolves into
+    /// release A. That is outside release B, so the old "resolves outside the
+    /// release" test passed and the refusal was skipped.
+    ///
+    /// It is the reason provenance now comes from the share list rather than
+    /// from the filesystem: whoever can write the tree can write the evidence.
+    #[test]
+    fn a_committed_symlink_out_of_the_release_buys_no_exemption() {
+        let tree = tempfile::tempdir().expect("tempdir");
+        let a = tree.path().join("releases/shaA");
+        let b = tree.path().join("releases/shaB");
+        std::fs::create_dir_all(&a).expect("a");
+        std::fs::create_dir_all(&b).expect("b");
+
+        std::fs::write(
+            a.join(".deploy-payload.toml"),
+            "[[app]]\nname = \"web\"\nuser = \"root\"\n",
+        )
+        .expect("payload");
+        std::os::unix::fs::symlink(&a, tree.path().join("current")).expect("current");
+
+        std::fs::write(
+            b.join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::os::unix::fs::symlink(
+            "../../current/.deploy-payload.toml",
+            b.join("Flockfile.override.toml"),
+        )
+        .expect("committed symlink");
+
+        // Nothing was shared, so nothing is the operator's.
+        let err =
+            app_config(&b, "web", &[]).expect_err("a committed symlink must not buy the exemption");
+        assert!(
+            format!("{err}").contains("user"),
+            "the refusal must name the field: {err}"
+        );
+    }
+
+    /// fails if the operator's own override stops being able to pin a user.
+    ///
+    /// The counterpart. Theirs reaches a release as a symlink into their
+    /// checkout, so it resolves outside the release and keeps the exemption,
+    /// which is the whole "pin it so upstream cannot change it" mechanism.
+    #[test]
+    fn the_operators_own_override_still_pins_a_user() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        let theirs = checkout.path().join("Flockfile.override.toml");
+        std::fs::write(&theirs, "[[app]]\nname = \"web\"\nuser = \"svc\"\n").expect("theirs");
+        std::os::unix::fs::symlink(&theirs, rel.path().join("Flockfile.override.toml"))
+            .expect("shared in");
+
+        // The share list is what makes it theirs, exactly as `link_into`
+        // would have reported it.
+        let shared = [PathBuf::from("Flockfile.override.toml")];
+        let app =
+            app_config(rel.path(), "web", &shared).expect("the operator's override is honoured");
+        assert_eq!(app.user.as_deref(), Some("svc"));
+    }
+
+    use crate::fixtures;
+
+    use super::*;
 
     /// fails if the override stops winning. The override is the user's file
     /// and the committed one is upstream's; a user who pins script must not
     /// have it changed underneath them by a pull.
     #[test]
     fn the_override_wins_on_merge() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='upstream.js'\n",
@@ -327,7 +509,7 @@ mod tests {
                 "[[app]]\nname='web'\nscript='mine.js'\n",
             ),
         ]);
-        let app = app_config(rel.path(), "web").expect("merges");
+        let app = app_config(rel.path(), "web", &[]).expect("merges");
         assert_eq!(app.script, "mine.js");
     }
 
@@ -337,11 +519,11 @@ mod tests {
     /// is the boundary.
     #[test]
     fn a_committed_flockfile_cannot_set_user() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
             "[[app]]\nname='web'\nscript='x.js'\nuser='root'\n",
         )]);
-        let err = app_config(rel.path(), "web").expect_err("refuses");
+        let err = app_config(rel.path(), "web", &[]).expect_err("refuses");
         assert!(err.to_string().contains("user"));
     }
 
@@ -352,35 +534,43 @@ mod tests {
     /// would still pass it.
     #[test]
     fn a_committed_flockfile_cannot_set_group() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
             "[[app]]\nname='web'\nscript='x.js'\ngroup='wheel'\n",
         )]);
-        let err = app_config(rel.path(), "web").expect_err("refuses");
+        let err = app_config(rel.path(), "web", &[]).expect_err("refuses");
         assert!(err.to_string().contains("group"));
     }
 
     /// fails if the presence of an override makes the committed-file
-    /// refusal disappear. The override here overwrites `user` to a
-    /// different value entirely - if the check ran against the *merged*
-    /// document's value instead of the committed document itself, this is
-    /// exactly the shape that would look laundered: the dangerous value
-    /// `root` is gone from the merged result, replaced by `nobody`. The
-    /// refusal must fire anyway, because it was decided by reading the
-    /// committed file alone, before the override was ever opened.
+    /// refusal disappear. The refusal must fire because it was decided by
+    /// reading the committed file alone, before the override was opened.
+    ///
+    /// The override deliberately does NOT name `user`. It did, set to
+    /// `nobody`, on the theory that a laundered merge would be the shape
+    /// worth catching. That made the test vacuous: `shared` is empty here, so
+    /// `is_operators` is false, so `merged_document` runs
+    /// `refuse_repo_privilege` against the override document too, and THAT
+    /// check produced the error being asserted on. Deleting the
+    /// committed-document check left the test passing. Found in round 8 of
+    /// the founder's review, by deleting that line and re-running.
+    ///
+    /// `script` is the right field precisely because nothing refuses it, so
+    /// the only remaining route to an error is the check this test is named
+    /// for. `a_committed_flockfile_cannot_set_user` covers the other one.
     #[test]
     fn an_override_present_does_not_launder_a_committed_user_field() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='x.js'\nuser='root'\n",
             ),
             (
                 "Flockfile.override.toml",
-                "[[app]]\nname='web'\nuser='nobody'\n",
+                "[[app]]\nname='web'\nscript='mine.js'\n",
             ),
         ]);
-        let err = app_config(rel.path(), "web").expect_err("still refuses");
+        let err = app_config(rel.path(), "web", &[]).expect_err("still refuses");
         assert!(err.to_string().contains("user"));
     }
 
@@ -393,7 +583,7 @@ mod tests {
     /// override actually names.
     #[test]
     fn apps_in_different_files_merge_by_name_not_position() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
                 "[[app]]\nname='web'\nscript='web.js'\n\n[[app]]\nname='worker'\nscript='worker.js'\n",
@@ -403,8 +593,8 @@ mod tests {
                 "[[app]]\nname='worker'\nscript='worker-mine.js'\n\n[[app]]\nname='web'\nscript='web-mine.js'\n",
             ),
         ]);
-        let web = app_config(rel.path(), "web").expect("merges web");
-        let worker = app_config(rel.path(), "worker").expect("merges worker");
+        let web = app_config(rel.path(), "web", &[]).expect("merges web");
+        let worker = app_config(rel.path(), "worker", &[]).expect("merges worker");
         assert_eq!(web.script, "web-mine.js");
         assert_eq!(worker.script, "worker-mine.js");
     }
@@ -415,14 +605,15 @@ mod tests {
     /// app available rather than being silently dropped.
     #[test]
     fn an_override_can_add_a_new_app_not_in_the_committed_file() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             ("Flockfile.toml", "[[app]]\nname='web'\nscript='web.js'\n"),
             (
                 "Flockfile.override.toml",
                 "[[app]]\nname='sidecar'\nscript='sidecar.js'\n",
             ),
         ]);
-        let sidecar = app_config(rel.path(), "sidecar").expect("the override's own app merges");
+        let sidecar =
+            app_config(rel.path(), "sidecar", &[]).expect("the override's own app merges");
         assert_eq!(sidecar.script, "sidecar.js");
     }
 
@@ -430,23 +621,50 @@ mod tests {
     /// something instead of a named refusal.
     #[test]
     fn app_config_refuses_an_unknown_sheep_name() {
-        let rel = fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x.js'\n")]);
-        let err = app_config(rel.path(), "ghost").expect_err("no such app");
+        let rel = fixtures::fixture_release(&[(
+            "Flockfile.toml",
+            "[[app]]\nname='web'\nscript='x.js'\n",
+        )]);
+        let err = app_config(rel.path(), "ghost", &[]).expect_err("no such app");
         assert!(err.to_string().contains("ghost"));
     }
 
-    /// fails if a declared `[build]` block does not reach the build step.
+    /// fails if the old top-level `[build]` spelling is silently ignored.
+    ///
+    /// It has to be refused rather than skipped. Skipping it builds nothing
+    /// and says nothing: the release is swapped in unbuilt and reported as
+    /// deployed. And whoever meets this is following this crate's own
+    /// published README, which documented `[build]` while that spelling made
+    /// the Flockfile unregisterable with `shep start`.
+    #[test]
+    fn the_old_top_level_build_block_is_refused_by_name() {
+        let rel = fixtures::fixture_release(&[(
+            "Flockfile.toml",
+            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\n",
+        )]);
+
+        let err = build_spec(rel.path(), &[]).expect_err("the old spelling must be refused");
+
+        let text = format!("{err}");
+        assert!(
+            text.contains("[dog.deploy.build]"),
+            "must name the new home: {text}"
+        );
+        assert!(text.contains("shep start"), "must say why it moved: {text}");
+    }
+
+    /// fails if a declared `[dog.deploy.build]` block does not reach the build step.
     /// `env` and `artifacts` both matter to a real build - a pinned
     /// registry token, and a binary the release can't see the build
     /// producing - so a block that parsed its command and dropped either
     /// of those would still break rollback.
     #[test]
     fn a_build_block_parses_into_a_spec() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
-            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\nenv = {              CARGO_TARGET_DIR = '/srv/cache' }\nartifacts = ['target/release/koji']\n",
+            "[[app]]\nname='web'\nscript='x'\n\n[dog.deploy.build]\ncommand = 'make build'\nenv = {              CARGO_TARGET_DIR = '/srv/cache' }\nartifacts = ['target/release/koji']\n",
         )]);
-        let spec = build_spec(rel.path()).expect("parses");
+        let spec = build_spec(rel.path(), &[]).expect("parses");
         assert_eq!(spec.command.as_deref(), Some("make build"));
         assert_eq!(
             spec.env.get("CARGO_TARGET_DIR").map(String::as_str),
@@ -458,15 +676,16 @@ mod tests {
         );
     }
 
-    /// fails if a Flockfile with no `[build]` block becomes an error
+    /// fails if a Flockfile with no `[dog.deploy.build]` block becomes an error
     /// rather than the no-op spec. ReactMap run as `bun .` declares no
     /// build at all, which is one of the three worked examples this design
     /// has to cover.
     #[test]
     fn an_absent_build_block_is_the_default_spec() {
-        let rel = fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x'\n")]);
+        let rel =
+            fixtures::fixture_release(&[("Flockfile.toml", "[[app]]\nname='web'\nscript='x'\n")]);
         assert_eq!(
-            build_spec(rel.path()).expect("parses"),
+            build_spec(rel.path(), &[]).expect("parses"),
             BuildSpec::default()
         );
     }
@@ -477,17 +696,17 @@ mod tests {
     /// this block at all.
     #[test]
     fn the_override_wins_on_the_build_block() {
-        let rel = fixture_release(&[
+        let rel = fixtures::fixture_release(&[
             (
                 "Flockfile.toml",
-                "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommand = 'make build'\n",
+                "[[app]]\nname='web'\nscript='x'\n\n[dog.deploy.build]\ncommand = 'make build'\n",
             ),
             (
                 "Flockfile.override.toml",
-                "[build]\nenv = { CARGO_TARGET_DIR = '/srv/cache' }\n",
+                "[dog.deploy.build]\nenv = { CARGO_TARGET_DIR = '/srv/cache' }\n",
             ),
         ]);
-        let spec = build_spec(rel.path()).expect("parses");
+        let spec = build_spec(rel.path(), &[]).expect("parses");
         assert_eq!(spec.command.as_deref(), Some("make build"));
         assert_eq!(
             spec.env.get("CARGO_TARGET_DIR").map(String::as_str),
@@ -500,11 +719,11 @@ mod tests {
     /// a deploy that swaps in a release nothing built.
     #[test]
     fn an_unknown_build_key_is_refused() {
-        let rel = fixture_release(&[(
+        let rel = fixtures::fixture_release(&[(
             "Flockfile.toml",
-            "[[app]]\nname='web'\nscript='x'\n\n[build]\ncommands = 'make build'\n",
+            "[[app]]\nname='web'\nscript='x'\n\n[dog.deploy.build]\ncommands = 'make build'\n",
         )]);
-        let err = build_spec(rel.path()).expect_err("refuses");
+        let err = build_spec(rel.path(), &[]).expect_err("refuses");
         assert!(err.to_string().contains("commands"));
     }
 }

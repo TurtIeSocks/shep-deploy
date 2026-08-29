@@ -87,7 +87,7 @@ const fn due(state: &State) -> bool {
 async fn tick<D: Daemon>(
     daemon: &D,
     shep_home: &Path,
-    config: DogConfig,
+    config: &DogConfig,
 ) -> Vec<(String, Result<Outcome, Error>)> {
     let names = match paths::targets(shep_home) {
         Ok(names) => names,
@@ -121,7 +121,7 @@ async fn tick<D: Daemon>(
         if !due(&state) {
             continue;
         }
-        let outcome = deploy::unattended(daemon, &tree, &mut state, config.retention).await;
+        let outcome = deploy::unattended(daemon, &tree, &mut state, config).await;
         results.push((name, outcome));
     }
     results
@@ -259,9 +259,10 @@ fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str
 /// It can also be deferred, which is a separate matter and not this
 /// module's to fix: `git` runs through blocking `std::process::Command` on
 /// a current-thread runtime, so nothing else is polled while a fetch is in
-/// flight, and a fetch against a host that is not answering is not a
-/// bounded wait.
-pub async fn run<D: Daemon>(daemon: &D, shep_home: &Path, config: DogConfig) -> Result<(), Error> {
+/// flight. A fetch against a host that is not answering is bounded by
+/// `DogConfig::git_timeout` (five minutes by default), so it fails that one
+/// target like any other error rather than wedging the loop.
+pub async fn run<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Result<(), Error> {
     run_with(
         daemon,
         shep_home,
@@ -286,7 +287,7 @@ pub async fn run<D: Daemon>(daemon: &D, shep_home: &Path, config: DogConfig) -> 
 async fn run_with<D: Daemon, O: Write, E: Write>(
     daemon: &D,
     shep_home: &Path,
-    config: DogConfig,
+    config: &DogConfig,
     out: &mut O,
     err: &mut E,
 ) -> Result<(), Error> {
@@ -322,6 +323,8 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
 
 #[cfg(test)]
 mod tests {
+    use crate::fixtures;
+
     use super::*;
 
     use core::time::Duration;
@@ -329,7 +332,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use shep_client::RequestError;
     use shep_client::shep_core::config::AppConfig;
@@ -350,34 +352,14 @@ mod tests {
         )
     }
 
-    /// `dir`'s current `HEAD` sha.
-    fn head_of(dir: &Path) -> String {
-        let out = Command::new("git")
-            .current_dir(dir)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("rev-parse");
-        String::from_utf8(out.stdout)
-            .expect("utf-8 sha")
-            .trim()
-            .to_owned()
-    }
-
-    /// Runs a git subcommand for fixture setup, panicking if it fails.
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(dir)
-            .args(args)
-            .status()
-            .expect("spawn git");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     /// The config every test that is not about the interval runs on.
     const fn config() -> DogConfig {
         DogConfig {
             interval: Duration::from_secs(30),
             retention: 5,
+            git_timeout: std::time::Duration::from_secs(60),
+            build_timeout: std::time::Duration::from_secs(60),
+            passthrough: Vec::new(),
         }
     }
 
@@ -414,18 +396,18 @@ mod tests {
     /// repository the deploy fetches from, so tests hold it.
     fn write_target_ready(home: &Path, sheep: &str, watch: Watch) -> TempDir {
         let origin = tempfile::tempdir().expect("tempdir");
-        git(origin.path(), &["init", "-q", "-b", "main"]);
-        git(origin.path(), &["config", "user.email", "test@example.com"]);
-        git(origin.path(), &["config", "user.name", "test"]);
+        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
+        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
         fs::write(origin.path().join("Flockfile.toml"), flockfile(sheep)).expect("Flockfile");
-        git(origin.path(), &["add", "."]);
-        git(origin.path(), &["commit", "-q", "-m", "first"]);
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "first"]);
 
         let tree = Tree::for_sheep(home, sheep);
         fs::create_dir_all(tree.git()).expect("create the git dir");
-        git(&tree.git(), &["init", "-q", "--bare"]);
+        fixtures::run_git(&tree.git(), &["init", "-q", "--bare"]);
         let remote = origin.path().to_str().expect("utf-8 path").to_owned();
-        crate::git::fetch(&tree.git(), &remote).expect("fetch");
+        crate::git::fetch(&tree.git(), &remote, fixtures::TEST_BUDGET).expect("fetch");
 
         let first = crate::git::remote_head(&tree.git(), "main").expect("head");
         crate::git::worktree_add(&tree.git(), &tree.release(&first), &first).expect("worktree");
@@ -448,8 +430,8 @@ mod tests {
         // `UpToDate` and the tests below would pass on a loop that does
         // nothing at all.
         fs::write(origin.path().join("second.txt"), "x").expect("write");
-        git(origin.path(), &["add", "."]);
-        git(origin.path(), &["commit", "-q", "-m", "second"]);
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "second"]);
 
         origin
     }
@@ -565,8 +547,8 @@ mod tests {
                 "the loop ticked far more than the interval allows: it is not sleeping"
             );
             fs::write(self.origin.join(format!("{asked}.txt")), "x").expect("write");
-            git(&self.origin, &["add", "."]);
-            git(&self.origin, &["commit", "-q", "-m", "another"]);
+            fixtures::run_git(&self.origin, &["add", "."]);
+            fixtures::run_git(&self.origin, &["commit", "-q", "-m", "another"]);
             Err(Error::Protocol("the shepherd stopped answering".to_owned()))
         }
         async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
@@ -612,7 +594,7 @@ mod tests {
             .expect("reads")
             .deployed;
 
-        assert!(tick(&Ready::new(), home.path(), config()).await.is_empty());
+        assert!(tick(&Ready::new(), home.path(), &config()).await.is_empty());
 
         assert_eq!(
             State::read(&Tree::for_sheep(home.path(), "paused").state_file())
@@ -635,7 +617,7 @@ mod tests {
         write_target(home.path(), "broken", Watch::Auto, Some("old"));
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
 
-        let results = tick(&Ready::new(), home.path(), config()).await;
+        let results = tick(&Ready::new(), home.path(), &config()).await;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "broken");
@@ -659,11 +641,11 @@ mod tests {
         let origin = write_target_ready(home.path(), "held", Watch::Auto);
         let tree = Tree::for_sheep(home.path(), "held");
         let mut state = State::read(&tree.state_file()).expect("reads");
-        state.failed = Some(head_of(origin.path()));
+        state.failed = Some(fixtures::head_of(origin.path()));
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = Ready::new();
-        let results = tick(&daemon, home.path(), config()).await;
+        let results = tick(&daemon, home.path(), &config()).await;
 
         assert_eq!(results.len(), 1);
         assert!(
@@ -680,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn a_dog_with_no_targets_ticks_quietly() {
         let home = tempfile::tempdir().expect("tempdir");
-        assert!(tick(&Ready::new(), home.path(), config()).await.is_empty());
+        assert!(tick(&Ready::new(), home.path(), &config()).await.is_empty());
     }
 
     /// fails if a deploy directory that cannot be listed is passed over in
@@ -696,7 +678,7 @@ mod tests {
         // Listable again on drop or not, this test never reads it back.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let results = tick(&Ready::new(), home.path(), config()).await;
+        let results = tick(&Ready::new(), home.path(), &config()).await;
 
         let listable = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         assert_eq!(results.len(), 1);
@@ -717,7 +699,7 @@ mod tests {
         fs::create_dir_all(tree.root()).expect("create the tree");
         fs::write(tree.state_file(), "this is not toml").expect("write deploy.toml");
 
-        let results = tick(&Ready::new(), home.path(), config()).await;
+        let results = tick(&Ready::new(), home.path(), &config()).await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "garbled");
@@ -746,9 +728,12 @@ mod tests {
             run(
                 &counter,
                 home.path(),
-                DogConfig {
+                &DogConfig {
                     interval: Duration::from_secs(150),
                     retention: 5,
+                    git_timeout: std::time::Duration::from_secs(60),
+                    build_timeout: std::time::Duration::from_secs(60),
+                    passthrough: Vec::new(),
                 },
             ),
         )
@@ -773,9 +758,12 @@ mod tests {
             run(
                 &counter,
                 home.path(),
-                DogConfig {
+                &DogConfig {
                     interval: Duration::from_secs(600),
                     retention: 5,
+                    git_timeout: std::time::Duration::from_secs(60),
+                    build_timeout: std::time::Duration::from_secs(60),
+                    passthrough: Vec::new(),
                 },
             ),
         )
@@ -911,7 +899,7 @@ mod tests {
     async fn a_deploy_is_written_to_the_log_it_belongs_in() {
         let home = tempfile::tempdir().expect("tempdir");
         let origin = write_target_ready(home.path(), "fine", Watch::Auto);
-        let head = head_of(origin.path());
+        let head = fixtures::head_of(origin.path());
         let (mut out, mut err) = (Vec::new(), Vec::new());
 
         let _ = tokio::time::timeout(
@@ -919,9 +907,12 @@ mod tests {
             run_with(
                 &Ready::new(),
                 home.path(),
-                DogConfig {
+                &DogConfig {
                     interval: Duration::from_secs(600),
                     retention: 5,
+                    git_timeout: std::time::Duration::from_secs(60),
+                    build_timeout: std::time::Duration::from_secs(60),
+                    passthrough: Vec::new(),
                 },
                 &mut out,
                 &mut err,
@@ -952,9 +943,12 @@ mod tests {
             run_with(
                 &Ready::new(),
                 home.path(),
-                DogConfig {
+                &DogConfig {
                     interval: Duration::from_secs(150),
                     retention: 5,
+                    git_timeout: std::time::Duration::from_secs(60),
+                    build_timeout: std::time::Duration::from_secs(60),
+                    passthrough: Vec::new(),
                 },
                 &mut out,
                 &mut err,
@@ -1078,8 +1072,8 @@ mod tests {
         write_target(home.path(), "ctm", Watch::Manual, Some("f6e5d4c3b2a1"));
         let daemon = SmitRecording::default();
 
-        tick(&daemon, home.path(), config()).await;
-        tick(&daemon, home.path(), config()).await;
+        tick(&daemon, home.path(), &config()).await;
+        tick(&daemon, home.path(), &config()).await;
 
         assert_eq!(
             daemon.smits(),
@@ -1101,7 +1095,7 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         write_target(home.path(), "ctm", Watch::Manual, Some("f6e5d4c3b2a1"));
         let daemon = SmitRecording::default();
-        tick(&daemon, home.path(), config()).await;
+        tick(&daemon, home.path(), &config()).await;
         assert_eq!(daemon.smits().len(), 1);
     }
 
@@ -1117,7 +1111,7 @@ mod tests {
         // with the smit refusal this test exists to pin - see every other
         // `write_target_ready` caller in this file for the pattern.
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
-        let results = tick(&RefusingSmits, home.path(), config()).await;
+        let results = tick(&RefusingSmits, home.path(), &config()).await;
         assert!(results[0].1.is_ok(), "the deploy still ran");
     }
 
@@ -1136,7 +1130,7 @@ mod tests {
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = SmitRecording::default();
-        let results = tick(&daemon, home.path(), config()).await;
+        let results = tick(&daemon, home.path(), &config()).await;
 
         assert!(
             !daemon.smits().is_empty(),

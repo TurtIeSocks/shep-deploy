@@ -162,7 +162,35 @@ impl Generation {
     /// Empty is never a turnover: a sheep the shepherd cannot find has not
     /// been verified.
     fn has_turned_over(&self, flock: &[ProcessInfo], accept: fn(&ProcessInfo) -> bool) -> bool {
-        !flock.is_empty() && flock.iter().all(|info| self.is_new(info) && accept(info))
+        // The count as well, measured against what was running BEFORE. A
+        // two-instance sheep that loses a replica during the reload lists one
+        // new instance, and one new instance is "all new": the turnover was
+        // accepted, `settled` became that single pid, and every later check
+        // compared the survivor against itself. A sheep that came back at half
+        // strength verified.
+        //
+        // Checked here rather than at the dwell, though the dwell is where it
+        // was found. `Verify::Probed` returns as soon as the turnover lands and
+        // never reaches a dwell, so a check placed there would leave the
+        // stricter of the two modes the blind one.
+        //
+        // Skipped when nothing was running before, because then there is no
+        // count to hold to and `!flock.is_empty()` is the whole of what can be
+        // asked.
+        // `flock.len()` and not a count of pids, which look like they could
+        // disagree and cannot. `settled` is built from `filter_map(|i| i.pid)`,
+        // so an instance without one would be dropped from the generation
+        // while still counting here. It never gets that far: `is_new` is
+        // `pid.is_some_and(..)`, so a pidless instance is not new, the `all`
+        // below is false, and no flock containing one is ever accepted as a
+        // turnover. That is what makes `settled.instances()` equal to this
+        // count afterwards, which the dwell then relies on.
+        let count_holds = self.instances() == 0
+            || u32::try_from(flock.len()).is_ok_and(|listed| listed == self.instances());
+
+        !flock.is_empty()
+            && count_holds
+            && flock.iter().all(|info| self.is_new(info) && accept(info))
     }
 }
 
@@ -239,11 +267,124 @@ pub async fn wait<D: Daemon>(
     }
 
     sleep(DWELL).await;
-    let flock = daemon.describe(sheep).await?;
-    Ok(!flock.is_empty()
-        && flock
-            .iter()
-            .all(|info| settled.holds(info) && is_alive(info)))
+    // Retried like the one in `turnover`, and for the same reason. Retrying
+    // there and not here left `Verify::Alive` with exactly the bug the retry
+    // was added to fix: one transient answer after the dwell propagates,
+    // `land` reads it as a failure, and a healthy release is rolled back at
+    // the cost of a second live reload. Found on 2026-08-28, in review of the
+    // commit that added the first retry.
+    // Polled for `Online`, not sampled once for "still alive", and the
+    // difference is what shep 0.1.10 made necessary.
+    //
+    // A probed app now reloads serially, so by the time readiness resolves the
+    // old instance has drained and there is nothing to abort back to. Rather
+    // than mark a replacement `Online` it knows never became ready, shep
+    // leaves it `Starting` and fires `ReloadAbandoned`. Its own comment gives
+    // the reason: answering `online` for an instance that never came up "is
+    // how a broken release gets recorded as deployed". A replacement stuck
+    // that way has no liveness loop either, because those are armed at
+    // `went_online`.
+    //
+    // Accepting `Starting` here threw that away and recorded exactly what
+    // shep had just refused to claim.
+    //
+    // Requiring `Online` at a single sample was the first attempt and is
+    // wrong. It would fail a healthy probeless app whose `listen_timeout`
+    // outlasts the dwell, which is not hypothetical: this crate's own README
+    // measures a one-instance probeless app at `listen_timeout = "15s"` being
+    // given up on at ten seconds, and calls that the bug the polling turnover
+    // above exists to prevent. Reintroducing it here would be the same
+    // mistake one phase later.
+    //
+    // So the question is not "is it Starting" but "is it STILL Starting after
+    // long enough". A slow app reaches `Online` on its own; an abandoned
+    // replacement never does, because nothing is left to move it.
+    let deadline = Instant::now() + DWELL;
+    loop {
+        let flock = describe_within(daemon, sheep, DWELL).await?;
+        // The COUNT as well as the pids. `all` over a listing that shrank is
+        // vacuously happy: with `settled` holding two, a listing of one
+        // `Online` pid from that generation satisfies every element and the
+        // sibling that vanished goes unmentioned. `alive_rejects_a_flock_that_empties_during_the_dwell`
+        // only pins the all-gone case.
+        let settled_and_ready = u32::try_from(flock.len()).is_ok_and(|n| n == settled.instances())
+            && flock
+                .iter()
+                .all(|info| settled.holds(info) && is_online(info));
+        if settled_and_ready {
+            return Ok(true);
+        }
+        // A pid that changed, or an instance that died, is a verdict rather
+        // than something more waiting can fix.
+        if flock.is_empty()
+            || !flock
+                .iter()
+                .all(|info| settled.holds(info) && is_alive(info))
+        {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        sleep(POLL).await;
+    }
+}
+
+/// [`Daemon::describe`], retrying an answer that could clear on its own.
+///
+/// The judgement is [`Error::is_retryable`]'s, which the crate already applies
+/// to `reload` over the same socket: a `Timeout` or an `Internal` is the
+/// shepherd being busy, a `NotFound` is a question that will never have a
+/// different answer.
+///
+/// `budget` bounds the retrying, so a shepherd that is genuinely gone still
+/// fails rather than hanging.
+///
+/// It does NOT bound the asking, and that is deliberate rather than loose.
+/// A caller's wall-clock can therefore exceed its own `budget` by one slow
+/// answer, which round 7 of the founder's review raised. Kept, for two
+/// reasons. The overrun is bounded without any help from here: every
+/// `describe` goes through `shep_client`'s `Client::request`, which waits
+/// `DEFAULT_DEADLINE` plus `DEADLINE_GRACE`, five seconds and two, the same
+/// pair `crate::deploy` already names in four places.
+/// And the obvious fix is worse than the problem: wrapping the call in a
+/// timeout against what is left of the budget means the last poll of a
+/// `turnover` gets almost no time and fails for that reason, which is how a
+/// healthy release gets rolled back at the cost of a second live reload. That
+/// is the exact failure the retry above this line was added to prevent.
+///
+/// # Errors
+/// Whatever [`Daemon::describe`] returns, once a failure is either fatal or
+/// the budget is spent.
+async fn describe_within<D: Daemon>(
+    daemon: &D,
+    sheep: &str,
+    budget: Duration,
+) -> Result<Vec<ProcessInfo>, Error> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match daemon.describe(sheep).await {
+            Ok(flock) => return Ok(flock),
+            Err(err) if !err.is_retryable() => return Err(err),
+            Err(err) => {
+                // `budget` bounds the RETRYING, never the asking. The caller
+                // wanted one describe and gets it whatever the clock says;
+                // `turnover` in particular hands over whatever is left of its
+                // own deadline and still expects the question put, because its
+                // loop is what decides that time is up.
+                //
+                // The sleep is clamped so a retry cannot run past the
+                // deadline, which is the part that was genuinely loose:
+                // `POLL` is 100ms and a budget with less than that remaining
+                // used to overshoot it.
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(err);
+                }
+                sleep(POLL.min(left)).await;
+            }
+        }
+    }
 }
 
 /// Polls until `before` has been replaced by instances `accept` is happy
@@ -253,7 +394,10 @@ pub async fn wait<D: Daemon>(
 /// failure both modes report.
 ///
 /// # Errors
-/// Whatever [`Daemon::describe`] returns.
+/// Whatever [`Daemon::describe`] returns, once a failure is either fatal or
+/// the budget has run out. A retryable failure inside the budget is polled
+/// through rather than reported: see the body for why one blip must not cost
+/// a live reload.
 async fn turnover<D: Daemon>(
     daemon: &D,
     sheep: &str,
@@ -263,7 +407,22 @@ async fn turnover<D: Daemon>(
 ) -> Result<Option<Generation>, Error> {
     let deadline = Instant::now() + budget;
     loop {
-        let flock = daemon.describe(sheep).await?;
+        // A transient answer is not a verdict. This polls roughly a hundred
+        // and fifty times over a ten-to-twenty second budget, so a single
+        // `Timeout` or `Internal` anywhere in that run used to abort
+        // verification and send `land` down the rollback path: a second real
+        // reload, under live traffic, for a release that was healthy.
+        //
+        // Same judgement `Error::is_retryable` already made for `reload` over
+        // the same socket. Retried inside the budget rather than beyond it,
+        // so a shepherd that is genuinely gone still fails at the deadline
+        // instead of hanging.
+        let flock = describe_within(
+            daemon,
+            sheep,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .await?;
         if before.has_turned_over(&flock, accept) {
             return Ok(Some(Generation {
                 pids: flock.iter().filter_map(|info| info.pid).collect(),
@@ -294,6 +453,7 @@ pub(crate) fn is_alive(info: &ProcessInfo) -> bool {
 mod tests {
     use std::cell::Cell;
 
+    use shep_client::RequestError;
     use shep_client::shep_core::config::AppConfig;
 
     use super::*;
@@ -334,6 +494,83 @@ mod tests {
                 next: Cell::new(0),
             }
         }
+    }
+
+    /// A daemon that fails its first `describe` with a retryable error, then
+    /// answers with a flock that has turned over.
+    struct Blips {
+        calls: Cell<u32>,
+        after: Vec<ProcessInfo>,
+    }
+
+    impl Daemon for Blips {
+        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
+            unimplemented!()
+        }
+        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
+            unimplemented!()
+        }
+        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
+            let n = self.calls.get();
+            self.calls.set(n + 1);
+            if n == 0 {
+                return Err(Error::Request(RequestError::Timeout {
+                    after: Duration::from_secs(1),
+                }));
+            }
+            Ok(self.after.clone())
+        }
+        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn delete(&self, _id: u32) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
+        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
+            unimplemented!()
+        }
+        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
+            unimplemented!()
+        }
+    }
+
+    /// fails if one transient `describe` failure costs a live reload.
+    ///
+    /// `turnover` polls roughly a hundred and fifty times over a ten-second
+    /// budget. Propagating any one of those used to make `land` report
+    /// `Landed::Failed`, which rolls back: `current` is put back and the sheep
+    /// is reloaded a SECOND time, under live traffic, for a release that was
+    /// healthy and one poll from Online.
+    ///
+    /// The error here is `Timeout`, which `Error::is_retryable` already
+    /// classifies as transient for `reload` over the same socket. A fatal code
+    /// must still fail, which `only_a_failure_that_could_clear_is_retried` in
+    /// `crate::error` pins from the other side.
+    #[tokio::test]
+    async fn a_transient_describe_failure_does_not_fail_verification() {
+        let before = Generation {
+            pids: [111].into_iter().collect(),
+        };
+        let daemon = Blips {
+            calls: Cell::new(0),
+            after: vec![instance(0, ProcStatus::Online, 222)],
+        };
+
+        let seen = turnover(&daemon, "web", &before, is_online, Duration::from_secs(10))
+            .await
+            .expect("a retryable blip must not end verification");
+
+        assert!(
+            seen.is_some(),
+            "the turnover after the blip must still be seen"
+        );
+        assert!(daemon.calls.get() >= 2, "it must have asked again");
     }
 
     impl Daemon for Listings {
@@ -482,12 +719,23 @@ mod tests {
         assert!(!ok);
     }
 
-    /// fails if `Verify::Alive` starts demanding a probe. Alive is the
-    /// deliberate, visible downgrade for a sheep with no probe: a new
-    /// process, still running after the window, is enough.
+    /// fails if `Verify::Alive` starts demanding a prompt probe. Alive is the
+    /// deliberate, visible downgrade for a sheep with no probe: a new process
+    /// that comes up and stays up is enough, and it is given the whole dwell
+    /// to get there where `Probed` wants `Online` at the turnover.
+    ///
+    /// The fake reaches `Online` on its second answer, which it did not have
+    /// to before. A probeless app takes shep's heuristic path and is marked
+    /// `Online` at its `listen_timeout`, so a listing that says `Starting`
+    /// forever is not a slow healthy app: since shep 0.1.10 it is the shape of
+    /// a reload shep abandoned, and `alive_rejects_a_replacement_shep_gave_up_on`
+    /// below is what pins that.
     #[tokio::test(start_paused = true)]
     async fn alive_accepts_a_new_process_that_is_still_running() {
-        let daemon = Listings::new(vec![vec![instance(2, ProcStatus::Starting, 13002)]]);
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Starting, 13002)],
+            vec![instance(2, ProcStatus::Online, 13002)],
+        ]);
         assert!(
             wait(
                 &daemon,
@@ -554,6 +802,11 @@ mod tests {
             vec![instance(1, ProcStatus::Online, 12835)],
             vec![instance(1, ProcStatus::Online, 12835)],
             vec![instance(2, ProcStatus::Starting, 13002)],
+            // Then ready, which is what the heuristic path does at
+            // `listen_timeout`. Without this the fake describes a replacement
+            // that never becomes ready, which is a different case entirely and
+            // has its own test below.
+            vec![instance(2, ProcStatus::Online, 13002)],
         ]);
         assert!(
             wait(
@@ -565,6 +818,111 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+    }
+
+    /// fails if a flock that came back SMALLER is accepted as a turnover.
+    ///
+    /// "All new" is true of one new instance, so a two-instance sheep that
+    /// loses a replica during the reload turns over on the survivor alone.
+    /// `settled` then becomes that single pid and every later check compares
+    /// the survivor against itself, including the dwell's own count. A sheep
+    /// at half strength verified, and both modes believed it.
+    ///
+    /// Pinned at the turnover rather than the dwell because `Verify::Probed`
+    /// returns as soon as the turnover lands and never dwells at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_turnover_that_lost_a_replica_is_not_a_turnover() {
+        // Two before, one after, and that one is new and healthy.
+        let daemon = Listings::new(vec![vec![instance(1, ProcStatus::Online, 200)]]);
+        let before = Generation {
+            pids: [100, 101].into_iter().collect(),
+        };
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Probed,
+            &before,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        assert!(!ok, "one replacement for two instances is not a turnover");
+    }
+
+    /// fails if the dwell stops counting how many instances are left.
+    ///
+    /// `all` over a listing that shrank is vacuously happy: with `settled`
+    /// holding two pids, a listing of ONE `Online` pid from that generation
+    /// satisfies every element, and the sibling that vanished goes unmentioned.
+    /// A scaled sheep that comes back at half strength is a release that did
+    /// not deploy, and the dwell is the only thing looking.
+    ///
+    /// `alive_rejects_a_flock_that_empties_during_the_dwell` pins the all-gone
+    /// case, which is the easy half.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_a_flock_that_came_back_smaller() {
+        let daemon = Listings::new(vec![
+            vec![
+                instance(1, ProcStatus::Online, 200),
+                instance(2, ProcStatus::Online, 201),
+            ],
+            // One of the two is gone by the dwell. The survivor is healthy and
+            // from the right generation, which is what let this pass without a
+            // count.
+            vec![instance(1, ProcStatus::Online, 200)],
+        ]);
+        let before = Generation {
+            pids: [100, 101].into_iter().collect(),
+        };
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &before,
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+
+        assert!(!ok, "half a flock is not a deployed release");
+    }
+
+    /// fails if `Alive` believes a replacement shep gave up on.
+    ///
+    /// shep 0.1.10 reloads a probed app serially, so when readiness resolves
+    /// the old instance has already drained and there is nothing to abort back
+    /// to. Rather than claim `Online` for a replacement it knows never became
+    /// ready, shep leaves it `Starting` and fires `ReloadAbandoned`. Its own
+    /// comment says why: answering `online` for an instance that never came up
+    /// "is how a broken release gets recorded as deployed". Such an instance
+    /// has no liveness loop either, since those are armed at `went_online`.
+    ///
+    /// Accepting that as alive threw the signal away and recorded the thing
+    /// shep had just refused to claim. Caught against a real shepherd by the
+    /// integration tier, which is the only place it could be caught: no fake
+    /// in this module knew `Starting` had acquired a meaning.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_a_replacement_shep_gave_up_on() {
+        // Starting forever, which is exactly what an abandoned reload leaves.
+        let daemon = Listings::new(vec![vec![instance(2, ProcStatus::Starting, 13002)]]);
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &serving(12835),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !ok,
+            "a replacement left at `starting` never came up, whatever verify mode asked"
         );
     }
 
@@ -589,6 +947,55 @@ mod tests {
         .await
         .unwrap();
         assert!(!ok);
+    }
+
+    /// fails if the dwell settles for SOME instance still being the one that
+    /// came up, rather than all of them.
+    ///
+    /// The module argues this for the turnover phase and
+    /// `a_draining_old_instance_is_not_a_finished_turnover` pins it there.
+    /// The identical requirement in the post-dwell check had no test with more
+    /// than one instance in it, so round 9 of the founder's review changed
+    /// that `.all` to `.any` and both existing dwell tests stayed green: over
+    /// a one-element iterator the two are the same function.
+    ///
+    /// A scaled sheep is why it matters. One replica of two coming up, dying
+    /// and being restarted under a new pid inside the dwell is a release that
+    /// does not work, and `.any` calls it verified because its sibling is
+    /// fine.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_one_replica_of_two_restarting_during_the_dwell() {
+        let daemon = Listings::new(vec![
+            // Turned over: both replicas are new, so `settled` is {200, 201}.
+            vec![
+                instance(1, ProcStatus::Starting, 200),
+                instance(2, ProcStatus::Starting, 201),
+            ],
+            // After the dwell 201 has died and come back as 202. The first
+            // replica still holds, which is exactly what `.any` would accept.
+            vec![
+                instance(1, ProcStatus::Starting, 200),
+                instance(2, ProcStatus::Starting, 202),
+            ],
+        ]);
+        let before = Generation {
+            pids: [100, 101].into_iter().collect(),
+        };
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &before,
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !ok,
+            "every instance must still be the one that came up, not merely one of them"
+        );
     }
 
     /// fails if the dwell stops noticing a process that is gone entirely by
