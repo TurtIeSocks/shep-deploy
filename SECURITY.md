@@ -61,10 +61,10 @@ again immediately before the open, so the window is one call wide. Closing the r
 
 **The cleared environment bounds what a build inherits from this process.** A
 build gets `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, whatever `passthrough` names
-in `[dog.deploy]`, and the release's own `[build] env`. Nothing else. Dropping
-uid does not unsee environment variables, because they are copied into the
-child before the drop happens, so a dog started with a registry token in its
-environment would otherwise hand it to every build.
+in `[dog.deploy]` in `shep.toml`, and the release's own `[dog.deploy.build]`
+env. Nothing else. Dropping uid does not unsee environment variables, because
+they are copied into the child before the drop happens, so a dog started with
+a registry token in its environment would otherwise hand it to every build.
 
 `SSH_AUTH_SOCK` is excluded from that base set deliberately. A forwarded agent
 reaching a build lets that build authenticate as the operator anywhere the
