@@ -201,6 +201,22 @@ its own port while the original still holds it, and the new instance is then
 removed and the original left serving. Every deploy after the first replaces
 the instance rather than joining it, and does not meet this.
 
+Most apps cannot set `SO_REUSEPORT`, and some cannot even be made to: Node
+refuses `reusePort` on macOS outright. For those, stop the sheep before the
+cutover and start it afterwards:
+
+```bash
+shep stop web
+```
+```bash
+shep-deploy setup web
+```
+
+With the port free the newcomer binds and the cutover lands. It costs the
+downtime this section already warns about, and it is the difference between a
+setup that works and one that cannot. Measured 2026-08-28: the same app that
+failed the cutover while running completed it once stopped.
+
 A cutover that was abandoned leaves the tree behind, and a sheep is not a
 deploy target until a cutover lands. `shep-deploy deploy` refuses such a target
 before anything at all happens, because its record names no deployed release.
