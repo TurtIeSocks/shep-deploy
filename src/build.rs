@@ -858,7 +858,12 @@ mod tests {
             // signalled would be `sleep` itself and `child.kill()` alone would
             // end it: the test would pass whether or not the group kill worked,
             // which makes it no test of the group at all.
-            command: Some("sleep 600 & wait".into()),
+            //
+            // The descendant writes its own pid, so the assertion below can be
+            // about the process rather than about the error. Asserting only
+            // that the build timed out leaves the group kill exactly as
+            // unproven as the bare `sleep 600` did.
+            command: Some("sleep 600 & echo $! > descendant.pid; wait".into()),
             env: BTreeMap::new(),
             artifacts: vec![],
         };
@@ -882,6 +887,21 @@ mod tests {
         assert!(
             format!("{err}").contains("build_timeout"),
             "must name the knob that changes it: {err}"
+        );
+
+        // The whole point of the process group. Killing the shell alone would
+        // leave this running against a release the deploy has given up on.
+        let pid = std::fs::read_to_string(rel.path().join("descendant.pid"))
+            .expect("the build wrote its descendant's pid");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .expect("kill -0")
+            .success();
+        assert!(
+            !alive,
+            "the backgrounded descendant (pid {}) outlived the build it belonged to",
+            pid.trim()
         );
     }
 
