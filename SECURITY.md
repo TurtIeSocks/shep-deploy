@@ -55,8 +55,9 @@ component that is already a link when the first check runs is refused at any
 depth IF it resolves outside the release and the cache, which is the check that
 matters. A link staying inside them is allowed, and has to be, because
 `shared::link_cache` makes `release/target` one. The destination is resolved
-again immediately before the open, so the window is one call wide. Closing the rest needs `openat2` with
-`RESOLVE_NO_SYMLINKS`, which needs the unsafe this crate forbids.
+again immediately before the open, so the window is one call wide. Closing the
+rest needs a handle-based walk, which means a capability-based crate such as
+`cap-std` rather than anything this crate can spell itself.
 `docs/specs/deferred.md` records it.
 
 **The cleared environment bounds what a build inherits from this process.** A

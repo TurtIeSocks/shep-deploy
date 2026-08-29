@@ -144,15 +144,24 @@ than trusting the spelling. And the destination is resolved again immediately
 before the open, so what is left is one call rather than the several syscalls
 it was.
 
-Closing it needs `openat2` with `RESOLVE_NO_SYMLINKS`, or walking each
-component with its own `openat`. Both need `unsafe`, against the
-`#![forbid(unsafe_code)]` at `src/main.rs:33`. Lifting that for one function
-is the decision to make, and a crate with its own unsafe only moves the
-review rather than removing it. `openat2` is Linux 5.6 and later, so macOS
-keeps the current shape whichever way it goes.
+Closing it needs a handle-based walk: `openat2` with `RESOLVE_NO_SYMLINKS`, or
+each component opened `O_NOFOLLOW` in turn.
 
-Not built, because the window is one call wide and what gets written through
-it is the build's own output.
+This entry used to say that needs `unsafe` and stop there, which was the wrong
+place to stop. `#![forbid(unsafe_code)]` at `src/main.rs:33` rules out calling
+the syscall from here, and a crate that does it for us is the ordinary answer
+rather than a dodge: `cap-std` gives capability-based directory handles on both
+platforms this crate supports, and `rustix` exposes `openat2` where the kernel
+has it. Neither is exotic and both are maintained.
+
+So the cost is a dependency and a rewrite of `copy_artifact`'s destination
+handling, not a safety principle. `openat2` alone is Linux 5.6 and later, so
+anything cross-platform means `cap-std` or per-component `O_NOFOLLOW` opens.
+
+Still deferred, now for the reason that is actually the reason: the window is
+one call wide, what gets written through it is the build's own output, and the
+rewrite touches the most-reviewed function in the crate. Worth its own change
+rather than one made on the way past.
 
 An earlier attempt refused every symlinked component outright. That is
 recorded here because it looks correct and is not: `shared::link_cache` makes
