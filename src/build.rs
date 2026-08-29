@@ -64,7 +64,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -629,7 +629,19 @@ fn copy_artifact(
     // Set from the handle rather than the path, so it lands on the file that
     // was actually written rather than on whatever the name resolves to now.
     // Same reasoning as the `O_NOFOLLOW` open above.
-    sink.set_permissions(opened.permissions())
+    // Masked to the ordinary nine bits, which is the difference between
+    // copying a mode and copying a privilege. `Permissions` carries setuid,
+    // setgid and the sticky bit too, and this copy runs in the PARENT at the
+    // dog's own uid, which shep's docs recommend be root. So a build dropped to
+    // `svc` could write `target/x` with mode 04755, and this would create a
+    // root-owned file in the release and make it setuid: anyone who can run it
+    // is root, and the release is what the app serves.
+    //
+    // Introduced by the fix one commit earlier that made the copy keep the
+    // executable bit. Preserving the mode was right; preserving all of it was
+    // not.
+    let mode = opened.permissions().mode() & 0o777;
+    sink.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|err| Error::Io {
             path: to,
             source: err,
@@ -1012,6 +1024,60 @@ mod tests {
         assert!(
             format!("{err}").contains("did not leave there"),
             "must say what is missing and why: {err}"
+        );
+    }
+
+    /// fails if a copied artifact keeps setuid, setgid or the sticky bit.
+    ///
+    /// The copy runs in the PARENT, at the dog's own uid, which shep's docs
+    /// recommend be root so it can drop per app. So the destination is created
+    /// root-owned. A build dropped to an unprivileged `user` that writes
+    /// `target/x` with mode 04755 would then have this hand it back as a
+    /// root-owned setuid executable inside the release, which is what the app
+    /// serves. Anyone who can run it is root.
+    ///
+    /// Introduced by the commit that made the copy preserve the executable
+    /// bit. Preserving the mode was right; preserving all of it was not.
+    #[tokio::test]
+    async fn a_copied_artifact_does_not_keep_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rel = fixtures::fixture_release(&[]);
+        let cache = fixtures::tempdir();
+        let built = cache.path().join("koji");
+        std::fs::write(&built, b"#!/bin/sh\necho hi\n").expect("the build's output");
+        std::fs::set_permissions(&built, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/koji")],
+        };
+
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            cache.path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds and copies");
+
+        let mode = std::fs::metadata(rel.path().join("target/koji"))
+            .expect("copied")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o7777,
+            0o755,
+            "the copy must keep the permission bits and drop the privilege ones"
         );
     }
 
