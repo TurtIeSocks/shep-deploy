@@ -144,8 +144,18 @@ than trusting the spelling. And the destination is resolved again immediately
 before the open, so what is left is one call rather than the several syscalls
 it was.
 
-Closing it needs a handle-based walk: `openat2` with `RESOLVE_NO_SYMLINKS`, or
-each component opened `O_NOFOLLOW` in turn.
+Closing it needs a handle-based walk, and the flag matters.
+`RESOLVE_NO_SYMLINKS` is the obvious reach and is wrong: it refuses every
+symlinked component,
+including `release/target`, which `shared::link_cache` creates on purpose. A
+design built on it would refuse the ordinary cargo arrangement, which is the
+same mistake an earlier attempt already made in code.
+
+What is wanted is confinement rather than refusal: `openat2` with
+`RESOLVE_IN_ROOT`, which follows a link but cannot leave the root it was given,
+or a per-component walk that opens each part by handle and checks containment
+as it goes. Both keep a link that stays inside the release and the cache, and
+neither can be talked out of the root by one swapped underneath them.
 
 This entry used to say that needs `unsafe` and stop there, which was the wrong
 place to stop. `#![forbid(unsafe_code)]` at `src/main.rs:33` rules out calling
@@ -156,7 +166,8 @@ has it. Neither is exotic and both are maintained.
 
 So the cost is a dependency and a rewrite of `copy_artifact`'s destination
 handling, not a safety principle. `openat2` alone is Linux 5.6 and later, so
-anything cross-platform means `cap-std` or per-component `O_NOFOLLOW` opens.
+anything cross-platform means `cap-std`, whose directory handles give the same
+confinement without naming a flag.
 
 Still deferred, now for the reason that is actually the reason: the window is
 one call wide, what gets written through it is the build's own output, and the
