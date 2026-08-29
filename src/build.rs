@@ -613,9 +613,27 @@ fn copy_artifact(
             source: err,
         })?;
     io::copy(&mut source, &mut sink).map_err(|err| Error::Io {
-        path: from,
+        path: from.clone(),
         source: err,
     })?;
+
+    // `fs::copy` carried the source's mode and this does not: a file created
+    // by `OpenOptions` gets `0o666 & !umask`, so 0755 arrives as 0644 and the
+    // executable bit is gone. That was silent and total for the arrangement
+    // this whole function exists to serve. `CARGO_TARGET_DIR` points at the
+    // dog's cache, cargo builds the binary there, `copy_artifact` brings it
+    // back so `script = "./target/release/koji"` resolves, and shep then
+    // cannot exec it. The release builds cleanly, fails verification, and is
+    // rolled back for a reason nothing reports.
+    //
+    // Set from the handle rather than the path, so it lands on the file that
+    // was actually written rather than on whatever the name resolves to now.
+    // Same reasoning as the `O_NOFOLLOW` open above.
+    sink.set_permissions(opened.permissions())
+        .map_err(|err| Error::Io {
+            path: to,
+            source: err,
+        })?;
 
     Ok(())
 }
@@ -812,11 +830,7 @@ pub async fn run(
 /// decided.
 async fn abandon(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
-        let group = format!("-{pid}");
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &group])
-            .status()
-            .await;
+        crate::shared::kill_group(pid);
     }
     // The group signal is the one that matters; this covers a host whose
     // `kill` refuses the group form.
@@ -839,7 +853,12 @@ mod tests {
     async fn a_build_that_never_finishes_is_abandoned() {
         let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec {
-            command: Some("sleep 600".into()),
+            // `&` plus `wait` keeps the SHELL alive with a descendant. A bare
+            // `sleep 600` is exec-replaced by the shell, so the child being
+            // signalled would be `sleep` itself and `child.kill()` alone would
+            // end it: the test would pass whether or not the group kill worked,
+            // which makes it no test of the group at all.
+            command: Some("sleep 600 & wait".into()),
             env: BTreeMap::new(),
             artifacts: vec![],
         };
@@ -900,6 +919,62 @@ mod tests {
         assert!(
             format!("{err}").contains("did not leave there"),
             "must say what is missing and why: {err}"
+        );
+    }
+
+    /// fails if a copied artifact loses the source's permission bits.
+    ///
+    /// This is the arrangement the redirect branch exists for: cargo builds
+    /// into `CARGO_TARGET_DIR`, and the binary is copied back so a `script`
+    /// pointing into `target/release` resolves. `fs::copy` carried the mode.
+    /// Replacing it with `OpenOptions` plus `io::copy` did not, so 0755
+    /// arrived as 0644, shep could not exec the binary, and a release that
+    /// built cleanly failed verification and rolled back with nothing saying
+    /// why.
+    ///
+    /// The old test asserted the destination merely existed, which a
+    /// non-executable file does.
+    #[tokio::test]
+    async fn a_copied_artifact_keeps_the_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let rel = fixtures::fixture_release(&[]);
+        let cache = fixtures::tempdir();
+        let built = cache.path().join("koji");
+        std::fs::write(&built, b"#!/bin/sh\necho hi\n").expect("the build's output");
+        std::fs::set_permissions(&built, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let spec = BuildSpec {
+            command: Some("true".into()),
+            env: [(
+                "CARGO_TARGET_DIR".into(),
+                cache.path().display().to_string(),
+            )]
+            .into(),
+            artifacts: vec![PathBuf::from("target/koji")],
+        };
+
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            cache.path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds and copies");
+
+        let copied = rel.path().join("target/koji");
+        let mode = std::fs::metadata(&copied)
+            .expect("copied")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "the copy must be executable, or shep cannot start the release it just built"
         );
     }
 
