@@ -177,6 +177,14 @@ impl Generation {
         // Skipped when nothing was running before, because then there is no
         // count to hold to and `!flock.is_empty()` is the whole of what can be
         // asked.
+        // `flock.len()` and not a count of pids, which look like they could
+        // disagree and cannot. `settled` is built from `filter_map(|i| i.pid)`,
+        // so an instance without one would be dropped from the generation
+        // while still counting here. It never gets that far: `is_new` is
+        // `pid.is_some_and(..)`, so a pidless instance is not new, the `all`
+        // below is false, and no flock containing one is ever accepted as a
+        // turnover. That is what makes `settled.instances()` equal to this
+        // count afterwards, which the dwell then relies on.
         let count_holds = self.instances() == 0
             || u32::try_from(flock.len()).is_ok_and(|listed| listed == self.instances());
 
