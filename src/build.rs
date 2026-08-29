@@ -782,6 +782,10 @@ pub async fn run(
         source,
     })?;
 
+    // Captured before the wait, because `Child::id` answers `None` once the
+    // child has been reaped and the group is named after the leader's pid.
+    let group = child.id();
+
     // Bounded, because an unbounded wait here does not stop one target, it
     // stops the dog. `crate::poll::tick` deploys targets one at a time, so a
     // build that never finishes holds that loop forever: no other target
@@ -804,6 +808,25 @@ pub async fn run(
             return Err(Error::BuildTimedOut { after: budget });
         }
     };
+
+    // The group goes when the build does, however the build ended. `sh -c`
+    // exiting is not the same as the build being over: a command can leave a
+    // job running behind it, and this module's own comments have said so since
+    // round 4, because that job is the thing every containment check below is
+    // racing. It can swap a component between a name being approved and the
+    // same name being opened, and one was measured winning that race in 0.03s.
+    //
+    // Killing it here removes the racer instead of out-manoeuvring it, which no
+    // amount of re-checking can do on its own. It also stops a build leaving a
+    // process behind that outlives the deploy and can still write to a release
+    // an operator has been told is live.
+    //
+    // A process that genuinely means to persist calls `setsid` and leaves the
+    // group, so a compiler daemon survives this and a stray `&` does not. That
+    // is the right split: one asked to outlive its parent, the other just did.
+    if let Some(pid) = group {
+        crate::shared::kill_group(pid);
+    }
 
     if !status.success() {
         return Err(Error::Build {
@@ -839,6 +862,50 @@ async fn abandon(child: &mut tokio::process::Child) {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a build that SUCCEEDS leaves its background job running.
+    ///
+    /// `sh -c` exiting is not the build being over. A command can leave a job
+    /// behind, and this module has known that since round 4: it is named in
+    /// `copy_artifact` as the thing every containment check is racing, and one
+    /// was measured winning that race in 0.03s, swapping a component between a
+    /// name being approved and the same name being opened.
+    ///
+    /// Every fix for that raced the job. None removed it. A build that exits 0
+    /// with a job still running left it running, free to alter the release
+    /// after the artifacts were validated and to outlive the deploy entirely.
+    ///
+    /// A process that means to persist calls `setsid` and leaves the group, so
+    /// this kills a stray `&` and not a compiler daemon.
+    #[tokio::test]
+    async fn a_successful_build_does_not_leave_its_background_job_running() {
+        let rel = fixtures::fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("sleep 400 & echo $! > bg.pid".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![],
+        };
+
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("this build exits 0");
+
+        let pid = std::fs::read_to_string(rel.path().join("bg.pid"))
+            .expect("the build wrote its background job's pid");
+        assert!(
+            !still_running(pid.trim()),
+            "the background job (pid {}) outlived the build that started it",
+            pid.trim()
+        );
+    }
+
     /// fails if a build that never finishes is waited on forever.
     ///
     /// It does not stop one target, it stops the dog. `crate::poll::tick`
@@ -904,13 +971,8 @@ mod tests {
             "the build never got far enough to write its descendant's pid, so this \
              proves nothing about the group kill either way",
         );
-        let alive = std::process::Command::new("kill")
-            .args(["-0", pid.trim()])
-            .status()
-            .expect("kill -0")
-            .success();
         assert!(
-            !alive,
+            !still_running(pid.trim()),
             "the backgrounded descendant (pid {}) outlived the build it belonged to",
             pid.trim()
         );
@@ -1007,6 +1069,30 @@ mod tests {
             0o755,
             "the copy must be executable, or shep cannot start the release it just built"
         );
+    }
+
+    /// Whether `pid` is still alive, polled rather than sampled once.
+    ///
+    /// Signalling a group and the kernel reaping its members are not the same
+    /// instant, so one `kill -0` immediately after the build returns can catch
+    /// a process that is already doomed and answer "alive". Bounded so a
+    /// genuine leak still fails rather than hanging.
+    ///
+    /// `kill -0` because `#![forbid(unsafe_code)]` rules out the syscall, and
+    /// its exit status is exactly the question being asked.
+    fn still_running(pid: &str) -> bool {
+        for _ in 0..50 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .expect("kill -0")
+                .success();
+            if !alive {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
     }
 
     /// A build budget the test tier can never legitimately hit.
