@@ -66,10 +66,18 @@ uid does not unsee environment variables, because they are copied into the
 child before the drop happens, so a dog started with a registry token in its
 environment would otherwise hand it to every build.
 
-`SSH_AUTH_SOCK` is excluded deliberately. A forwarded agent reaching a build
-lets that build authenticate as the operator anywhere the agent is trusted.
-Fetching happens in this process and keeps its own environment, so a private
-repository still clones.
+`SSH_AUTH_SOCK` is excluded from that base set deliberately. A forwarded agent
+reaching a build lets that build authenticate as the operator anywhere the
+agent is trusted. Fetching happens in this process and keeps its own
+environment, so a private repository still clones without it.
+
+Excluded from the base set is not the same as refused, and this document said
+only the first half. Naming it in `passthrough` hands it to every build, which
+is what `passthrough` is: an operator's explicit allowlist, and README.md tells
+them to reach for it when a build genuinely needs the socket. Nothing rejects
+the key, on purpose, because an operator who writes it has said what they mean.
+What it costs is the whole of the paragraph above, so it is worth being sure
+the build command is one you would hand your agent to.
 
 **Nothing bounds what a build reads out of its own release.** Gitignored files
 are symlinked into every release by design, which is what makes a `.env` work
