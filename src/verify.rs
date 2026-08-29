@@ -245,11 +245,56 @@ pub async fn wait<D: Daemon>(
     // `land` reads it as a failure, and a healthy release is rolled back at
     // the cost of a second live reload. Found on 2026-08-28, in review of the
     // commit that added the first retry.
-    let flock = describe_within(daemon, sheep, DWELL).await?;
-    Ok(!flock.is_empty()
-        && flock
-            .iter()
-            .all(|info| settled.holds(info) && is_alive(info)))
+    // Polled for `Online`, not sampled once for "still alive", and the
+    // difference is what shep 0.1.10 made necessary.
+    //
+    // A probed app now reloads serially, so by the time readiness resolves the
+    // old instance has drained and there is nothing to abort back to. Rather
+    // than mark a replacement `Online` it knows never became ready, shep
+    // leaves it `Starting` and fires `ReloadAbandoned`. Its own comment gives
+    // the reason: answering `online` for an instance that never came up "is
+    // how a broken release gets recorded as deployed". A replacement stuck
+    // that way has no liveness loop either, because those are armed at
+    // `went_online`.
+    //
+    // Accepting `Starting` here threw that away and recorded exactly what
+    // shep had just refused to claim.
+    //
+    // Requiring `Online` at a single sample was the first attempt and is
+    // wrong. It would fail a healthy probeless app whose `listen_timeout`
+    // outlasts the dwell, which is not hypothetical: this crate's own README
+    // measures a one-instance probeless app at `listen_timeout = "15s"` being
+    // given up on at ten seconds, and calls that the bug the polling turnover
+    // above exists to prevent. Reintroducing it here would be the same
+    // mistake one phase later.
+    //
+    // So the question is not "is it Starting" but "is it STILL Starting after
+    // long enough". A slow app reaches `Online` on its own; an abandoned
+    // replacement never does, because nothing is left to move it.
+    let deadline = Instant::now() + DWELL;
+    loop {
+        let flock = describe_within(daemon, sheep, DWELL).await?;
+        let settled_and_ready = !flock.is_empty()
+            && flock
+                .iter()
+                .all(|info| settled.holds(info) && is_online(info));
+        if settled_and_ready {
+            return Ok(true);
+        }
+        // A pid that changed, or an instance that died, is a verdict rather
+        // than something more waiting can fix.
+        if flock.is_empty()
+            || !flock
+                .iter()
+                .all(|info| settled.holds(info) && is_alive(info))
+        {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        sleep(POLL).await;
+    }
 }
 
 /// [`Daemon::describe`], retrying an answer that could clear on its own.
@@ -641,12 +686,23 @@ mod tests {
         assert!(!ok);
     }
 
-    /// fails if `Verify::Alive` starts demanding a probe. Alive is the
-    /// deliberate, visible downgrade for a sheep with no probe: a new
-    /// process, still running after the window, is enough.
+    /// fails if `Verify::Alive` starts demanding a prompt probe. Alive is the
+    /// deliberate, visible downgrade for a sheep with no probe: a new process
+    /// that comes up and stays up is enough, and it is given the whole dwell
+    /// to get there where `Probed` wants `Online` at the turnover.
+    ///
+    /// The fake reaches `Online` on its second answer, which it did not have
+    /// to before. A probeless app takes shep's heuristic path and is marked
+    /// `Online` at its `listen_timeout`, so a listing that says `Starting`
+    /// forever is not a slow healthy app: since shep 0.1.10 it is the shape of
+    /// a reload shep abandoned, and `alive_rejects_a_replacement_shep_gave_up_on`
+    /// below is what pins that.
     #[tokio::test(start_paused = true)]
     async fn alive_accepts_a_new_process_that_is_still_running() {
-        let daemon = Listings::new(vec![vec![instance(2, ProcStatus::Starting, 13002)]]);
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Starting, 13002)],
+            vec![instance(2, ProcStatus::Online, 13002)],
+        ]);
         assert!(
             wait(
                 &daemon,
@@ -713,6 +769,11 @@ mod tests {
             vec![instance(1, ProcStatus::Online, 12835)],
             vec![instance(1, ProcStatus::Online, 12835)],
             vec![instance(2, ProcStatus::Starting, 13002)],
+            // Then ready, which is what the heuristic path does at
+            // `listen_timeout`. Without this the fake describes a replacement
+            // that never becomes ready, which is a different case entirely and
+            // has its own test below.
+            vec![instance(2, ProcStatus::Online, 13002)],
         ]);
         assert!(
             wait(
@@ -724,6 +785,41 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+    }
+
+    /// fails if `Alive` believes a replacement shep gave up on.
+    ///
+    /// shep 0.1.10 reloads a probed app serially, so when readiness resolves
+    /// the old instance has already drained and there is nothing to abort back
+    /// to. Rather than claim `Online` for a replacement it knows never became
+    /// ready, shep leaves it `Starting` and fires `ReloadAbandoned`. Its own
+    /// comment says why: answering `online` for an instance that never came up
+    /// "is how a broken release gets recorded as deployed". Such an instance
+    /// has no liveness loop either, since those are armed at `went_online`.
+    ///
+    /// Accepting that as alive threw the signal away and recorded the thing
+    /// shep had just refused to claim. Caught against a real shepherd by the
+    /// integration tier, which is the only place it could be caught: no fake
+    /// in this module knew `Starting` had acquired a meaning.
+    #[tokio::test(start_paused = true)]
+    async fn alive_rejects_a_replacement_shep_gave_up_on() {
+        // Starting forever, which is exactly what an abandoned reload leaves.
+        let daemon = Listings::new(vec![vec![instance(2, ProcStatus::Starting, 13002)]]);
+
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Alive,
+            &serving(12835),
+            Duration::from_secs(120),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !ok,
+            "a replacement left at `starting` never came up, whatever verify mode asked"
         );
     }
 
