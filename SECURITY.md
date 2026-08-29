@@ -52,8 +52,10 @@ where an artifact's destination really lands, then opens it. A component
 swapped for a symlink between those two steps is followed, because the kernel
 honours `O_NOFOLLOW` on a path's last component and on nothing above it. A
 component that is already a link when the first check runs is refused at any
-depth, and the destination is resolved again immediately before the open, so
-the window is one call wide. Closing the rest needs `openat2` with
+depth IF it resolves outside the release and the cache, which is the check that
+matters. A link staying inside them is allowed, and has to be, because
+`shared::link_cache` makes `release/target` one. The destination is resolved
+again immediately before the open, so the window is one call wide. Closing the rest needs `openat2` with
 `RESOLVE_NO_SYMLINKS`, which needs the unsafe this crate forbids.
 `docs/specs/deferred.md` records it.
 

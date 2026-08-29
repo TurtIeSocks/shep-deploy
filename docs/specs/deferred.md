@@ -138,10 +138,11 @@ Neither won the race in a harness. This crate has measured a comparable one
 being won in 0.03s, so treat it as narrow rather than as theatre.
 
 Two things narrow it already. A component that is a symlink when the first
-check runs is refused at any depth, because `lands_within` resolves the
-deepest existing ancestor rather than trusting the spelling. And the
-destination is resolved again immediately before the open, so what is left is
-one call rather than the several syscalls it was.
+check runs is refused at any depth IF it resolves outside the release and the
+cache, because `lands_within` resolves the deepest existing ancestor rather
+than trusting the spelling. And the destination is resolved again immediately
+before the open, so what is left is one call rather than the several syscalls
+it was.
 
 Closing it needs `openat2` with `RESOLVE_NO_SYMLINKS`, or walking each
 component with its own `openat`. Both need `unsafe`, against the
