@@ -430,9 +430,12 @@ fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
 /// boundary); either end resolves outside the release and the build cache;
 /// the destination changed underneath the check; or the build never produced
 /// it at the path declared. [`Error::Io`] naming the destination's parent if
-/// that directory cannot be created, naming the source if it cannot be opened
-/// or read, and naming the destination if it cannot be opened, written or
-/// have its permissions set.
+/// that directory cannot be created, the destination if it cannot be opened or
+/// have its permissions set, and the source in every other case - including a
+/// write to the destination that fails. `io::copy` does not report which side
+/// of a copy an error came from, so the one path it can name is the artifact
+/// that could not be copied. Read `No space left on device` against a source
+/// path as the release's filesystem rather than the cache's.
 fn copy_artifact(
     release: &Path,
     cache: &Path,
@@ -732,9 +735,10 @@ fn copy_artifact(
 /// resolve, if a declared artifact resolves outside the release and the build
 /// cache, or if one the build was meant to produce is not there - see
 /// [`copy_artifact`] for all three. [`Error::Io`] naming `release` if the shell
-/// (or `id`, for `as_user`) cannot even be launched, and naming the path it
-/// actually failed on - the artifact's source, its destination, or that
-/// destination's parent - if a declared artifact cannot be copied.
+/// (or `id`, for `as_user`) cannot even be launched, and naming the artifact's
+/// source, its destination, or that destination's parent if a declared
+/// artifact cannot be copied - see [`copy_artifact`], which names the source
+/// for the copy itself even when it was the destination that failed.
 /// [`Error::Build`] if the command launches and
 /// exits non-zero, or is killed by a signal, naming the exit status when there
 /// is one. [`Error::BuildTimedOut`] if it runs past `budget`, which is
