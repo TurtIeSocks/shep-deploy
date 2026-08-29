@@ -144,54 +144,44 @@ than trusting the spelling. And the destination is resolved again immediately
 before the open, so what is left is one call rather than the several syscalls
 it was.
 
-Closing it needs a handle-based walk, and the flag matters.
-`RESOLVE_NO_SYMLINKS` is the obvious reach and is wrong: it refuses every
-symlinked component,
-including `release/target`, which `shared::link_cache` creates on purpose. A
-design built on it would refuse the ordinary cargo arrangement, which is the
-same mistake an earlier attempt already made in code.
+### What any fix has to satisfy
 
-What is wanted is confinement rather than refusal: `openat2` with
-`RESOLVE_IN_ROOT`, which follows a link but cannot leave the root it was given,
-or a per-component walk that opens each part by handle and checks containment
-as it goes.
+This section used to propose a mechanism. It proposed four, each one correcting
+the last and introducing the next, which is what happens to a design iterated
+in prose and never run. So it now records the constraints instead, and leaves
+the mechanism to whoever builds it against a compiler.
 
-Which root is the whole question, and the obvious answer is wrong. Rooting at
-the release refuses `release/target`, because `link_cache` points it at
-`<tree>/cache/target`, and the cache is the release's sibling rather than its
-child. `RESOLVE_IN_ROOT` confines each lookup to one `dirfd`, so a
-release-rooted lookup cannot follow that link anywhere useful: an absolute
-target is reinterpreted against the release, and a relative one climbing out is
-clamped. The design would refuse the ordinary cargo arrangement again, one
-layer deeper than the two attempts before it.
+1. **A symlinked component is not automatically wrong.** `shared::link_cache`
+   makes `release/target` a link on purpose. Refusing every symlinked component
+   was the first attempt, and it broke
+   `an_artifact_that_is_already_where_it_belongs_is_not_truncated`.
 
-The tree root is the answer, since `releases/<sha>` and `cache` are both under
-it, so a single confined lookup spans exactly the two places an artifact may
-legitimately land and nothing else. A two-root walk checking containment
-against release and cache separately works too, and is what `lands_within`
-already does by name today.
+2. **Confinement to the release alone is too tight.** That link points at
+   `<tree>/cache/target`, the release's sibling. A release-rooted `openat2`
+   with `RESOLVE_IN_ROOT` reinterprets an absolute target against the release
+   and clamps a relative one climbing out, so the link resolves nowhere useful.
+   That was the second attempt.
 
-This entry used to say that needs `unsafe` and stop there, which was the wrong
-place to stop. `#![forbid(unsafe_code)]` at `src/main.rs:33` rules out calling
-the syscall from here, and a crate that does it for us is the ordinary answer
-rather than a dodge: `cap-std` gives capability-based directory handles on both
-platforms this crate supports, and `rustix` exposes `openat2` where the kernel
-has it. Neither is exotic and both are maintained.
+3. **Confinement to the tree alone is too loose.** The tree also holds `git/`,
+   `current`, `deploy.toml` and `complete/`. An artifact landing on
+   `deploy.toml` is the round-1 escape exactly, and a tree-rooted lookup
+   permits it. That was the third.
 
-So the cost is a dependency and a rewrite of `copy_artifact`'s destination
-handling, not a safety principle. `openat2` alone is Linux 5.6 and later, so
-anything cross-platform means `cap-std`, whose directory handles give the same
-confinement without naming a flag.
+4. **So confinement and containment are two jobs.** Resolution has to be
+   anchored somewhere it cannot be walked out of, AND the object it arrives at
+   has to be checked as being under the release or the cache. One without the
+   other fails as above. `lands_within` already does the containment half by
+   name; what it cannot do is hold a handle while it does so.
+
+5. **It has to hold across both platforms.** `openat2` is Linux 5.6 and later,
+   so anything cross-platform means `cap-std`'s directory handles or a
+   per-component walk built on `openat`.
 
 Still deferred, now for the reason that is actually the reason: the window is
 one call wide, what gets written through it is the build's own output, and the
 rewrite touches the most-reviewed function in the crate. Worth its own change
 rather than one made on the way past.
 
-An earlier attempt refused every symlinked component outright. That is
-recorded here because it looks correct and is not: `shared::link_cache` makes
-`release/target` a link at the dog's own cache, so the refusal broke the
-ordinary cargo arrangement rather than an attack.
 
 ## Two things shep should export, so a dog stops copying them
 

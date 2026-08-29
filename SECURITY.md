@@ -56,9 +56,9 @@ depth IF it resolves outside the release and the cache, which is the check that
 matters. A link staying inside them is allowed, and has to be, because
 `shared::link_cache` makes `release/target` one. The destination is resolved
 again immediately before the open, so the window is one call wide. Closing the
-rest needs a handle-based walk, which means a capability-based crate such as
-`cap-std` rather than anything this crate can spell itself.
-`docs/specs/deferred.md` records it.
+rest needs a handle-based walk, which is a dependency and a rewrite rather than
+a line. `docs/specs/deferred.md` records what such a fix has to satisfy, and
+what three attempts at describing one got wrong.
 
 **The cleared environment bounds what a build inherits from this process.** A
 build gets `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, whatever `passthrough` names
