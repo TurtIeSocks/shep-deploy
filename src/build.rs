@@ -875,7 +875,16 @@ mod tests {
             None,
             &[],
             tempdir_cache().path(),
-            Duration::from_millis(250),
+            // Two seconds, not 250ms, for the reason `shep`'s own
+            // `run_bounded` test learned the hard way: a budget this small is
+            // shared with process startup, and on a loaded runner the shell
+            // has not yet written its pid when the deadline fires. The
+            // assertion below then reads a file that is not there and fails
+            // for a reason that has nothing to do with process groups.
+            //
+            // Still three hundred times shorter than the `sleep 600` it has to
+            // interrupt, so what the test is about is unchanged.
+            Duration::from_secs(2),
         )
         .await
         .expect_err("a build that never finishes must be abandoned");
@@ -891,8 +900,10 @@ mod tests {
 
         // The whole point of the process group. Killing the shell alone would
         // leave this running against a release the deploy has given up on.
-        let pid = std::fs::read_to_string(rel.path().join("descendant.pid"))
-            .expect("the build wrote its descendant's pid");
+        let pid = std::fs::read_to_string(rel.path().join("descendant.pid")).expect(
+            "the build never got far enough to write its descendant's pid, so this \
+             proves nothing about the group kill either way",
+        );
         let alive = std::process::Command::new("kill")
             .args(["-0", pid.trim()])
             .status()
