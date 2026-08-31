@@ -450,7 +450,7 @@ Unix only. This is deliberate, not a gap waiting to be filled by accident: the d
 And in `## Usage`, after the `--watch` line:
 
 ```markdown
-Exit codes follow [shep's own taxonomy](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md): `0` deployed or already up to date, `2` bad arguments, `4` bad configuration, `5` no daemon answered, `1` anything else. **`12` is this dog's own: the deploy was rejected and the previous release was put back.** A script that treats any nonzero code as "the deploy broke" will be wrong about `12`, where the flock is healthy on the old release.
+Exit codes follow [shep's own taxonomy](https://github.com/shep-pm/shep/blob/main/docs/specs/shep-v1.md): `0` deployed or already up to date, `2` bad arguments, `4` bad configuration, `5` no daemon answered, `1` anything else. **`12` is this dog's own: the deploy was rejected and the previous release was put back.** A script that treats any nonzero code as "the deploy broke" will be wrong about `12`, where the flock is healthy on the old release.
 ```
 
 - [ ] **Step 10: Run the gate and commit**

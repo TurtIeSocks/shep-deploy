@@ -673,6 +673,7 @@ mod tests {
             source: Box::new(Error::Request(RequestError::Rpc(RpcError {
                 code: RpcErrorCode::Internal,
                 message: "web is already being reloaded".to_owned(),
+                daemon_version: None,
             }))),
         }
     }
@@ -819,6 +820,7 @@ mod tests {
             Error::Request(RequestError::Rpc(RpcError {
                 code,
                 message: "web is already being reloaded".to_owned(),
+                daemon_version: None,
             }))
         };
 

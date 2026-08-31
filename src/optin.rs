@@ -1183,6 +1183,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: "the shepherd is not answering".to_owned(),
+                    daemon_version: None,
                 })));
             }
 
@@ -1232,6 +1233,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: "bpm cannot be started".to_owned(),
+                    daemon_version: None,
                 })));
             }
 
@@ -1250,6 +1252,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: format!("instance {id} cannot be deleted"),
+                    daemon_version: None,
                 })));
             }
             self.deletes.borrow_mut().push(id);
