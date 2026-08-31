@@ -1630,6 +1630,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: self.refusal_code,
                     message: format!("{sheep} is already being reloaded"),
+                    daemon_version: None,
                 })));
             }
             self.reloads.set(self.reloads.get() + 1);
@@ -2598,6 +2599,7 @@ mod tests {
         let rpc = Error::Request(RequestError::Rpc(RpcError {
             code: RpcErrorCode::Internal,
             message: "web is already being reloaded".to_owned(),
+            daemon_version: None,
         }));
         assert!(never_reached_the_shepherd(&rpc));
 

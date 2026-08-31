@@ -672,6 +672,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: "describe refused".to_owned(),
+                    daemon_version: None,
                 })));
             }
             Ok((0..self.instances)
@@ -698,6 +699,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: "refused".to_owned(),
+                    daemon_version: None,
                 })));
             }
             // `calls()` tracks only what actually changed the flock, so a
@@ -712,6 +714,7 @@ mod tests {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
                     code: RpcErrorCode::Internal,
                     message: "delete refused".to_owned(),
+                    daemon_version: None,
                 })));
             }
             self.calls.borrow_mut().push("delete");

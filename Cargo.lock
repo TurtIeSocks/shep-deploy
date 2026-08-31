@@ -313,9 +313,9 @@ dependencies = [
 
 [[package]]
 name = "granit-parser"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ccd1be9ebf2bd5520dbfcfb72b70ef492f654061299a097056f3e73410e38ec"
+checksum = "65ec0d45986cd51c847c75c5b69a00852c4fc84d0e5e79f041173f73437d0cdf"
 dependencies = [
  "arraydeque",
  "smallvec",
@@ -365,9 +365,9 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "indexmap"
-version = "2.14.0"
+version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
 dependencies = [
  "equivalent",
  "hashbrown",
@@ -675,9 +675,9 @@ dependencies = [
 
 [[package]]
 name = "shep-client"
-version = "0.1.10"
+version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dabc96e3aa68ba7a9ae91ac368c6b0d559f41c5673c4ad33140e5635bf863b04"
+checksum = "64302b3fea1e48d66e3790d110e2b376551d8bfb5e2c766605434f8ece6e2562"
 dependencies = [
  "futures-util",
  "shep-core",
@@ -688,9 +688,9 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.1.10"
+version = "0.1.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc5437fbd8dfcd5919be2b1a84c816fed0380b48bc04b7e058a9f39f97a7e806"
+checksum = "8f56910e35a0818bef197d32bf798c591748132c2b0dda4f2e0c3a90138e8a43"
 dependencies = [
  "annotate-snippets",
  "anstyle",

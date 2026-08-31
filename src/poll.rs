@@ -1056,6 +1056,7 @@ mod tests {
             Err(Error::Request(RequestError::Rpc(RpcError {
                 code: RpcErrorCode::Internal,
                 message: "smits are not accepted right now".to_owned(),
+                daemon_version: None,
             })))
         }
     }
