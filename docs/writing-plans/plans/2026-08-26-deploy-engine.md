@@ -62,7 +62,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "A deploy dog for shep: watches a git branch, builds a release, swaps to it, and rolls back if it does not come up"
-repository = "https://github.com/TurtIeSocks/shep-deploy"
+repository = "https://github.com/shep-pm/shep-deploy"
 keywords = ["shep", "process-manager", "deploy", "git"]
 categories = ["command-line-utilities"]
 

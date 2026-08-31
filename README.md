@@ -1,18 +1,18 @@
 # shep-deploy
 
 [![Crates.io Version](https://img.shields.io/crates/v/shep-deploy.svg)](https://crates.io/crates/shep-deploy)
-[![License](https://img.shields.io/crates/l/shep-deploy.svg)](https://github.com/TurtIeSocks/shep-deploy#license)
+[![License](https://img.shields.io/crates/l/shep-deploy.svg)](https://github.com/shep-pm/shep-deploy#license)
 [![MSRV](https://img.shields.io/crates/msrv/shep-deploy.svg)](https://crates.io/crates/shep-deploy)
-[![CI](https://github.com/TurtIeSocks/shep-deploy/actions/workflows/test.yml/badge.svg)](https://github.com/TurtIeSocks/shep-deploy/actions/workflows/test.yml)
+[![CI](https://github.com/shep-pm/shep-deploy/actions/workflows/test.yml/badge.svg)](https://github.com/shep-pm/shep-deploy/actions/workflows/test.yml)
 
-A deploy dog for [shep](https://github.com/TurtIeSocks/shep).
+A deploy dog for [shep](https://github.com/shep-pm/shep).
 
 Watches a git branch, builds a release in an isolated directory, swaps to it,
 reloads the sheep, and rolls back on its own if the new release does not come
 up.
 
 It is an external dog, the same shape as
-[shep-log-rotate](https://github.com/TurtIeSocks/shep-log-rotate): an ordinary
+[shep-log-rotate](https://github.com/shep-pm/shep-log-rotate): an ordinary
 binary you adopt, talking to the daemon over the socket the CLI already uses.
 
 ## Install
@@ -289,7 +289,7 @@ bootstrap case a running app is still pointing into it.
 ## Exit codes
 
 Follows [shep's own
-taxonomy](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md):
+taxonomy](https://github.com/shep-pm/shep/blob/main/docs/specs/shep-v1.md):
 `0` deployed or already up to date, `2` bad arguments, `4` bad configuration,
 `5` no daemon answered, `1` anything else.
 

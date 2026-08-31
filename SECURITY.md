@@ -100,4 +100,4 @@ and no token passes through any URL or argument this crate builds.
 ## Reporting
 
 Open a private security advisory on
-[the repository](https://github.com/TurtIeSocks/shep-deploy/security/advisories).
+[the repository](https://github.com/shep-pm/shep-deploy/security/advisories).

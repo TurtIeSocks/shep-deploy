@@ -1,6 +1,6 @@
 # shep-deploy — CLAUDE.md
 
-A deploy dog for [shep](https://github.com/TurtIeSocks/shep). Watches a git
+A deploy dog for [shep](https://github.com/shep-pm/shep). Watches a git
 branch, builds a release in an isolated worktree, swaps a `current` symlink
 with `rename(2)`, reloads the sheep, and rolls back if the new release does not
 come up. Unix only, deliberately. MIT OR Apache-2.0.

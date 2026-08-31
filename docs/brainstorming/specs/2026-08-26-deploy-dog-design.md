@@ -18,7 +18,7 @@ slightly differently each time.
 ## Where this lives
 
 The dog is its own repository and its own crate, not part of shep:
-[github.com/TurtIeSocks/shep-deploy](https://github.com/TurtIeSocks/shep-deploy),
+[github.com/shep-pm/shep-deploy](https://github.com/shep-pm/shep-deploy),
 scaffolded 2026-08-26. It publishes to crates.io the way `shep-log-rotate`
 does, and it consumes `shep-core` and `shep-client` as an ordinary dependent.
 
@@ -67,7 +67,7 @@ Named explicitly, because "mini Vercel" invites scope creep:
 - **Static-site targets.** Long-running processes only. A static site has no
   process to restart and wants a different design; revisit separately if ever.
 
-Note that [shep-v1.md](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/shep-v1.md) §1 lists "deployment tooling"
+Note that [shep-v1.md](https://github.com/shep-pm/shep/blob/main/docs/specs/shep-v1.md) §1 lists "deployment tooling"
 as a v1 non-goal, meaning `pm2 deploy`: host lists, revision directories, `ref`
 and `repo` per environment, remote execution over SSH. This design is much
 smaller and lives outside the shep binary. Reconsidering the cut is not
@@ -486,7 +486,7 @@ unprivileged with a reverse proxy for ports below 1024.
 
 **A dog holds full socket authority.** It can issue `Delete` as easily as
 `Restart`. Nothing here changes that, and it is why the confinement work
-recorded under `shep install` in [deferred.md](https://github.com/TurtIeSocks/shep/blob/main/docs/specs/deferred.md) matters
+recorded under `shep install` in [deferred.md](https://github.com/shep-pm/shep/blob/main/docs/specs/deferred.md) matters
 more once this exists.
 
 **Private repositories inherit the build user's git auth.** If git cannot reach
