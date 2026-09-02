@@ -165,9 +165,14 @@ impl Shepherd {
 
     /// Run `shep-deploy` against this home with whatever argv is given.
     ///
-    /// `SHEP_HOME` and nothing else, which is the whole of a dog's
-    /// environment - a verb that needed more than that would work here and
-    /// fail under the shepherd.
+    /// `SHEP_HOME` and nothing else. A verb needing more than that would
+    /// work here and fail under the shepherd, which hands a dog `SHEP_HOME`
+    /// and `SHEP_DOG_NAME` and no argv at all.
+    ///
+    /// `SHEP_DOG_NAME` is deliberately absent: these are the one-shot verbs,
+    /// and the whole point of reading that variable is that a command run by
+    /// hand is not a dog and must not announce itself as one. See
+    /// `adopted_as` in `src/main.rs`.
     fn deploy_args(&self, args: &[&str]) -> Output {
         Command::new(DEPLOY_BIN)
             .args(args)

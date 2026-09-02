@@ -28,6 +28,29 @@ pub enum Error {
     Connect(ConnectError),
     /// A request reached the shepherd and came back an error.
     Request(RequestError),
+    /// A successor daemon refused this dog's handshake on protocol-version
+    /// skew, so the reconnecting link has stopped for good.
+    ///
+    /// Not a [`Self::Connect`], though it is the same family of failure and
+    /// takes the same exit code. `Connect` is the FIRST connection failing,
+    /// which the operator is standing in front of; this one happens after a
+    /// daemon handover, hours later, to a process nobody is watching. The
+    /// distinction is worth a variant because the remedy differs: nothing is
+    /// wrong with the socket, and the dog's own binary is the thing that is
+    /// out of date.
+    ///
+    /// Carried rather than rebuilt as a
+    /// [`ConnectError::ProtocolMismatch`], which needs this client's own
+    /// protocol number as well, and
+    /// [`LinkState::Refused`](shep_client::LinkState::Refused) does not
+    /// carry one to give it.
+    Refused {
+        /// The daemon's own crate version, when it named one. `None` from a
+        /// daemon built before the refusal carried it.
+        daemon_version: Option<String>,
+        /// The daemon's refusal message, verbatim.
+        message: String,
+    },
     /// The shepherd answered with a response this dog cannot use.
     Protocol(String),
     /// Some operator-supplied input failed validation, and the message says
@@ -361,6 +384,19 @@ impl fmt::Display for Error {
         match self {
             Self::Connect(err) => write!(f, "cannot reach the shepherd: {err}"),
             Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
+            Self::Refused {
+                daemon_version,
+                message,
+            } => write!(
+                f,
+                "the shepherd refused this dog's handshake: {message}. It is running {}, and \
+                 the two no longer speak the same protocol. Upgrade whichever of them is \
+                 behind; the shepherd starts this dog again on its own once they agree",
+                match daemon_version {
+                    Some(version) => format!("shep {version}"),
+                    None => "a version it did not name".to_owned(),
+                }
+            ),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config(what) => write!(f, "bad deploy configuration: {what}"),
             Self::Smit(err) => write!(f, "could not publish a smit: {err}"),
@@ -549,6 +585,7 @@ impl core::error::Error for Error {
                 .as_deref()
                 .map(|err| err as &(dyn core::error::Error + 'static)),
             Self::Protocol(_)
+            | Self::Refused { .. }
             | Self::Config(_)
             | Self::NotCutOver { .. }
             | Self::Held { .. }
@@ -803,6 +840,41 @@ mod tests {
     fn a_build_error_names_a_signal_kill_distinctly() {
         let err = Error::Build { status: None };
         assert!(err.to_string().contains("signal"));
+    }
+
+    /// fails if a refused handshake stops saying what an operator has to do
+    /// about it. This is the last line a dog writes before it ends, in a log
+    /// nobody is reading at the time, so it has to carry the whole
+    /// diagnosis: the daemon's own words for the refusal, which version
+    /// refused, and that an upgrade is the way out.
+    #[test]
+    fn a_refused_handshake_names_the_daemon_and_the_way_out() {
+        let err = Error::Refused {
+            daemon_version: Some("0.4.0".to_owned()),
+            message: "protocol 3, this daemon speaks 4".to_owned(),
+        };
+        let shown = err.to_string();
+        assert!(
+            shown.contains("protocol 3, this daemon speaks 4"),
+            "{shown}"
+        );
+        assert!(shown.contains("shep 0.4.0"), "{shown}");
+        assert!(shown.contains("Upgrade"), "{shown}");
+    }
+
+    /// fails if a daemon too old to name its own version turns into a
+    /// message with a hole in it. `daemon_version` is `None` from any shep
+    /// built before the refusal carried one, and "shep " followed by nothing
+    /// reads as a bug in this dog rather than a fact about that one.
+    #[test]
+    fn a_refusal_from_an_unnamed_version_still_reads() {
+        let err = Error::Refused {
+            daemon_version: None,
+            message: "protocol mismatch".to_owned(),
+        };
+        let shown = err.to_string();
+        assert!(shown.contains("a version it did not name"), "{shown}");
+        assert!(!shown.contains("shep ."), "{shown}");
     }
 
     /// fails if a request that can never succeed is retried anyway.
