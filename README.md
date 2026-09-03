@@ -22,6 +22,18 @@ cargo install shep-deploy
 shep adopt shep-deploy
 ```
 
+Upgrading later wants `--force`:
+
+```bash
+cargo install shep-deploy --force
+shep restart deploy
+```
+
+That flag is not politeness. This dog links `shep-client`, and its own version
+does not change when that does, so after you upgrade shep the rebuild you need
+is exactly the one cargo declines to do: it prints `already installed, use
+--force to override`, builds nothing, and exits 0. It looks like it worked.
+
 `shep adopt` registers it with the shepherd, which supervises it from then on.
 `shep dogs` lists what you have adopted.
 
