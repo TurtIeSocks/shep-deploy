@@ -165,9 +165,14 @@ impl Shepherd {
 
     /// Run `shep-deploy` against this home with whatever argv is given.
     ///
-    /// `SHEP_HOME` and nothing else, which is the whole of a dog's
-    /// environment - a verb that needed more than that would work here and
-    /// fail under the shepherd.
+    /// `SHEP_HOME` and nothing else. A verb needing more than that would
+    /// work here and fail under the shepherd, which hands a dog `SHEP_HOME`
+    /// and `SHEP_DOG_NAME` and no argv at all.
+    ///
+    /// `SHEP_DOG_NAME` is deliberately absent: these are the one-shot verbs,
+    /// and the whole point of reading that variable is that a command run by
+    /// hand is not a dog and must not announce itself as one. See
+    /// `adopted_as` in `src/main.rs`.
     fn deploy_args(&self, args: &[&str]) -> Output {
         Command::new(DEPLOY_BIN)
             .args(args)
@@ -472,17 +477,26 @@ fn register_from_checkout(shepherd: &Shepherd, origin: &Path) -> tempfile::TempD
     checkout
 }
 
-/// The last non-empty line of `path`, or `None` if it cannot be read yet.
+/// The last non-empty line of `path`, with shep's timestamp taken back off,
+/// or `None` if it cannot be read yet.
 ///
 /// The app's stdout log is how these tests tell which RELEASE is executing,
 /// which `shep describe` cannot answer: it reports status and pid, not code.
 /// The last line specifically, because the log accumulates across reloads -
 /// including the short-lived instance of a release that failed to come up.
+///
+/// Through `shep_core::logstamp::strip`, the same call `shep bleats` makes
+/// when it reads one of these files, so what a caller compares against is what
+/// an operator is shown rather than a prefix this test learned to expect. shep
+/// stamps every line it writes to a log FILE as of 0.1.28; the bus feed a
+/// follower reads is unstamped. `strip` recognises a stamp by parsing it, so a
+/// line that never carried one comes back unchanged and this stays correct
+/// against an older shep too.
 fn last_line(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     text.lines()
         .rfind(|line| !line.trim().is_empty())
-        .map(str::to_owned)
+        .map(|line| shep_client::shep_core::logstamp::strip(line).to_owned())
 }
 
 /// Poll `ready` until it answers true, or fail with `what`.

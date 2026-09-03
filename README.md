@@ -170,6 +170,27 @@ published on change would show nothing at all after a daemon restart until its
 next deploy. A refused smit is logged and otherwise ignored, since it is
 cosmetic and never worth failing a deploy over.
 
+## How it holds its connection
+
+Adopted, the dog announces itself by the name shep gave it, taken from
+`SHEP_DOG_NAME`. That is what shep records as a handshake. A dog that does not
+send one connects, serves every request correctly, and is still shown as
+`silent`, restarted once, and then written off as stale.
+
+The connection survives a handover as well, so `shep upgrade` does not leave
+the dog running against a socket nobody is listening on.
+
+A refusal it does not survive. When a newer shepherd rejects the handshake on
+protocol skew, no amount of reconnecting fixes it, so the dog reports the
+shepherd's version and its refusal message, then exits `5` rather than ticking
+on against a connection that will never answer. It cannot name its own protocol
+number, because `LinkState::Refused` does not carry one. Upgrade whichever side
+is behind and shep starts it again.
+
+Run by hand, `shep-deploy deploy web` announces no name at all. It is not a
+dog, and a command claiming to be one would have shep restart the real dog when
+the command's own handshake was refused.
+
 ## A commit that fails is held
 
 A commit that does not land is left alone until the branch moves. It is
@@ -291,7 +312,7 @@ bootstrap case a running app is still pointing into it.
 Follows [shep's own
 taxonomy](https://github.com/shep-pm/shep/blob/main/docs/specs/shep-v1.md):
 `0` deployed or already up to date, `2` bad arguments, `4` bad configuration,
-`5` no daemon answered, `1` anything else.
+`5` no daemon answered or one refused this dog's handshake, `1` anything else.
 
 Two are this dog's own:
 

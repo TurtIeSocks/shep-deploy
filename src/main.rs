@@ -6,11 +6,18 @@
 //!
 //! # Two invocation modes
 //!
-//! Supervised, the dog is spawned with no argv at all and one environment
-//! entry, `SHEP_HOME` - that is the dog contract, and it is why
-//! [`daemon::adopted_name`] exists. That mode runs [`poll::run`], which
-//! deploys every `watch = "auto"` target whose branch has moved, once an
-//! interval, until the process is asked to stop.
+//! Supervised, the dog is spawned with no argv at all and two environment
+//! entries: `SHEP_HOME`, which every path below is joined onto, and
+//! `SHEP_DOG_NAME`, which is what shep registered this process as. That mode
+//! runs [`poll::run`], which deploys every `watch = "auto"` target whose
+//! branch has moved, once an interval, until the process is asked to stop.
+//!
+//! The two modes connect differently, in two ways. The poll loop connects
+//! through a client that survives a daemon handover, because it is the only
+//! mode that outlives one; a verb connects through a plain client and exits.
+//! And the poll loop announces a dog name, but only the one shep put in
+//! `SHEP_DOG_NAME` - no variable, no dog, no name. See [`poll_forever`] and
+//! [`adopted_as`].
 //!
 //! Run directly, it takes a verb:
 //!
@@ -68,8 +75,8 @@ mod verify;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use shep_client::Client;
 use shep_client::shep_core::paths::ShepPaths;
+use shep_client::{Client, LinkState, RECONNECT_MAX_DELAY, ReconnectingClient};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::daemon::Live;
@@ -209,15 +216,42 @@ async fn main() -> ExitCode {
     }
 }
 
-/// The supervised mode: connect, read this dog's own config section, and
-/// poll until the process is asked to stop.
+/// The environment entry shep puts an adopted dog's registered name in.
+///
+/// Set by the daemon itself when it spawns the dog, alongside `SHEP_HOME`.
+/// Its absence is the signal that this process is NOT a supervised dog; see
+/// [`adopted_as`].
+const DOG_NAME: &str = "SHEP_DOG_NAME";
+
+/// The supervised mode: connect as this dog, read its own config section,
+/// and poll until the process is asked to stop.
 ///
 /// Answers 0 for a stop that was asked for, which is the only way out that
 /// is not an error. [`poll::run`] itself never returns.
 ///
+/// # Why this one connection is not a [`Client`]
+///
+/// This is the only invocation that outlives the daemon it connected to. A
+/// `shep upgrade` hands the socket to a successor process, and a dog is an
+/// ordinary child that keeps running through it, so its connection has to be
+/// re-established or the dog is alive and mute for as long as it is left up.
+/// [`ReconnectingClient`] is the client that does that, and
+/// `connect_as_dog` is the only public door to a handshake that names a dog.
+/// That name is what the daemon marks as handshook, and what it needs to
+/// restart the right dog when a successor refuses one. A dog connecting
+/// without it serves every request correctly and is still recorded as
+/// silent, restarted once, and then written off as stale.
+///
+/// The four one-shot verbs stay on [`Client`], deliberately. Each runs for
+/// one command and exits, so there is nothing to reconnect for, and a
+/// command claiming to be this dog would have the daemon record a handshake
+/// for a process about to exit - and restart the real dog if the command's
+/// own handshake were refused.
+///
 /// # Errors
 /// [`Error::Io`] if `$SHEP_HOME` cannot be resolved, [`Error::Connect`] if
-/// the shepherd's socket cannot be reached, and whatever
+/// the shepherd's socket cannot be reached, [`Error::Refused`] if a
+/// successor daemon refuses this dog's handshake, and whatever
 /// [`config::read`] returns - a `[dog.<name>]` section that cannot be
 /// parsed stops the dog here rather than being ignored, because a dog
 /// running on defaults it was not asked for looks exactly like one
@@ -230,16 +264,83 @@ async fn poll_forever() -> Result<u8, Error> {
     // First, and before anything is awaited. See `Stop`.
     let mut stop = Stop::install();
 
-    let client = Client::connect(&socket()?).await?;
-    let daemon = Live::new(client);
+    let socket = socket()?;
+    let client = match adopted_as(&|key| std::env::var(key).ok()) {
+        Some(name) => ReconnectingClient::connect_as_dog(&socket, &name).await?,
+        None => ReconnectingClient::connect(&socket).await?,
+    };
+    let daemon = Live::dog(client);
     let config = config::read(&daemon).await?;
 
     tokio::select! {
         result = poll::run(&daemon, &home, &config) => result.map(|()| 0),
+        // Cancels `poll::run` the same way a stop does, and can land inside
+        // a deploy for the same reason - see `Stop::arrives`. It costs
+        // nothing here that carrying on would not cost anyway: past a
+        // refusal every request this loop makes fails, so the deploy it
+        // interrupts had already stopped being able to finish.
+        refusal = refused(&daemon) => Err(refusal),
         () = stop.arrives() => {
             println!("shep-deploy: stopping");
             Ok(0)
         }
+    }
+}
+
+/// The name shep registered this process under, or `None` when nothing did.
+///
+/// This is the handshake identity and nothing else, which is why it has
+/// exactly one source. A name reaching the daemon is a claim about which dog
+/// to restart when a handshake is refused, so a guessed one - the binary's
+/// own stem, the config section's key, a default - gets some other dog
+/// restarted for this process's problem. No name at all is a complete and
+/// honest answer, and it is the right one for somebody running the binary by
+/// hand: they are not a supervised dog, and the daemon should not record a
+/// handshake for them.
+///
+/// Blank is treated as absent. An empty `SHEP_DOG_NAME` names no dog, and
+/// announcing it would claim an identity the daemon cannot match. Anything
+/// else is passed through verbatim rather than trimmed or validated: the
+/// daemon looks this up against its own registry, so the only useful value
+/// is the exact one it set.
+///
+/// Takes its lookup rather than reading the environment directly, matching
+/// [`resolved`], so the decision is testable without a process-global
+/// `set_var`.
+fn adopted_as(env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    env(DOG_NAME).filter(|name| !name.trim().is_empty())
+}
+
+/// Resolves when a successor daemon has refused this dog's handshake, and
+/// never otherwise.
+///
+/// A refusal is terminal by design: the supervisor stops, and every later
+/// request fails with no chance of recovering. The loop would carry on
+/// ticking through that, deploying nothing and reporting each target's
+/// failure once, which reads like a broken remote rather than a dog that
+/// can no longer talk to its shepherd at all. Ending instead puts the reason
+/// in the dog's log once and hands the process back to shep, which knows
+/// from the handshake which dog this was and can start it again when it is
+/// upgraded.
+///
+/// Polled rather than awaited, because [`LinkState`] is a snapshot and
+/// `shep-client` offers no wakeup for it. [`RECONNECT_MAX_DELAY`] is the
+/// supervisor's own ceiling between reconnect attempts, so a refusal is
+/// noticed about one attempt after it happens, and the poll costs one
+/// read of a lock per five seconds.
+async fn refused(daemon: &Live) -> Error {
+    loop {
+        if let Some(LinkState::Refused {
+            daemon_version,
+            message,
+        }) = daemon.link()
+        {
+            return Error::Refused {
+                daemon_version,
+                message,
+            };
+        }
+        tokio::time::sleep(RECONNECT_MAX_DELAY).await;
     }
 }
 
@@ -346,7 +447,11 @@ fn code_for(err: &Error) -> u8 {
         // from outside. What its own variant buys is inside - see the
         // variant's doc, and `crate::poll::worth_saying`.
         Error::Config(_) | Error::NotCutOver { .. } => 4,
-        Error::Connect(_) => 5,
+        // A refused handshake takes the same number as a socket that could
+        // not be reached, because it is the same thing from an operator's
+        // side: this dog and the shepherd are not talking. The message says
+        // which of the two it was, and that is where the difference belongs.
+        Error::Connect(_) | Error::Refused { .. } => 5,
         _ => 1,
     }
 }
@@ -362,7 +467,7 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
     let mut state = State::read(&tree.state_file())?;
 
     let client = Client::connect(&socket()?).await?;
-    let daemon = Live::new(client);
+    let daemon = Live::command(client);
 
     let config = config::read(&daemon).await?;
     let outcome = deploy::deploy(&daemon, &tree, &mut state, &config).await?;
@@ -390,7 +495,7 @@ async fn deploy_once(sheep: &str) -> Result<u8, Error> {
 /// and the instances it replaced did not all go.
 async fn setup_once(sheep: &str) -> Result<u8, Error> {
     let client = Client::connect(&socket()?).await?;
-    let daemon = Live::new(client);
+    let daemon = Live::command(client);
 
     let config = config::read(&daemon).await?;
     let prepared = optin::prepare(&daemon, &shep_home()?, sheep, &config).await?;
@@ -421,7 +526,7 @@ async fn setup_once(sheep: &str) -> Result<u8, Error> {
 /// [`survey::survey`] returns.
 async fn survey_once() -> Result<u8, Error> {
     let client = Client::connect(&socket()?).await?;
-    let daemon = Live::new(client);
+    let daemon = Live::command(client);
 
     print!("{}", survey::survey(&daemon, &shep_home()?).await?);
     Ok(0)
@@ -449,7 +554,7 @@ async fn on_remove() -> ExitCode {
     };
     match Client::connect(&socket).await {
         Ok(client) => {
-            let daemon = Live::new(client);
+            let daemon = Live::command(client);
             print!("{}", restore::report(&restore::all(&daemon, &home).await));
         }
         // Nothing was restored and nothing was broken. Said plainly,
@@ -663,6 +768,61 @@ mod tests {
                 sha: "new".to_owned()
             }),
             0
+        );
+    }
+
+    /// fails if a supervised dog stops announcing the name shep gave it.
+    ///
+    /// That name is the whole of the bug this function exists for. Without
+    /// it in the handshake the daemon never marks the dog handshook: it
+    /// connects, serves every request correctly, and is rendered `silent`,
+    /// restarted once after five seconds, then written off as stale and
+    /// never started again. Everything an operator can see says the dog is
+    /// working.
+    #[test]
+    fn a_supervised_dog_announces_the_name_shep_gave_it() {
+        let env = |key: &str| (key == DOG_NAME).then(|| "log-rotate".to_owned());
+        assert_eq!(adopted_as(&env).as_deref(), Some("log-rotate"));
+    }
+
+    /// fails if a process nobody supervised claims to be a dog anyway.
+    ///
+    /// No `SHEP_DOG_NAME` means shep did not spawn this, so there is no dog
+    /// to be. The name must never be guessed here - from the binary's stem,
+    /// from the `[dog.<name>]` section, from a default - because it is what
+    /// the daemon restarts on a refused handshake, and a guess gets some
+    /// other dog restarted for a hand run's problem.
+    #[test]
+    fn a_hand_run_announces_no_name_at_all() {
+        assert_eq!(adopted_as(&|_| None), None);
+        // Blank names no dog either, and an identity the daemon cannot
+        // match is worse than none: it is a claim.
+        assert_eq!(adopted_as(&|_| Some(String::new())), None);
+        assert_eq!(adopted_as(&|_| Some("   ".to_owned())), None);
+    }
+
+    /// fails if the name stops being read from `SHEP_DOG_NAME` specifically.
+    /// `SHEP_NAME` and `SHEP_INSTANCE` sit beside it in a dog's environment
+    /// and neither is the registered dog name.
+    #[test]
+    fn only_shep_dog_name_is_read() {
+        let env = |key: &str| (key == "SHEP_NAME").then(|| "web".to_owned());
+        assert_eq!(adopted_as(&env), None);
+    }
+
+    /// fails if a refused handshake stops being an error at all, or starts
+    /// taking a number that means something else. It is 5 for the same
+    /// reason a dead socket is: this dog and the shepherd are not talking.
+    #[test]
+    fn a_refused_handshake_exits_on_the_no_daemon_code() {
+        let refused = Error::Refused {
+            daemon_version: Some("0.4.0".to_owned()),
+            message: "protocol mismatch".to_owned(),
+        };
+        assert_eq!(code_for(&refused), 5);
+        assert_eq!(
+            code_for(&refused),
+            code_for(&Error::Connect(shep_client::ConnectError::HandshakeClosed))
         );
     }
 

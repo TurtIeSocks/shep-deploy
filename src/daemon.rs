@@ -8,10 +8,11 @@
 //! shepherd running - a task can hand it a fake and assert on what the fake
 //! recorded.
 //!
-//! There is one real implementation, [`Live`], a thin wrapper over
-//! [`Client`] that turns each method into one [`Request`] and matches the
-//! [`Response`] it expects back. Test doubles live in each module's own
-//! `#[cfg(test)]` block, this one included.
+//! There is one real implementation, [`Live`], a thin wrapper over a
+//! connected client that turns each method into one [`Request`] and matches
+//! the [`Response`] it expects back. Which client it wraps is the one thing
+//! the two constructors disagree about, and [`Link`] says why. Test doubles
+//! live in each module's own `#[cfg(test)]` block, this one included.
 //!
 //! # Why a trait at all
 //!
@@ -38,19 +39,26 @@
 //!
 //! # Self-identification
 //!
-//! [`adopted_name`] is the documented workaround for a real gap: an adopted
-//! dog is spawned with no argv at all and exactly one environment entry,
-//! `SHEP_HOME`, so there is nothing in the process's own environment that
-//! says what it was adopted as. What there is instead is the flock listing:
-//! it reports a pid per entry and a dog marker per dog, and this process
-//! knows its own pid. Getting this wrong means every config lookup silently
-//! reads an empty section, which looks exactly like a dog correctly running
-//! on defaults - there is no error to notice.
+//! [`adopted_name`] answers "what did shep register this process as", by
+//! finding this process's own pid in the flock listing: it reports a pid per
+//! entry and a dog marker per dog, and this process knows its own pid.
+//! Getting it wrong means every config lookup silently reads an empty
+//! section, which looks exactly like a dog correctly running on defaults -
+//! there is no error to notice.
+//!
+//! shep also puts that name in `$SHEP_DOG_NAME` when it spawns an adopted
+//! dog, and [`crate::main`] reads it for the handshake. This lookup stays
+//! all the same, because the two answer different questions. The handshake
+//! may carry ONLY a name the daemon itself set, never one this process
+//! worked out, since a wrong name there has the daemon restart the wrong dog
+//! when a refusal arrives. The config section has no such blast radius, and
+//! looking it up here keeps working under a shep old enough not to set the
+//! variable at all.
 
 use std::path::PathBuf;
 
 use shep_client::{
-    Client,
+    Client, LinkState, ReconnectingClient, RequestError,
     shep_core::config::AppConfig,
     shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec, Smit},
 };
@@ -156,19 +164,92 @@ pub trait Daemon {
     async fn set_smit(&self, sheep: &str, text: &str) -> Result<(), Error>;
 }
 
-/// A [`Client`] behind the [`Daemon`] trait - the only implementation this
-/// crate ships that speaks to a real shepherd.
+/// A connected client behind the [`Daemon`] trait - the only implementation
+/// this crate ships that speaks to a real shepherd.
 ///
-/// `Debug` is derived: the only thing in here is a [`Client`], whose own
-/// `Debug` prints its socket path and handshake ack and nothing else.
+/// `Debug` is derived: the only thing in here is one client, and both
+/// clients' own `Debug` print a socket path and a handshake ack and nothing
+/// else.
 #[derive(Debug)]
-pub struct Live(Client);
+pub struct Live(Link);
+
+/// Which kind of connection a [`Live`] speaks over.
+///
+/// # Why one type with two constructors rather than two types
+///
+/// The two clients are not interchangeable and must not become so. A
+/// [`ReconnectingClient`] built by [`Live::dog`] announces a dog name in its
+/// handshake, and that name is what lets the daemon restart THAT dog when a
+/// successor refuses it (shep's handover design, G8). A one-shot command
+/// that claimed a name would have the real dog restarted because a CLI
+/// invocation was refused, so [`Live::command`] takes the plain [`Client`],
+/// which has no way to claim one.
+///
+/// Everything downstream of this module is written against the [`Daemon`]
+/// trait and does not care which it got: the deploy sequence is the same
+/// sequence either way. So the split is an enum inside one type rather than
+/// a type parameter on `Live` or two `Daemon` implementations. A parameter
+/// would propagate `Live<C>` into every signature in `main` to express a
+/// distinction only the two constructors here need to make, and a second
+/// implementation would duplicate nine method bodies that differ in nothing
+/// but which field they call `request` on.
+#[derive(Debug)]
+enum Link {
+    /// The supervised dog's connection: reconnects across a daemon
+    /// handover, and stops for good when a successor refuses it.
+    Dog(ReconnectingClient),
+    /// A one-shot command's connection, which outlives nothing.
+    Command(Client),
+}
 
 impl Live {
-    /// Wrap a connected client.
+    /// Wrap the supervised dog's reconnecting connection.
+    ///
+    /// The dog process outlives the daemon it connected to - a handover
+    /// replaces the shepherd underneath a dog that keeps running - so this
+    /// is the only constructor whose connection has to survive one.
     #[must_use]
-    pub fn new(client: Client) -> Self {
-        Self(client)
+    pub const fn dog(client: ReconnectingClient) -> Self {
+        Self(Link::Dog(client))
+    }
+
+    /// Wrap a one-shot command's connection.
+    ///
+    /// A command runs for one deploy, setup or survey and exits. It has
+    /// nothing to reconnect for, and deliberately no way to announce itself
+    /// as a dog - see [`Link`].
+    #[must_use]
+    pub const fn command(client: Client) -> Self {
+        Self(Link::Command(client))
+    }
+
+    /// What the reconnecting supervisor is doing, or `None` on a one-shot
+    /// command connection, which has no supervisor to ask.
+    ///
+    /// The caller that matters is [`crate::main`]'s poll loop, watching for
+    /// [`LinkState::Refused`]: past that point every request fails forever,
+    /// and a loop that kept ticking would deploy nothing while looking
+    /// exactly like a dog with nothing to do.
+    #[must_use]
+    pub fn link(&self) -> Option<LinkState> {
+        match &self.0 {
+            Link::Dog(client) => Some(client.link()),
+            Link::Command(_) => None,
+        }
+    }
+}
+
+impl Link {
+    /// Send one request over whichever connection this is.
+    ///
+    /// Both clients spell `request` identically, down to the error type, so
+    /// every [`Daemon`] method below is written once and reads the same as
+    /// it did when `Live` held a bare [`Client`].
+    async fn request(&self, body: Request) -> Result<Response, RequestError> {
+        match self {
+            Self::Dog(client) => client.request(body).await,
+            Self::Command(client) => client.request(body).await,
+        }
     }
 }
 
@@ -473,10 +554,14 @@ mod tests {
     }
 
     /// fails if the dog cannot work out the name it was adopted under.
-    /// A dog is spawned with no argv and one env entry, so the ONLY way it
-    /// learns its own `[dog.<name>]` key is to find its own pid in the flock.
+    /// A dog is spawned with no argv, so the flock listing is how it finds
+    /// its own `[dog.<name>]` key: its own pid, carrying a dog marker.
     /// Getting this wrong means every config lookup silently reads an empty
     /// section, which looks exactly like running on defaults.
+    ///
+    /// `$SHEP_DOG_NAME` carries the same name and is NOT read here; see this
+    /// module's own doc for why the config section and the handshake take
+    /// their names from different places.
     #[tokio::test]
     async fn the_dog_finds_its_own_name_by_pid() {
         let me = std::process::id();
