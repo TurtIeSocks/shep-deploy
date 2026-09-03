@@ -181,9 +181,11 @@ The connection survives a handover as well, so `shep upgrade` does not leave
 the dog running against a socket nobody is listening on.
 
 A refusal it does not survive. When a newer shepherd rejects the handshake on
-protocol skew, no amount of reconnecting fixes it, so the dog names both
-versions and exits `5` rather than ticking on against a connection that will
-never answer. Upgrade whichever side is behind and shep starts it again.
+protocol skew, no amount of reconnecting fixes it, so the dog reports the
+shepherd's version and its refusal message, then exits `5` rather than ticking
+on against a connection that will never answer. It cannot name its own protocol
+number, because `LinkState::Refused` does not carry one. Upgrade whichever side
+is behind and shep starts it again.
 
 Run by hand, `shep-deploy deploy web` announces no name at all. It is not a
 dog, and a command claiming to be one would have shep restart the real dog when
