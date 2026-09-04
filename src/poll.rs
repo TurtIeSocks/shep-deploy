@@ -540,7 +540,7 @@ mod tests {
     fn flockfile(sheep: &str) -> String {
         format!(
             "[[app]]\nname = '{sheep}'\nscript = './run.sh'\n\n\
-             [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n"
+             [app.readiness_probe]\nkind = 'http'\ntarget = 'http://127.0.0.1:1/health'\n"
         )
     }
 
@@ -1038,7 +1038,8 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
 
         let _ = tokio::time::timeout(
-            Duration::from_secs(1),
+            // Paused time: long enough for a verify dwell, over in an instant.
+            Duration::from_secs(120),
             run_with(
                 &Ready::new(),
                 home.path(),

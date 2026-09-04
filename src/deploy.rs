@@ -1350,7 +1350,7 @@ mod tests {
     /// no test here runs a real shepherd - so `true` is honest rather than
     /// lazy: what these tests need is an app that HAS a probe.
     const FLOCKFILE: &str = "[[app]]\nname = 'web'\nscript = './run.sh'\n\n\
-                             [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n";
+                             [app.readiness_probe]\nkind = 'http'\ntarget = 'http://127.0.0.1:1/health'\n";
 
     /// A deploy target with a bare clone, an origin repo, and one release
     /// already live.

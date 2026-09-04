@@ -80,6 +80,21 @@ the key, on purpose, because an operator who writes it has said what they mean.
 What it costs is the whole of the paragraph above, so it is worth being sure
 the build command is one you would hand your agent to.
 
+**Four more fields make the shepherd act at its own uid, and a committed
+Flockfile is refused for setting any of them.** Read out of shep-daemon on
+2026-09-04. A `readiness_probe` or `liveness_probe` of kind `exec` is run by
+the daemon through `sh -c` on the probe's interval, forever, with no uid drop
+and no regard for `user`: committed, it is a root shell every ten seconds.
+`out_file` and `err_file` are opened, created and appended to by the daemon's
+log pump and truncated by `shep flush`, at the daemon's uid, with a symlink
+check on the final component and nothing on where the path points. An `http`
+or `tcp` probe is a connection the daemon makes from its own network
+position, so a committed target has to be on loopback. `watch` has the daemon
+walk and watch the working directory recursively as itself, following
+symlinks, so a committed link out of the release reaches whatever it points
+at. All of them stay available in `Flockfile.override.toml`, which is the
+operator's.
+
 **Nothing bounds what a build reads out of its own release.** Gitignored files
 are symlinked into every release by design, which is what makes a `.env` work
 at runtime. A build command can therefore read every secret the app itself can
@@ -96,6 +111,11 @@ individual routes out of it, and why it is deferred.
 No credential handling of any kind. Git auth is inherited from the user the dog
 runs as, so a private repository behaves as it does in that user's own shell,
 and no token passes through any URL or argument this crate builds.
+
+One file of this crate's own holds secrets. `deploy.toml` records the app as
+the shepherd had it before adoption, `env` included, so that removal can put
+it back whole. It is written owner-only, the same mode shep uses for its own
+roll, which holds the same values.
 
 ## Reporting
 

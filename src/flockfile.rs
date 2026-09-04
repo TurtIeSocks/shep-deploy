@@ -18,18 +18,20 @@
 //! upstream already runs arbitrary code the moment this dog runs `bun
 //! install`'s postinstall or `make build`, and pinning `script` in an
 //! override does not stop that - it only stops a *later* pull from moving
-//! the pointer. `user` and `group` are different in kind, not degree. A
-//! build cannot escalate to another unix user on its own; the daemon
-//! choosing which user a sheep's process runs as is the one privilege a
-//! Flockfile can grant that the build itself never could. So a *committed*
-//! Flockfile is refused outright the moment it sets either field on any app
-//! it declares - see [`refuse_repo_privilege`] - and the check runs against
-//! the committed document alone, before the override is even read, so an
-//! override cannot make the refusal disappear by also touching the same
-//! key. The override itself is under no such restriction: it is the
-//! operator's own file, and pinning `user`/`group` there is exactly the
-//! "pin it so upstream can never change it" mechanism every other field
-//! already gets.
+//! the pointer. What a build cannot reach on its own is the SHEPHERD's uid,
+//! and a handful of Flockfile fields make the shepherd act at it: `user`
+//! and `group` choose the uid an app runs as, an `exec` probe is a command
+//! the shepherd runs itself, `out_file` and `err_file` are paths the
+//! shepherd opens and truncates itself, and an `http` or `tcp` probe is a
+//! connection the shepherd makes itself. So a *committed* Flockfile is
+//! refused outright the moment it sets any of those on any app it declares
+//! (a loopback probe target excepted) - see [`refuse_repo_privilege`] - and
+//! the check runs against the committed document alone, before the
+//! override is even read, so an override cannot make the refusal disappear
+//! by also touching the same key. The override itself is under no such
+//! restriction: it is the operator's own file, and pinning `user` or a log
+//! path there is exactly the "pin it so upstream can never change it"
+//! mechanism every other field already gets.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -421,45 +423,179 @@ fn parse(path: &Path, text: &str) -> Result<Value, Error> {
     })
 }
 
-/// The one real boundary this module enforces: refuses if any app declared
-/// in `committed` sets `user` or `group` at all, regardless of what value it
-/// names.
+/// The boundary this module enforces: refuses a committed Flockfile that
+/// sets any field the DAEMON acts on at its own uid, on any app it declares.
+///
+/// `user` and `group` were the whole list until 2026-09-04, on the theory
+/// that privilege was the one thing a build could not reach on its own. A
+/// read of shep-daemon found three more fields the daemon itself acts on,
+/// without ever dropping privilege, so a committed value reaches the
+/// shepherd's uid, which shep's own docs recommend be root:
+///
+/// - A `readiness_probe` or `liveness_probe` of kind `exec` is run by the
+///   daemon through `sh -c`, on the probe's interval (ten seconds by
+///   default), forever, with no uid drop at all. It ignores `user` even
+///   when the app sets one. A committed one is a root shell on a timer.
+/// - `out_file` and `err_file` are opened, created and appended to by the
+///   daemon's own log pump, and `shep flush` truncates them, at the
+///   daemon's uid. shep guards the final path component against a symlink
+///   and refuses a loosely owned ancestry, and nothing else: a committed
+///   `out_file = "/etc/cron.d/shep"` is appended to with whatever the app
+///   prints, and emptied on `shep flush`.
+/// - An `http` or `tcp` probe is connected to from the daemon's own network
+///   position. Only the verdict leaks, so it is a blind primitive rather
+///   than a read, and a committed target on loopback is the ordinary shape
+///   of a health check; one anywhere else is refused.
+/// - `watch` has the daemon watch the app's working directory recursively,
+///   as itself, following symlinks (notify's default). A committed link out
+///   of the release has a root shepherd walk and watch whatever it points
+///   at, up to the whole host, and restart the app on any change there.
 ///
 /// Takes the *committed* document specifically, never the merged one. If
 /// this ran against the merged document instead, a legitimate use of the
-/// mechanism - an operator pinning `user` in their own override - would
-/// look identical to the thing being refused, since the merged document
-/// would carry the key either way. Checking the committed document alone,
-/// before the override is even read, keeps the two apart: the committed
-/// file can never carry the key, full stop, and the override remains free
-/// to set it precisely because it is the operator's own file and never came
-/// from the repo.
+/// mechanism - an operator pinning `user` or a log path in their own
+/// override - would look identical to the thing being refused, since the
+/// merged document would carry the key either way. Checking the committed
+/// document alone, before the override is even read, keeps the two apart:
+/// the committed file can never carry these, full stop, and the override
+/// remains free to set them precisely because it is the operator's own file
+/// and never came from the repo.
+///
+/// What this does NOT do is refuse a committed Flockfile that OMITS `user`.
+/// That app runs at the daemon's uid, and so does its build; `build::run`
+/// warns about it and does not refuse, which is Rin's call: whether an app
+/// runs without a `user` is shep's and the operator's, not a deploy dog's.
 ///
 /// # Errors
-/// [`Error::Config`] naming the field and the app, if any app in `committed`
-/// sets `user` or `group`.
+/// [`Error::Config`] naming the field and the app, for the first app in
+/// `committed` that sets one of them.
 fn refuse_repo_privilege(committed: &Value) -> Result<(), Error> {
     for app in apps(committed) {
         let Some(table) = app.as_table() else {
             continue;
         };
+        let name = table
+            .get("name")
+            .and_then(Value::as_str)
+            .map(printable)
+            .unwrap_or_else(|| "<unnamed>".to_owned());
+        let refuse = |field: &str, why: &str| {
+            Error::Config(format!(
+                "Flockfile.toml sets `{field}` on app {name:?}: {why}. A committed Flockfile \
+                 can never set it, on any app, because the shepherd acts on it at its own uid \
+                 and a build cannot reach that on its own. Pin `{field}` in \
+                 Flockfile.override.toml instead - it is gitignored and never comes from the \
+                 repo."
+            ))
+        };
+
         for field in ["user", "group"] {
             if table.contains_key(field) {
-                let name = table
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unnamed>");
-                return Err(Error::Config(format!(
-                    "Flockfile.toml sets `{field}` on app {name:?} - a committed Flockfile can \
-                     never set user or group, on any app, because privilege is the one thing a \
-                     compromised build cannot escalate to on its own. Pin `{field}` in \
-                     Flockfile.override.toml instead - it is gitignored and never comes from the \
-                     repo."
-                )));
+                return Err(refuse(
+                    field,
+                    "privilege is the one thing a compromised build cannot escalate to",
+                ));
+            }
+        }
+        for field in ["out_file", "err_file"] {
+            if table.contains_key(field) {
+                return Err(refuse(
+                    field,
+                    "the shepherd opens, appends to and on `shep flush` truncates that path \
+                     itself, at its own uid, with no check on where it points",
+                ));
+            }
+        }
+        if table.contains_key("watch") {
+            return Err(refuse(
+                "watch",
+                "the shepherd watches the app's whole working directory itself, at its own \
+                 uid, following symlinks, so a committed link out of the release has it walk \
+                 and watch whatever the link points at",
+            ));
+        }
+        for field in ["readiness_probe", "liveness_probe"] {
+            // Presence first, shape second. serde deserialises a struct from a
+            // sequence as well as a table, so `readiness_probe = ["exec", "cmd"]`
+            // is a valid probe to shep, and a walk that only looked at tables
+            // let it through untouched. Measured 2026-09-04.
+            let Some(value) = table.get(field) else {
+                continue;
+            };
+            let Some(probe) = value.as_table() else {
+                return Err(refuse(
+                    field,
+                    "a probe the committed file spells as anything but a table is one this \
+                     check cannot read, and shep would accept it",
+                ));
+            };
+            let (Some(kind), Some(target)) = (
+                probe.get("kind").and_then(Value::as_str),
+                probe.get("target").and_then(Value::as_str),
+            ) else {
+                return Err(refuse(
+                    field,
+                    "a probe whose `kind` or `target` is not a string is one this check \
+                     cannot read",
+                ));
+            };
+            if kind == "exec" {
+                return Err(refuse(
+                    field,
+                    "an exec probe is run by the shepherd through `sh -c` on the probe's \
+                     interval, forever, at the shepherd's own uid and ignoring `user`",
+                ));
+            }
+            if !probes_loopback(kind, target) {
+                return Err(refuse(
+                    field,
+                    "the shepherd connects to the probe's target from its own network \
+                     position, so a committed target has to be on loopback: `127.0.0.1`, \
+                     `::1` or `localhost`",
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// Whether an `http` or `tcp` probe `target` names this host.
+///
+/// `http` targets are URLs and `tcp` targets are `host:port`; either way
+/// the host is what matters, and the daemon is the one connecting to it.
+/// Loopback by name or number, IPv4 or IPv6, with or without a port or a
+/// path. Anything the parser does not recognise is not loopback: the
+/// refusal costs an operator one line in their override, and a miss here
+/// costs a blind connection from the shepherd to wherever the commit said.
+fn probes_loopback(kind: &str, target: &str) -> bool {
+    let host_and_rest = match kind {
+        "http" => target
+            .split_once("://")
+            .map_or(target, |(_, rest)| rest)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(""),
+        "tcp" => target,
+        _ => return false,
+    };
+    // Strip credentials, then a port. An IPv6 literal is bracketed.
+    let host = host_and_rest.rsplit('@').next().unwrap_or("");
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                h
+            } else {
+                host
+            }
+        })
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host.starts_with("127.")
+            && host.split('.').count() == 4
+            && host.split('.').all(|octet| octet.parse::<u8>().is_ok())
 }
 
 /// Refuses a committed Flockfile that declares one app name twice.
@@ -632,6 +768,168 @@ mod tests {
             !shown.contains("SECRET"),
             "must not quote the file: {shown}"
         );
+    }
+
+    /// fails if a committed Flockfile can hand the shepherd a command to run
+    /// as itself. An `exec` probe is run by the daemon through `sh -c`, on
+    /// its interval, with no uid drop and no regard for `user`: a root shell
+    /// every ten seconds. Read out of shep-daemon on 2026-09-04.
+    #[test]
+    fn a_committed_exec_probe_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n[app.readiness_probe]\nkind = \
+             \"exec\"\ntarget = \"curl -fs http://127.0.0.1/health\"\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("an exec probe");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("readiness_probe") && shown.contains("sh -c"),
+            "{shown}"
+        );
+    }
+
+    /// fails if a probe spelled as a sequence walks past the check. serde
+    /// builds a struct from `["exec", "cmd"]` as readily as from a table,
+    /// and a walk that only read tables let exactly that through, with the
+    /// `exec` refusal and the loopback rule both defeated. Measured
+    /// 2026-09-04: `app_config` returned a `ProbeConfig { kind: Exec, .. }`.
+    #[test]
+    fn a_committed_probe_spelled_as_a_sequence_is_refused() {
+        for probe in [
+            "readiness_probe = [\"exec\", \"id > /tmp/pwn\"]",
+            "readiness_probe = [\"http\", \"http://metadata.internal/\"]",
+            "liveness_probe = \"exec\"",
+        ] {
+            let rel = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                rel.path().join("Flockfile.toml"),
+                format!("[[app]]\nname = \"web\"\nscript = \"./run\"\n{probe}\n"),
+            )
+            .expect("committed");
+
+            let err = app_config(rel.path(), "web", &[]).expect_err(probe);
+            assert!(err.to_string().contains("_probe"), "{probe}: {err}");
+        }
+    }
+
+    /// fails if a committed `watch` reaches the shepherd. It watches the
+    /// working directory as itself, following symlinks, so a committed link
+    /// out of the release has it walk whatever the link points at.
+    #[test]
+    fn a_committed_watch_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\nwatch = true\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("watch");
+        assert!(err.to_string().contains("`watch`"), "{err}");
+    }
+
+    /// fails if a committed Flockfile can point the shepherd's log pump at a
+    /// path of its choosing. The daemon opens and appends to `out_file` at
+    /// its own uid and `shep flush` truncates it, with no check on where it
+    /// points.
+    #[test]
+    fn a_committed_log_path_is_refused() {
+        for field in ["out_file", "err_file"] {
+            let rel = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                rel.path().join("Flockfile.toml"),
+                format!(
+                    "[[app]]\nname = \"web\"\nscript = \"./run\"\n{field} = \"/etc/cron.d/x\"\n"
+                ),
+            )
+            .expect("committed");
+
+            let err = app_config(rel.path(), "web", &[]).expect_err(field);
+            let shown = err.to_string();
+            assert!(
+                shown.contains(field) && shown.contains("truncates"),
+                "{shown}"
+            );
+        }
+    }
+
+    /// fails if a committed probe can send the shepherd's connection
+    /// anywhere but this host, or if a loopback one is refused. A health
+    /// check of the app itself is on loopback; the cloud metadata address is the
+    /// cloud metadata service, reached from the daemon's network position.
+    #[test]
+    fn a_committed_network_probe_must_target_loopback() {
+        let refused = [
+            ("http", "http://metadata.internal/latest/meta-data"),
+            ("http", "http://internal.example:8080/"),
+            ("tcp", "192.0.2.5:5432"),
+            ("tcp", "db:5432"),
+            ("http", "http://127.0.0.1.evil.example/"),
+            ("http", "http://localhost@evil.example/"),
+        ];
+        for (kind, target) in refused {
+            assert!(
+                !probes_loopback(kind, target),
+                "{kind} {target} must be refused"
+            );
+        }
+        let allowed = [
+            ("http", "http://127.0.0.1:3000/health"),
+            ("http", "http://localhost/health?deep=1"),
+            ("http", "https://[::1]:8443/"),
+            ("http", "http://user:pw@127.0.0.1/"),
+            ("tcp", "127.0.0.1:5432"),
+            ("tcp", "localhost:6379"),
+            ("tcp", "[::1]:80"),
+        ];
+        for (kind, target) in allowed {
+            assert!(
+                probes_loopback(kind, target),
+                "{kind} {target} must be allowed"
+            );
+        }
+
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n[app.readiness_probe]\nkind = \
+             \"http\"\ntarget = \"http://metadata.internal/\"\n",
+        )
+        .expect("committed");
+        let err = app_config(rel.path(), "web", &[]).expect_err("off-host target");
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    /// fails if the operator's own override loses any of the fields the
+    /// committed file is refused. The override is the operator's, and
+    /// these are exactly the things they pin there.
+    #[test]
+    fn the_operators_override_may_set_every_refused_field() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::fs::write(
+            checkout.path().join(OVERRIDE),
+            "[[app]]\nname = \"web\"\nuser = \"svc\"\nout_file = \"/var/log/web.log\"\n\
+             [app.readiness_probe]\nkind = \"exec\"\ntarget = \"./healthy\"\n",
+        )
+        .expect("the operator's override");
+        std::os::unix::fs::symlink(checkout.path().join(OVERRIDE), rel.path().join(OVERRIDE))
+            .expect("linked in");
+
+        let app = app_config(rel.path(), "web", &[PathBuf::from(OVERRIDE)])
+            .expect("the operator may set all of them");
+        assert_eq!(app.user.as_deref(), Some("svc"));
+        assert_eq!(app.out_file.as_deref(), Some("/var/log/web.log"));
+        assert!(app.readiness_probe.is_some());
     }
 
     /// fails if a committed Flockfile naming one app twice is accepted.

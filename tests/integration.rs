@@ -245,14 +245,55 @@ fn app_toml(home: &Path, with_cwd: bool, readiness: Readiness, extra: &str) -> S
         String::new()
     };
     let gate = match readiness {
-        Readiness::Probe => format!(
-            "\n[app.readiness_probe]\nkind = \"exec\"\ntarget = \"test -f \
-             {marker}\"\ninterval = \"1s\"\ntimeout = \"2s\"\nfailure_threshold = 1\n",
-            marker = current.join("ready-marker").display(),
-        ),
+        Readiness::Probe => probe_toml(home),
         Readiness::Heuristic(listen) => format!("listen_timeout = \"{listen}s\"\n"),
     };
     format!("[[app]]\nname = \"web\"\nscript = \"./run.sh\"\n{cwd}{extra}{gate}")
+}
+
+/// The exec probe every probed fixture uses: `test -f` on a marker reached
+/// THROUGH `current`, so a release that ships the marker can become ready
+/// and one that does not never can.
+fn probe_toml(home: &Path) -> String {
+    let current = home.join("deploy/web/current");
+    format!(
+        "\n[app.readiness_probe]\nkind = \"exec\"\ntarget = \"test -f \
+         {marker}\"\ninterval = \"1s\"\ntimeout = \"2s\"\nfailure_threshold = 1\n",
+        marker = current.join("ready-marker").display(),
+    )
+}
+
+/// Writes the app into `dir` the way an operator's repository carries it:
+/// `Flockfile.toml` with the script and nothing the dog refuses in a
+/// committed file, and, for a probed app, the probe in
+/// `Flockfile.override.toml` with a `.gitignore` that keeps it out of the
+/// commit.
+///
+/// The split is the dog's own rule, not a test convenience: an `exec` probe
+/// is run by the shepherd at its own uid and ignores `user`, so a committed
+/// one is refused, and the override is where an operator puts theirs. The
+/// deploy links the ignored override in from the checkout, which for these
+/// fixtures is `dir` itself, and honours the probe from there.
+///
+/// `tail` is appended after the app table, for a `[dog.deploy.build]` block.
+fn write_committed_app(dir: &Path, home: &Path, readiness: Readiness, extra: &str, tail: &str) {
+    let gate = match readiness {
+        Readiness::Probe => String::new(),
+        Readiness::Heuristic(listen) => format!("listen_timeout = \"{listen}s\"\n"),
+    };
+    fs::write(
+        dir.join("Flockfile.toml"),
+        format!("[[app]]\nname = \"web\"\nscript = \"./run.sh\"\n{extra}{gate}{tail}"),
+    )
+    .expect("write Flockfile");
+    if matches!(readiness, Readiness::Probe) {
+        fs::write(dir.join(".gitignore"), "Flockfile.override.toml\n").expect("write .gitignore");
+        fs::write(
+            dir.join("Flockfile.override.toml"),
+            format!("[[app]]\nname = \"web\"\n{}", probe_toml(home)),
+        )
+        .expect("write the operator's override");
+    }
 }
 
 /// How a test's app reports itself ready.
@@ -301,11 +342,7 @@ fn origin_with_app(
     git(origin.path(), &["init", "-q", "-b", "main"]);
     git(origin.path(), &["config", "user.email", "test@example.com"]);
     git(origin.path(), &["config", "user.name", "test"]);
-    fs::write(
-        origin.path().join("Flockfile.toml"),
-        app_toml(home, false, readiness, extra),
-    )
-    .expect("write Flockfile");
+    write_committed_app(origin.path(), home, readiness, extra, "");
     fs::write(origin.path().join("ready-marker"), "").expect("write ready-marker");
     write_run_script(origin.path(), version);
     git(origin.path(), &["add", "."]);
@@ -468,6 +505,15 @@ fn register_from_checkout(shepherd: &Shepherd, origin: &Path) -> tempfile::TempD
             ".",
         ],
     );
+    // The operator's own override, with the probe, sits beside their
+    // checkout's Flockfile: the deploy links it in from here, since this
+    // clone is the checkout `setup` records. The committed `.gitignore`
+    // keeps it out of every commit, which is what makes it theirs.
+    fs::write(
+        checkout.path().join("Flockfile.override.toml"),
+        format!("[[app]]\nname = \"web\"\n{}", probe_toml(shepherd.home())),
+    )
+    .expect("write the operator's override");
     let path = checkout.path().join("Flockfile.toml");
     fs::write(
         &path,
@@ -675,14 +721,13 @@ fn a_failing_build_leaves_the_previous_release_serving() {
     });
     let live_pid = described_pid(&shepherd, "web").expect("a pid");
 
-    fs::write(
-        origin.path().join("Flockfile.toml"),
-        format!(
-            "{}\n[dog.deploy.build]\ncommand = 'exit 3'\n",
-            app_toml(shepherd.home(), false, Readiness::Probe, "")
-        ),
-    )
-    .expect("write a failing build");
+    write_committed_app(
+        origin.path(),
+        shepherd.home(),
+        Readiness::Probe,
+        "",
+        "\n[dog.deploy.build]\ncommand = 'exit 3'\n",
+    );
     git(origin.path(), &["add", "."]);
     git(origin.path(), &["commit", "-q", "-m", "broken"]);
 
