@@ -68,7 +68,10 @@ rather than ignored and silently building nothing.
    sha.
 2. `git worktree add` the new sha, sharing the object store.
 3. Symlink the shared files in: whatever git ignores and `.shepignore` does
-   not.
+   not. A `.shepignore` line is a bare name, matched at any depth, or a path
+   with a `/` in it, anchored to the checkout. A leading `/` anchors too and
+   a trailing `/` is dropped, as in `.gitignore`; a glob, a `!` negation or a
+   `..` is refused by name rather than matched against nothing.
 4. Run the build, as the app's `user` if it sets one.
 5. `rename(2)` `current` onto the new release.
 6. `Reload` the sheep.
@@ -129,11 +132,18 @@ passthrough = ["CARGO_HOME"]
 All five are read once, when the dog starts, so changing any takes a `shep
 restart deploy`.
 
-`retention` is how many releases each target keeps **besides the live one**, so
-a target holds up to `retention + 1` directories. The live release is spared
-unconditionally, whatever its age. It cannot be below 2: the release a failed
-deploy rolls back to is the second newest, so anything lower would silently
-disable rollback, and it is refused rather than clamped.
+`retention` is how many of the newest releases each target keeps. Two are
+spared whatever their age: the one `current` points at, and the one
+`deploy.toml` names. They are the same release except after a deploy died
+between its swap and its record write, so a target holds `retention`
+directories in the ordinary case and up to two more after that. It cannot be
+below 2: the release a failed deploy rolls back to is the second newest, so
+anything lower would silently disable rollback, and it is refused rather than
+clamped.
+
+`interval`, `git_timeout` and `build_timeout` are refused under a second. A
+bare number is milliseconds, so `interval = "30"` is thirty milliseconds and a
+dog fetching thirty times a second; write `"30s"`.
 
 `git_timeout` bounds the fetch, which is the only git call that talks to a network. The rest operate on local directories and cannot hang on a remote. Targets are deployed one at a
 time, so without it a remote that drops packets rather than refusing them stops
@@ -150,7 +160,9 @@ per-target failure, not to put a schedule on slow work. A build past it is
 killed as a process group, so whatever the build command started goes with it.
 
 `passthrough` names environment variables a build may keep from the dog's own
-environment. See Security below for why that list starts empty.
+environment. See Security below for why that list starts empty. An entry that
+is not a variable name, or is listed twice, is refused; one that names a
+variable the dog was not started with is said at build time, once per build.
 
 One target's failure never stops the others, and never stops the dog. Each
 target's outcome is reported on its own and the loop carries on. `up to date`
@@ -370,6 +382,12 @@ a build lets the build authenticate as you anywhere that agent is trusted.
 Fetching happens in the dog's own process and keeps its own environment, so a
 private repository still clones; only the build loses the socket. Name it in
 `passthrough` if a build genuinely needs it.
+
+The release's own `Flockfile.toml` is read in the dog's process too, before
+any build drops to `user`, so a committed one that is a symlink is refused
+unread, and a parse error names a line number and never quotes the line. Your
+`Flockfile.override.toml` is the one file that is followed through its link,
+because this dog made that link.
 
 `build.artifacts` may only name paths that really land inside the release or
 the dog's own build cache, resolved rather than spelled. A `..`, an absolute
