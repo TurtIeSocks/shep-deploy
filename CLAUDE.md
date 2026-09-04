@@ -217,7 +217,10 @@ class rather than the instances.
   record lock, blocking, held for one read and one write of `deploy.toml`:
   `set_watch` and every whole-record write in `deploy` and `optin` take it.
   A deploy takes the tree lock first and the record lock inside; nothing
-  holding the record lock waits for the tree's.
+  holding the record lock waits for the tree's. The cutover's final write
+  adopts `verify` from disk and deliberately not `watch`: `prepare` wrote
+  `manual` and that write is the promotion to `auto`, so a `--watch manual`
+  typed during setup is overwritten and belongs after setup returns.
 - **A build's process group is led by a holder, not by the build.** `sh -c
   'read _'` on a pipe the dog holds, so the group id stays reserved after the
   build is reaped and `killpg` cannot land on a recycled pid. Never signal a

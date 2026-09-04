@@ -359,7 +359,10 @@ pub async fn prepare<D: Daemon>(
     // `swap::point_at`'s own atomicity claim rests on its doc rather than
     // on a test.
     swap::point_at(&tree.current(), &release)?;
-    state.write(&tree.state_file())?;
+    // Under the record lock like every other write of the record, though
+    // nothing can race a record that does not exist yet: one rule is easier
+    // to keep true than one rule with an exception.
+    lock::hold_record(&tree).and_then(|_record| state.write(&tree.state_file()))?;
 
     Ok(Prepared {
         hold,
@@ -402,6 +405,11 @@ pub async fn prepare<D: Daemon>(
 /// [`State::write`] failing is the mild one, and it is passed through. The
 /// release is serving and only the record is missing, which the next
 /// `shep-deploy deploy` writes.
+///
+/// A `verify` the operator edited in the record while the cutover ran is
+/// kept; a `--watch manual` typed while it ran is not, because the record
+/// already said `manual` from [`prepare`] and the two cannot be told
+/// apart. Run it after setup returns.
 ///
 /// A cutover that lands with nothing stranded promotes the record's `watch`
 /// from the `manual` [`prepare`] wrote to `auto`, which is what makes the
@@ -506,8 +514,23 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
             // operator costs an instance respawned on the old config on every
             // deploy from now on, so the write's failure is printed rather
             // than allowed to replace the error that names them.
-            let written =
-                lock::hold_record(&tree).and_then(|_record| state.write(&tree.state_file()));
+            //
+            // `verify` is the operator's, hand-edited in the record, and a
+            // first build can take an hour: an edit made during it is taken
+            // from the disk rather than written over by this process's copy
+            // from `prepare`. `watch` is deliberately NOT taken from the
+            // disk. `prepare` wrote `manual` so the poll loop leaves the
+            // tree alone until it has been served from, and the line above
+            // is the promotion out of that; a `--watch manual` typed during
+            // setup reads the same as the `manual` `prepare` wrote, and is
+            // overwritten. Setup is a command the operator is sitting at;
+            // `--watch manual` after it returns is the way to keep it.
+            let written = lock::hold_record(&tree).and_then(|_record| {
+                if let Ok(on_disk) = State::read(&tree.state_file()) {
+                    state.verify = on_disk.verify;
+                }
+                state.write(&tree.state_file())
+            });
             if let Err(err) = written {
                 if outcome.is_ok() {
                     return Err(err);
@@ -1744,6 +1767,26 @@ mod tests {
             current.to_str(),
             "cwd must be the current symlink itself, not a release and not None"
         );
+    }
+
+    /// fails if a `verify` the operator edited during the cutover is written
+    /// over by the cutover's own copy from `prepare`. A first build can take
+    /// an hour, and the record is the file they are told to edit.
+    #[tokio::test(start_paused = true)]
+    async fn a_verify_edited_during_the_cutover_survives_its_record_write() {
+        let (daemon, prepared, _dirs) = cutover_fixture().await;
+        let path = prepared.tree.state_file();
+        let mut edited = State::read(&path).expect("the record prepare wrote");
+        assert_eq!(edited.verify, Verify::Probed, "the default before the edit");
+        edited.verify = Verify::Alive;
+        edited.write(&path).expect("the operator's edit");
+
+        cut_over(&daemon, prepared).await.expect("cuts over");
+
+        let after = State::read(&path).expect("reads");
+        assert_eq!(after.verify, Verify::Alive, "the edit survives");
+        assert_eq!(after.watch, Watch::Auto, "and the promotion still lands");
+        assert!(after.deployed.is_some());
     }
 
     /// fails if a Flockfile that names no `interpreter` is registered with
