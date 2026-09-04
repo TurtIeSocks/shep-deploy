@@ -25,8 +25,8 @@
 //! lift this into a library and it starts firing, at which point the
 //! trade-off wants deciding rather than silencing.
 //!
-//! Do not add trait methods speculatively. These eight are the surface plan
-//! one and plan two need between them, not eight that looked useful:
+//! Do not add trait methods speculatively. These nine are the surface plan
+//! one and plan two need between them, not nine that looked useful:
 //! `list_flock`, `describe` and `reload` are exercised inside plan one
 //! (`adopted_name` below, probe-based verification, and the deploy
 //! sequence). `dog_config` reads the `[dog.<name>]` section that names the
@@ -67,7 +67,7 @@ use crate::error::Error;
 
 /// Everything this dog asks the shepherd for.
 ///
-/// Narrow on purpose: eight methods cover the whole plan, and each is written
+/// Narrow on purpose: nine methods cover the whole plan, and each is written
 /// against whatever the shepherd itself calls the operation (`shep reload`,
 /// `shep restart`, ...) rather than against this crate's own vocabulary for
 /// it, so a reader who knows shep already knows what each one does.
@@ -362,9 +362,15 @@ fn named(response: &Response) -> String {
         Response::SmitPainted(flock) => format!("a SmitPainted of {}", flock.len()),
         // `Response` is `#[non_exhaustive]`, so this arm is not optional. A
         // variant added to the protocol after this dog was written is
-        // exactly the one worth naming, and only `Debug` can name it.
-        // Truncated, because some of them are listings.
-        other => format!("{other:?}").chars().take(60).collect(),
+        // exactly the one worth naming, and only `Debug` can name it. Only
+        // the name: `Debug` goes on to print the body, and a variant nobody
+        // here has reviewed is exactly the one whose body might carry a
+        // credential, as `DogSection`'s does. The first run of identifier
+        // characters is the variant's name and nothing else.
+        other => format!("{other:?}")
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect(),
     }
 }
 
@@ -544,7 +550,7 @@ mod tests {
 
     /// fails if `unexpected` stops saying which request the answer was to.
     /// "a Flock of 2" alone does not tell an operator which call went
-    /// wrong, and this dog makes eight different ones.
+    /// wrong, and this dog makes nine different ones.
     #[test]
     fn an_unexpected_answer_names_the_request_it_answered() {
         let err = unexpected("Reload", &Response::Flock(Vec::new()));
