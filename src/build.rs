@@ -900,12 +900,19 @@ pub async fn run(
 
     // Resolved once for every artifact rather than once per artifact:
     // `canonicalize` walks the whole chain and the two roots do not change.
+    // The copies run off the runtime's thread: a release binary can be
+    // hundreds of megabytes, and copying it on the one thread stalled the
+    // signal handler and the client's reconnect for the duration. See
+    // `shared::off_thread`.
     let roots = artifact_roots(release, cache);
-    for artifact in &spec.artifacts {
-        copy_artifact(release, &roots, &spec.env, artifact)?;
-    }
-
-    Ok(())
+    let (release, env, artifacts) = (release.to_owned(), spec.env.clone(), spec.artifacts.clone());
+    crate::shared::off_thread(move || {
+        for artifact in &artifacts {
+            copy_artifact(&release, &roots, &env, artifact)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// The two places an artifact may really land, resolved: the release and

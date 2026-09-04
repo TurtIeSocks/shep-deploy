@@ -62,6 +62,7 @@ use tokio::time::{Instant, sleep};
 use shep_client::RequestError;
 use shep_client::shep_core::config::AppConfig;
 
+use crate::build::BuildSpec;
 use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::error::Error;
@@ -345,7 +346,11 @@ async fn go<D: Daemon>(
 
     let started_at = swap::resolve(&tree.current())?;
 
-    git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
+    // Off the runtime's thread: see `shared::off_thread` for what a fetch on
+    // it used to stall. `run_git_within` bounds the wait; this keeps the
+    // dog answering during it.
+    let (git_dir, remote, budget) = (tree.git(), state.remote.clone(), config.git_timeout);
+    shared::off_thread(move || git::fetch(&git_dir, &remote, budget)).await?;
     let head = head_of(tree, &state.branch)?;
     if state.deployed.as_deref() == Some(head.as_str()) {
         return Ok(Outcome::UpToDate);
@@ -362,8 +367,42 @@ async fn go<D: Daemon>(
     }
 
     let outcome = attempt(daemon, tree, state, &head, started_at, config).await;
-    record(tree, state, &head, &outcome, config.retention);
+    record(tree, state, &head, &outcome, config.retention).await;
     outcome
+}
+
+/// Everything between a sha and its build: the worktree, the cache link,
+/// the operator's shared files, and the two Flockfiles read once.
+///
+/// One function because two callers, [`attempt`] and
+/// [`crate::optin::prepare`], had the same seven lines, and because all of
+/// it is blocking work (git, symlinks, file reads) that both run through
+/// [`shared::off_thread`]. Answers the app to register and the build to
+/// run.
+///
+/// # Errors
+/// Whatever [`checkout_release`], [`shared::link_cache`],
+/// [`shared::to_link`], [`shared::link_into`] and [`flockfile::read`]
+/// return, plus the app-selection and schema failures of
+/// [`flockfile::Merged::app_config`] and [`flockfile::Merged::build_spec`].
+pub(crate) fn stage_release(
+    tree: &Tree,
+    checkout: &Path,
+    sha: &str,
+) -> Result<(AppConfig, BuildSpec), Error> {
+    let release = tree.release(sha);
+    checkout_release(tree, sha)?;
+    shared::link_cache(&release, &tree.cache_target())?;
+    // Held, not recomputed. This is the only record of which files came from
+    // the operator's own checkout rather than from the repository, and
+    // `flockfile` needs it to know whether an override is theirs.
+    let shared_paths = shared::to_link(checkout)?;
+    shared::link_into(&release, checkout, &shared_paths)?;
+
+    let flockfiles = flockfile::read(&release, &shared_paths)?;
+    let app = flockfiles.app_config(tree.sheep())?;
+    let spec = flockfiles.build_spec()?;
+    Ok((app, spec))
 }
 
 /// Checks `sha` out at `release`, unless a FINISHED checkout is already there.
@@ -443,18 +482,11 @@ async fn attempt<D: Daemon>(
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
     let release = tree.release(head);
-    checkout_release(tree, head)?;
-    shared::link_cache(&release, &tree.cache_target())?;
-    // Held, not recomputed. This is the only record of which files came from
-    // the operator's own checkout rather than from the repository, and
-    // `flockfile` needs it to know whether an override is theirs.
-    let shared_paths = shared::to_link(&state.checkout)?;
-    shared::link_into(&release, &state.checkout, &shared_paths)?;
-
-    let flockfiles = flockfile::read(&release, &shared_paths)?;
-    let app = flockfiles.app_config(sheep)?;
+    let (app, spec) = {
+        let (tree, checkout, head) = (tree.clone(), state.checkout.clone(), head.to_owned());
+        shared::off_thread(move || stage_release(&tree, &checkout, &head)).await?
+    };
     refuse_ungated_verification(sheep, &app, state.verify)?;
-    let spec = flockfiles.build_spec()?;
     build::run(
         sheep,
         &release,
@@ -579,7 +611,7 @@ async fn attempt<D: Daemon>(
 /// decided and true - what a lost write costs is one more attempt at the
 /// same sha - and the prune failure has always been reported this way; see
 /// [`crate::retention`]'s own doc.
-fn record(
+async fn record(
     tree: &Tree,
     state: &mut State,
     head: &str,
@@ -621,7 +653,20 @@ fn record(
         .into_iter()
         .chain(on_disk.as_deref())
         .collect();
-    if let Err(err) = retention::prune(tree, keep, &spared) {
+    // `git worktree remove` per doomed release, off the runtime's thread
+    // like every other git call.
+    let pruned = {
+        let (tree, spared): (Tree, Vec<String>) = (
+            tree.clone(),
+            spared.iter().map(|sha| (*sha).to_owned()).collect(),
+        );
+        shared::off_thread(move || {
+            let spared: Vec<&str> = spared.iter().map(String::as_str).collect();
+            retention::prune(&tree, keep, &spared)
+        })
+        .await
+    };
+    if let Err(err) = pruned {
         eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
     }
 }
@@ -1902,7 +1947,8 @@ mod tests {
             &second,
             &Err(Error::Protocol("lost the checkout race".to_owned())),
             fixtures::dog_config().retention,
-        );
+        )
+        .await;
 
         let written = State::read(&fixture.tree.state_file()).expect("still readable");
         assert_eq!(
@@ -2763,8 +2809,8 @@ mod tests {
     /// fails if `record`'s own write, the one a FAILED deploy makes, puts
     /// back a `watch` the operator changed while it ran. The landed case
     /// has its own test above; this drives `record` directly.
-    #[test]
-    fn a_failed_deploys_record_write_keeps_the_watch_the_operator_set_meanwhile() {
+    #[tokio::test]
+    async fn a_failed_deploys_record_write_keeps_the_watch_the_operator_set_meanwhile() {
         let fixture = fixture_with_previous_release();
         // The copy a deploy holds from its first read: watched.
         let mut in_flight = fixture.state.clone();
@@ -2784,7 +2830,8 @@ mod tests {
             fixtures::OTHER_SHA,
             &failed,
             5,
-        );
+        )
+        .await;
 
         let written = State::read(&fixture.tree.state_file()).expect("reads");
         assert_eq!(
@@ -2803,8 +2850,8 @@ mod tests {
     /// a verified deploy whose record could not be written. Memory names the
     /// new sha then, disk still names the old one, and the old one is what
     /// the next run rolls back to.
-    #[test]
-    fn the_release_the_disk_record_names_is_spared_after_a_lost_write() {
+    #[tokio::test]
+    async fn the_release_the_disk_record_names_is_spared_after_a_lost_write() {
         let mut fixture = fixture_with_previous_release();
         let old = fixture.state.deployed.clone().expect("a previous release");
         // Three newer releases, all fresher than `old`, so that with
@@ -2824,7 +2871,7 @@ mod tests {
         fixture.state.deployed = Some(newest.clone());
 
         let landed: Result<Outcome, Error> = Ok(Outcome::Deployed { sha: newest });
-        record(&fixture.tree, &mut fixture.state, "unused", &landed, 2);
+        record(&fixture.tree, &mut fixture.state, "unused", &landed, 2).await;
 
         assert!(
             fixture.tree.release(&old).is_dir(),

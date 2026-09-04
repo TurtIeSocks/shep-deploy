@@ -60,10 +60,13 @@ use crate::error::Error;
 /// `wait_with_output` does internally and the reason it cannot be used here:
 /// it also waits, and waiting is what this function needs to bound.
 ///
-/// Residual, stated rather than hidden: this still occupies the caller for up
-/// to `budget`. The runtime is single-threaded, so a target whose remote is a
-/// black hole delays the others by that much. Bounded and reported beats
-/// unbounded and silent, which is the whole of what this buys.
+/// Residual, stated rather than hidden: this still occupies its caller for up
+/// to `budget`, and the poll loop deploys targets one at a time, so a target
+/// whose remote is a black hole delays the others by that much. It no longer
+/// occupies the RUNTIME: every caller runs it through [`off_thread`], so a
+/// stop, a refused handshake or the client's reconnect are all still served
+/// while it waits. Bounded and reported beats unbounded and silent, which is
+/// the whole of what this buys.
 ///
 /// # Errors
 /// [`Error::Git`] naming the command and a `None` status if `budget` elapses
@@ -282,6 +285,37 @@ fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8
         let _ = tx.send(buf);
     });
     rx
+}
+
+/// Runs `work` on tokio's blocking pool and answers with its result.
+///
+/// Every git call in this crate is a blocking `std::process::Command`, and
+/// the artifact copy is blocking I/O. Run on the runtime's one thread, each
+/// stalled everything else polled on it for its whole duration: a five
+/// minute fetch against a remote that drops packets meant five minutes in
+/// which a `SIGTERM` went unanswered, a refused handshake went unnoticed and
+/// the client's reconnect could not run. On the pool, the runtime keeps
+/// turning and the caller alone waits.
+///
+/// A panic inside `work` is re-raised here rather than turned into an
+/// error, so it reaches the poll loop's own guard and is reported as the
+/// bug it is. The only other way a blocking task ends without a result is
+/// the runtime shutting down underneath it, which is the process ending.
+///
+/// # Errors
+/// Whatever `work` returns.
+pub(crate) async fn off_thread<T, F>(work: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(join) => match join.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(join) => panic!("a blocking task was cancelled: {join}"),
+        },
+    }
 }
 
 /// `O_NOFOLLOW`, without a libc dependency or an unsafe block.
@@ -751,6 +785,54 @@ pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use crate::fixtures;
+
+    /// fails if `off_thread` stops passing a result through, or turns a
+    /// panic into an error. The poll loop's guard is what should see a
+    /// panic, so it has to leave here as one.
+    #[tokio::test]
+    async fn off_thread_answers_with_the_result_and_re_raises_a_panic() {
+        let answered = off_thread(|| Ok::<_, Error>(41 + 1))
+            .await
+            .expect("passes through");
+        assert_eq!(answered, 42);
+
+        let refused = off_thread(|| Err::<(), _>(Error::Config("no".to_owned())))
+            .await
+            .expect_err("passes the error through");
+        assert!(matches!(refused, Error::Config(_)));
+
+        let caught = std::panic::AssertUnwindSafe(off_thread(|| -> Result<(), Error> {
+            panic!("inside the pool");
+        }));
+        let outcome = futures_catch(caught).await;
+        assert!(outcome.is_err(), "the panic must come out as a panic");
+    }
+
+    /// `catch_unwind` for a future, the same dozen lines `crate::poll`
+    /// keeps, spelled here so this module's test does not reach into that
+    /// one's.
+    async fn futures_catch<F: std::future::Future>(
+        fut: std::panic::AssertUnwindSafe<F>,
+    ) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        struct Catch<F>(Pin<Box<F>>);
+        impl<F: Future> Future for Catch<F> {
+            type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let inner = &mut self.get_mut().0;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inner.as_mut().poll(cx)
+                })) {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(v)) => Poll::Ready(Ok(v)),
+                    Err(payload) => Poll::Ready(Err(payload)),
+                }
+            }
+        }
+        Catch(Box::pin(fut.0)).await
+    }
 
     /// fails if a chatty-but-healthy git subprocess is killed as if it hung.
     ///

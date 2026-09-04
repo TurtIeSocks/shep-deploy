@@ -365,12 +365,14 @@ fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str
 /// rebuild and repairs itself, which is the right shape of failure for a
 /// signal that means "stop now".
 ///
-/// It can also be deferred, which is a separate matter and not this
-/// module's to fix: `git` runs through blocking `std::process::Command` on
-/// a current-thread runtime, so nothing else is polled while a fetch is in
-/// flight. A fetch against a host that is not answering is bounded by
-/// `DogConfig::git_timeout` (five minutes by default), so it fails that one
-/// target like any other error rather than wedging the loop.
+/// It is not deferred by a git call any more. Every git call and the
+/// artifact copy run on tokio's blocking pool (`shared::off_thread`), so a
+/// stop arriving during a five-minute fetch is answered at once: this
+/// future is dropped, `main` gives the pool a second to wind down, and the
+/// fetch's own git process finishes or times out on its own after the dog
+/// has gone. A fetch against a host that is not answering is still bounded
+/// by `DogConfig::git_timeout`, so it fails that one target like any other
+/// error rather than holding the loop.
 pub async fn run<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Result<(), Error> {
     run_with(
         daemon,

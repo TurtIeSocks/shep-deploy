@@ -53,7 +53,6 @@ use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::deploy::RELOAD_DEADLINE_SLACK;
 use crate::error::Error;
-use crate::flockfile;
 use crate::git;
 use crate::lock;
 use crate::paths::Tree;
@@ -112,7 +111,8 @@ pub struct Prepared {
 /// working directory for it. Otherwise, whatever [`roll::registered`],
 /// [`git::remote_url`], [`git::current_branch`], [`git::init_bare`],
 /// [`git::fetch`], [`git::remote_head`], [`git::worktree_add`],
-/// [`shared::link_cache`], [`shared::link_into`], [`flockfile::read`],
+/// [`crate::deploy::stage_release`] (the worktree, the cache link, the shared
+/// files and both Flockfiles),
 /// [`build::run`] or [`swap::point_at`] return.
 pub async fn prepare<D: Daemon>(
     daemon: &D,
@@ -311,29 +311,25 @@ pub async fn prepare<D: Daemon>(
 
     std::fs::create_dir_all(tree.releases()).map_err(Error::at(tree.releases()))?;
     git::init_bare(&tree.git())?;
-    git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
+    // Off the runtime's thread, like every git call: see `shared::off_thread`.
+    let (git_dir, remote, budget) = (tree.git(), state.remote.clone(), config.git_timeout);
+    shared::off_thread(move || git::fetch(&git_dir, &remote, budget)).await?;
     let sha = git::remote_head(&tree.git(), &state.branch)?;
 
     let release = tree.release(&sha);
-    // Shared with `deploy::attempt` rather than a bare `worktree_add`, and
-    // that is what makes this function's own retry story true. `git worktree
-    // add` refuses a path that already exists ("fatal: `<path>` already
-    // exists") and refuses one it still has registered after the directory
-    // was removed ("missing but already registered worktree"). So every run
-    // that died anywhere from here onward left a release directory that made
-    // the next run fail on git rather than resume, which is the opposite of
-    // what the doc above promises.
-    crate::deploy::checkout_release(&tree, &sha)?;
-    shared::link_cache(&release, &tree.cache_target())?;
-    // Held, not recomputed. This is the only record of which files came from
-    // the operator's own checkout rather than from the repository, and
-    // `flockfile` needs it to know whether an override is theirs.
-    let shared_paths = shared::to_link(&state.checkout)?;
-    shared::link_into(&release, &state.checkout, &shared_paths)?;
-
-    let flockfiles = flockfile::read(&release, &shared_paths)?;
-    let app = flockfiles.app_config(sheep)?;
-    let spec = flockfiles.build_spec()?;
+    // Shared with `deploy::attempt`, and that is what makes this function's
+    // own retry story true: `stage_release` goes through `checkout_release`,
+    // which reuses a finished checkout and replaces a partial one. `git
+    // worktree add` alone refuses a path that already exists ("fatal:
+    // `<path>` already exists") and refuses one it still has registered
+    // after the directory was removed ("missing but already registered
+    // worktree"), so every run that died anywhere from here onward left a
+    // release directory that made the next run fail on git rather than
+    // resume, which is the opposite of what the doc above promises.
+    let (app, spec) = {
+        let (tree, checkout, sha) = (tree.clone(), state.checkout.clone(), sha.clone());
+        shared::off_thread(move || crate::deploy::stage_release(&tree, &checkout, &sha)).await?
+    };
     build::run(
         sheep,
         &release,
