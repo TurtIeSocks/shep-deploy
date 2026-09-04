@@ -283,7 +283,7 @@ macro_rules! daemon_methods {
         async fn start(
             &self,
             _apps: Vec<shep_client::shep_core::config::AppConfig>,
-        ) -> Result<(), crate::error::Error> {
+        ) -> Result<Vec<u32>, crate::error::Error> {
             $body
         }
     };

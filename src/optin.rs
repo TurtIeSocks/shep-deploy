@@ -842,21 +842,19 @@ async fn undo_start<D: Daemon>(
     // Individual failures are recorded rather than returned: this path is
     // already failing, and an operator needs the reason they got here
     // rather than a second error about the cleanup.
-    let seen: Vec<u32> = flock.iter().map(|info| info.id).collect();
     let mut removed = drain(daemon, &flock, previous).await;
 
     let patience = cutover_budget(&original);
-    // How many the repair `Start` spawns: one per instance the original
-    // config asks for. Waiting for the first and draining that listing left
-    // the rest registered whenever they appeared on a later poll, with
-    // `removed` reporting true.
-    let wanted = usize::try_from(original.instances.max(1)).unwrap_or(1);
-    if daemon.start(vec![original]).await.is_err() {
+    // The rows the repair registered, by the shepherd's own account. Waiting
+    // for "a row that is new" instead let a cutover newcomer that spawned
+    // late stand in for the repair instance, and the wait ended with the
+    // repair's own rows still to come and then left registered.
+    let Ok(repair) = daemon.start(vec![original]).await else {
         return Undone {
             removed,
             recorded: false,
         };
-    }
+    };
 
     // The repair `Start` spawned an instance, and a `Start` is an acceptance:
     // the shepherd spawns afterwards. Waited for, the way phase one of
@@ -875,26 +873,20 @@ async fn undo_start<D: Daemon>(
                 recorded: true,
             };
         };
-        // Rows that are new to both the pre-cutover flock AND the listing the
-        // first drain worked from. A newcomer that drain could not delete is
-        // in the second and must not pass for a repair instance, or the
-        // wait ends before that instance appears and it is left running.
-        // All `wanted` of them, not the first: a scaled original spawns
-        // several, and they need not appear on the same poll.
-        let arrived = flock
+        // Every row the repair registered, present. Then everything that is
+        // not an original goes: the repair's rows, and any cutover newcomer
+        // that spawned after the first drain looked.
+        let all_present = repair
             .iter()
-            .filter(|info| !previous.contains(&info.id) && !seen.contains(&info.id))
-            .count();
-        if arrived >= wanted {
+            .all(|id| flock.iter().any(|info| info.id == *id));
+        if all_present {
             removed &= drain(daemon, &flock, previous).await;
             break;
         }
         if Instant::now() >= deadline {
             // Whatever did arrive is taken down; what did not is reported.
             removed = false;
-            if arrived > 0 {
-                let _ = drain(daemon, &flock, previous).await;
-            }
+            let _ = drain(daemon, &flock, previous).await;
             break;
         }
         sleep(POLL).await;
@@ -1317,6 +1309,8 @@ mod tests {
         repaired_at: Cell<Option<Instant>>,
         /// How far apart a scaled repair's rows appear, if not together.
         repair_stagger: Option<Duration>,
+        /// When a newcomer `newcomers_at_most` held back finally appears.
+        late_newcomer_after: Option<Duration>,
     }
 
     /// How long a shepherd takes to spawn after accepting a `Start`, as the
@@ -1341,7 +1335,15 @@ mod tests {
                 repairs: Cell::new(0),
                 repaired_at: Cell::new(None),
                 repair_stagger: None,
+                late_newcomer_after: None,
             }
+        }
+
+        /// The same double, with one newcomer the cap held back appearing
+        /// `after` the cutover's `Start` was accepted.
+        fn with_a_late_newcomer_after(mut self, after: Duration) -> Self {
+            self.late_newcomer_after = Some(after);
+            self
         }
 
         /// The same double, with a scaled repair's rows appearing one per
@@ -1466,6 +1468,18 @@ mod tests {
                         flock.push(self.row(id, status, pid + offset, restarts));
                     }
                 }
+                // A newcomer the cap held back, arriving late: a shepherd
+                // that spawned the rest of what it registered only after the
+                // cutover had given up on waiting.
+                if let Some(late) = self.late_newcomer_after
+                    && elapsed >= late
+                    && spawned < asked
+                {
+                    let id = NEWCOMER_ID - spawned;
+                    if !self.is_deleted(id) {
+                        flock.push(self.row(id, ProcStatus::Online, pid + spawned, 0));
+                    }
+                }
             }
 
             // Not at once. `undo_start` used to describe right after the
@@ -1486,7 +1500,7 @@ mod tests {
 
             Ok(flock)
         }
-        async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+        async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
             let attempt = self.attempts.get();
             self.attempts.set(attempt + 1);
             if self.refuses == Some(attempt) {
@@ -1497,23 +1511,23 @@ mod tests {
                 })));
             }
 
+            // One row per instance asked for, registered now and spawned
+            // later, which is what a shepherd answers a `Start` with.
+            let asked = apps.first().map_or(1, |app| app.instances.max(1));
             self.starts.borrow_mut().extend(apps);
             if attempt == 0 {
                 self.accepted_at.set(Some(Instant::now()));
+                Ok((0..asked).map(|offset| NEWCOMER_ID - offset).collect())
             } else {
-                // One row per instance the repair asked for, as a shepherd
-                // spawns them: counting Starts instead hid a scaled repair.
-                let asked = self
-                    .starts
-                    .borrow()
-                    .last()
-                    .map_or(1, |app| app.instances.max(1));
-                self.repairs.set(self.repairs.get() + asked);
+                let first = self.repairs.get();
+                self.repairs.set(first + asked);
                 if self.repaired_at.get().is_none() {
                     self.repaired_at.set(Some(Instant::now()));
                 }
+                Ok((first..first + asked)
+                    .map(|offset| REPAIR_ID + offset)
+                    .collect())
             }
-            Ok(())
         }
         async fn delete(&self, id: u32) -> Result<(), Error> {
             let seen = self.deletes_seen.get();
@@ -2171,6 +2185,31 @@ mod tests {
                 daemon.deleted()
             );
         }
+    }
+
+    /// fails if a cutover newcomer that spawns late is taken for the repair
+    /// instance. The cutover asked for two, the shepherd spawned one, the
+    /// cutover gave up waiting, and the second appears after the first
+    /// drain and before the repair's own row. Counting "a new row" ended
+    /// the wait there and left the repair row registered; the repair's ids
+    /// are the shepherd's own answer, and both rows have to go.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_cutover_newcomer_is_not_taken_for_the_repair_instance() {
+        let (daemon, mut prepared, _dirs) = cutover_fixture().await;
+        prepared.app.instances = 2;
+        let late = cutover_budget(&prepared.app) + Duration::from_millis(100);
+        let daemon = daemon.spawning_at_most(1).with_a_late_newcomer_after(late);
+
+        cut_over(&daemon, prepared)
+            .await
+            .expect_err("gives up on the missing newcomer");
+
+        assert!(daemon.is_deleted(REPAIR_ID), "{:?}", daemon.deleted());
+        assert!(
+            daemon.is_deleted(NEWCOMER_ID - 1),
+            "the late newcomer goes too: {:?}",
+            daemon.deleted()
+        );
     }
 
     /// fails if a repair that could not be made is glossed over.

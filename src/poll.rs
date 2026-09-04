@@ -1146,7 +1146,7 @@ mod tests {
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             self.ready.describe(sheep).await
         }
-        async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+        async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
             self.ready.start(apps).await
         }
         async fn delete(&self, id: u32) -> Result<(), Error> {

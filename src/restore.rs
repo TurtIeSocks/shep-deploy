@@ -413,7 +413,7 @@ async fn put_back<D: Daemon>(
     }
 
     match daemon.start(vec![restored]).await {
-        Ok(()) => PutBack::Done,
+        Ok(_) => PutBack::Done,
         Err(err) => {
             // The sheep is deregistered at this point. Put the shepherd's
             // own config back rather than leaving it deleted, because a
@@ -868,7 +868,7 @@ mod tests {
                 })
                 .collect())
         }
-        async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+        async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
             let attempt = self.attempts.get();
             self.attempts.set(attempt + 1);
             let refused = match self.refuse {
@@ -890,7 +890,7 @@ mod tests {
             // `calls()` tracks only what actually changed the flock, so a
             // refused start does not appear here.
             self.calls.borrow_mut().push("start");
-            Ok(())
+            Ok(Vec::new())
         }
         async fn delete(&self, _id: u32) -> Result<(), Error> {
             let attempt = self.delete_attempts.get() + 1;

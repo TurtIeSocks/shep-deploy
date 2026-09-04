@@ -99,11 +99,18 @@ pub trait Daemon {
     /// As [`Self::dog_config`].
     async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error>;
 
-    /// Register and start every app in `apps`.
+    /// Register and start every app in `apps`, answering the ids of the
+    /// instances this `Start` registered.
+    ///
+    /// The ids are the daemon's own answer to "which rows are yours", so a
+    /// caller that later has to take exactly those rows down can name them
+    /// rather than guess from a listing which rows are new. `Start` is an
+    /// acceptance: the rows are registered when this returns and spawned
+    /// afterwards, so a `describe` straight after can still be missing them.
     ///
     /// # Errors
     /// As [`Self::dog_config`].
-    async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error>;
+    async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error>;
 
     /// Stop and deregister one instance, by its stable numeric id.
     ///
@@ -281,9 +288,9 @@ impl Daemon for Live {
         }
     }
 
-    async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+    async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
         match self.0.request(Request::Start { apps }).await? {
-            Response::Started(_) => Ok(()),
+            Response::Started(flock) => Ok(flock.iter().map(|info| info.id).collect()),
             other => Err(unexpected("Start", &other)),
         }
     }
