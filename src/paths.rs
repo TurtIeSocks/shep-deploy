@@ -13,6 +13,9 @@
 //! │                        release as `target` so builds stay warm and a
 //! │                        hardcoded `./target/release/x` still resolves
 //! ├── current -> releases/<sha>   swapped with rename(2) at cutover
+//! ├── complete/<sha>       per-release completion marker, kept outside the
+//! │                        release on purpose - see `Tree::completion`
+//! ├── deploy.lock          exclusive flock so only one deploy runs at once
 //! └── deploy.toml          the sheep's `State` - see `crate::state`
 //! ```
 
@@ -32,7 +35,9 @@ use crate::error::Error;
 /// # Errors
 /// [`Error::Io`], naming `<shep_home>/deploy`, if it exists but cannot be
 /// listed. An absent directory is an empty list, not an error: that is
-/// every shepherd with no targets yet.
+/// every shepherd with no targets yet. Also [`Error::Io`], naming the
+/// offending entry, if a target directory's name is not valid UTF-8: a
+/// target the dog cannot name is a broken target, not an absent one.
 pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
     let root = shep_home.join("deploy");
     let entries = match std::fs::read_dir(&root) {
@@ -50,9 +55,15 @@ pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
         if !entry.path().join("deploy.toml").is_file() {
             continue;
         }
-        if let Some(name) = entry.file_name().to_str() {
-            found.push(name.to_owned());
-        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(Error::Io {
+                path: entry.path(),
+                source: std::io::Error::other(
+                    "directory name is not valid UTF-8, so it cannot name a sheep",
+                ),
+            });
+        };
+        found.push(name);
     }
     found.sort();
     Ok(found)
@@ -103,6 +114,13 @@ impl Tree {
     /// off one `ReactMap` checkout), and each gets its own tree.
     #[must_use]
     pub fn for_sheep(shep_home: &Path, sheep: &str) -> Self {
+        // The real check lives in `main::route`; this keeps the contract
+        // next to the constructor instead of trusting every caller to have
+        // gone through there first.
+        debug_assert!(
+            is_sheep_name(sheep),
+            "a sheep name is one path component, got {sheep:?}"
+        );
         Self {
             root: shep_home.join("deploy").join(sheep),
             sheep: sheep.to_owned(),
@@ -168,7 +186,18 @@ impl Tree {
     /// Under the tree's own root, which only this dog writes.
     #[must_use]
     pub fn completion(&self, sha: &str) -> PathBuf {
-        self.root.join("complete").join(sha)
+        self.completions().join(sha)
+    }
+
+    /// The directory every completion marker lives in.
+    ///
+    /// Named on its own because retention sweeps it. Deriving it from
+    /// `completion("")` gave a path with a trailing separator whose
+    /// `parent()` was the tree root, and a sweep of the root removed
+    /// `current`. Measured by the suite on 2026-09-03, before it shipped.
+    #[must_use]
+    pub fn completions(&self) -> PathBuf {
+        self.root.join("complete")
     }
 
     /// The file a deploy takes an exclusive `flock` on, so only one process
@@ -228,9 +257,57 @@ mod tests {
         );
         assert_eq!(tree.current(), Path::new("/srv/shep/deploy/bpm/current"));
         assert_eq!(
+            tree.completion("a1b2c3d"),
+            Path::new("/srv/shep/deploy/bpm/complete/a1b2c3d")
+        );
+        assert_eq!(
+            tree.lock_file(),
+            Path::new("/srv/shep/deploy/bpm/deploy.lock")
+        );
+        assert_eq!(
             tree.state_file(),
             Path::new("/srv/shep/deploy/bpm/deploy.toml")
         );
+    }
+
+    /// fails if `is_sheep_name` accepts a name that would traverse out of
+    /// the tree, or rejects an ordinary one. This is the one check standing
+    /// between an operator-typed name and a tree rooted somewhere nobody
+    /// pointed it.
+    #[test]
+    fn is_sheep_name_accepts_one_component_and_rejects_everything_else() {
+        for accepted in ["bpm", "reactmap-staging", "web.2"] {
+            assert!(is_sheep_name(accepted), "should accept {accepted:?}");
+        }
+        for rejected in ["", ".", "..", "/tmp/x", "../x", "a/b", "a/"] {
+            assert!(!is_sheep_name(rejected), "should reject {rejected:?}");
+        }
+    }
+
+    /// fails if a directory whose name is not valid UTF-8 is silently
+    /// dropped from the target list. A target the dog cannot name never
+    /// polls and never restores, with nothing said anywhere, so this has
+    /// to be a loud error instead of a skip.
+    #[test]
+    fn a_non_utf8_target_name_is_an_error_naming_the_entry() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let deploy = home.path().join("deploy");
+        let bad_dir = deploy.join(OsStr::from_bytes(&[0xff, 0xfe]));
+        if let Err(err) = std::fs::create_dir_all(&bad_dir) {
+            // APFS refuses a name that is not valid UTF-8 outright, so on
+            // macOS the entry this pins cannot exist. Linux filesystems
+            // accept it, and CI runs there.
+            eprintln!("skipped: this filesystem refuses the name ({err})");
+            return;
+        }
+        std::fs::write(bad_dir.join("deploy.toml"), "").expect("write deploy.toml");
+
+        let err = targets(home.path()).expect_err("non-UTF-8 name");
+        assert!(matches!(err, Error::Io { .. }));
+        assert!(format!("{err}").contains("UTF-8"));
     }
 
     /// fails if a tree stops knowing which sheep it belongs to. The
