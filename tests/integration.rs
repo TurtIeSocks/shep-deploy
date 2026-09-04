@@ -207,6 +207,16 @@ fn head_of(dir: &Path) -> String {
         .args(["rev-parse", "HEAD"])
         .output()
         .expect("rev-parse");
+    // Checked, because the failure is silent otherwise: a repository with no
+    // commits gives an empty stdout and a status nobody reads, so the caller
+    // gets `""` and asserts against it. Same check as `src/fixtures.rs`'s
+    // copy, which this one had drifted behind.
+    assert!(
+        out.status.success(),
+        "git rev-parse HEAD failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     String::from_utf8(out.stdout)
         .expect("utf-8 sha")
         .trim()
