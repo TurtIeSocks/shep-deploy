@@ -720,6 +720,7 @@ name = "shep-deploy"
 version = "0.2.2"
 dependencies = [
  "nix",
+ "rustix",
  "serde",
  "serde_json",
  "shep-client",

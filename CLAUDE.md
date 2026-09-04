@@ -97,7 +97,7 @@ SHEP_BIN="$(command -v shep)" cargo test --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-389 unit tests and 7 integration as of 2026-09-04, ~22s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
+392 unit tests and 7 integration as of 2026-09-04, ~23s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
 
 ## Architecture
 
@@ -208,6 +208,15 @@ class rather than the instances.
   is the operator's file. The field is private and there is no `From` impl on
   purpose: a trait impl is reachable from every module, which would let any
   caller mint the proof. Tests build one with `FromCheckout::of`.
+- **An artifact is copied through a per-component walk, not through a path.**
+  `build::Walk` opens every directory from the release or the build cache with
+  `openat` and `O_NOFOLLOW | O_DIRECTORY` against the descriptor above it, so
+  a parent swapped for a symlink mid-copy is refused rather than followed. A
+  component that answers `ELOOP` is followed only when `readlinkat` says it
+  names one of the two roots exactly, which is what keeps `link_cache`'s
+  `release/target` working. `lands_within` still runs first and is what
+  produces the message an operator reads. It uses `rustix`, not `nix`: nix
+  0.29's `openat` returns a bare `RawFd` and this crate forbids unsafe.
 - **A regression test for the artifact escape is worthless without
   `CARGO_TARGET_DIR` set.** Without it, source and destination collapse to the
   same path and the self-copy guard returns `Ok` before reaching anything the
