@@ -28,8 +28,9 @@
 //! `nix` is already in this crate's tree, as a dependency of `shep-core`, so
 //! this is a direct edge on something every build already compiles.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use nix::errno::Errno;
@@ -37,6 +38,15 @@ use nix::fcntl::{Flock, FlockArg};
 
 use crate::error::Error;
 use crate::paths::Tree;
+
+/// The lock file's mode: owner only.
+///
+/// `flock(2)` needs nothing more than an open descriptor, so a lock file
+/// readable by other accounts is one any local user can take out from under
+/// the dog. Left at the default `0o644`, an unprivileged process could hold
+/// it forever and every deploy of that sheep would report
+/// [`Error::AlreadyDeploying`] against a rival that is not a deploy at all.
+const LOCK_MODE: u32 = 0o600;
 
 /// An exclusive hold on one sheep's deploy tree.
 ///
@@ -72,6 +82,7 @@ pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(LOCK_MODE)
         .open(&path)
         .map_err(|source| Error::Io {
             path: path.clone(),
@@ -81,6 +92,12 @@ pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
     // `truncate(false)` above, deliberately. The file's contents are never
     // read and never written, so truncating would be a write to a file another
     // process is at that moment holding a lock on, for no reason.
+    //
+    // `mode` only applies when the file is created, so a lock file left at the
+    // default mode by an earlier version is tightened here as well. Best
+    // effort: a file this process cannot chmod is one it does not own, and
+    // the lock still works on it.
+    let _ = std::fs::set_permissions(&path, Permissions::from_mode(LOCK_MODE));
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(held) => Ok(Deploying { _held: held }),
         Err((_, errno)) => Err(refusal(tree.sheep(), path, errno)),
@@ -181,6 +198,33 @@ mod tests {
                 "{errno:?} must not claim contention: {err}"
             );
         }
+    }
+
+    /// fails if the lock file can be opened by another account.
+    ///
+    /// `flock` needs only an open descriptor, so a file at the default mode
+    /// lets any local user hold the lock and turn every deploy of that sheep
+    /// into a false `AlreadyDeploying`, indefinitely. Both paths are pinned:
+    /// a file this call creates, and one left wide open by an earlier version.
+    #[test]
+    fn the_lock_file_is_owner_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("lock file")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        drop(hold(&tree).expect("creates the lock file"));
+        assert_eq!(mode(&tree.lock_file()), LOCK_MODE, "as created");
+
+        std::fs::set_permissions(tree.lock_file(), Permissions::from_mode(0o644))
+            .expect("loosen, as an older version left it");
+        drop(hold(&tree).expect("reopens the lock file"));
+        assert_eq!(mode(&tree.lock_file()), LOCK_MODE, "tightened on reopen");
     }
 
     /// fails if two sheep contend with each other. The lock is per tree, and
