@@ -63,6 +63,16 @@ pub enum Standing {
     Eligible,
     /// Left alone, and why.
     NotEligible(String),
+    /// A deploy tree whose record cannot be read, and what reading it said.
+    ///
+    /// Its own standing rather than a fall-through, because the fall-through
+    /// was dangerous: a live target's `cwd` is `current`, a git worktree
+    /// shipping a `Flockfile.toml`, so an unreadable record classified it as
+    /// `NeedsSetup` and told the operator to run `setup` against a running
+    /// service, which clones over its tree. Reachable without corruption:
+    /// the record refuses unknown fields, so one written by a newer
+    /// shep-deploy reads this way to an older binary.
+    Unreadable(String),
 }
 
 /// Where `app` stands, without touching anything.
@@ -76,7 +86,14 @@ pub enum Standing {
 #[must_use]
 pub fn classify(shep_home: &Path, app: &AppConfig) -> Standing {
     let tree = Tree::for_sheep(shep_home, &app.name);
-    if let Ok(state) = State::read(&tree.state_file()) {
+    let state = match State::read(&tree.state_file()) {
+        Ok(state) => Some(state),
+        // No record is no target, which is the ordinary case for every
+        // sheep the dog has not taken over.
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Standing::Unreadable(err.to_string()),
+    };
+    if let Some(state) = state {
         let (branch, sha) = (state.branch, state.deployed);
         // A hold is only reported for a target something polls. `failed`
         // is written by an operator's own deploy too, and for a manual
@@ -123,7 +140,15 @@ pub fn render(rows: &[(String, Standing)]) -> String {
         return "no sheep are registered, so there is nothing to survey\n".to_owned();
     }
 
-    let name_width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 2;
+    // Characters, not bytes: `{name:width$}` pads by character, and a name
+    // with a multi-byte character in it would otherwise pull its row's
+    // columns left of every other row's.
+    let name_width = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
     let label_width = rows
         .iter()
         .map(|(_, standing)| standing.label().len())
@@ -152,6 +177,7 @@ impl Standing {
             Self::NeedsSetup => "needs setup",
             Self::Eligible => "eligible",
             Self::NotEligible(_) => "not eligible",
+            Self::Unreadable(_) => "unreadable",
         }
     }
 
@@ -184,6 +210,13 @@ impl Standing {
             Self::NeedsSetup => "a git checkout that ships a Flockfile".to_owned(),
             Self::Eligible => "a git checkout, nothing declares a deploy".to_owned(),
             Self::NotEligible(why) => why.clone(),
+            // Says what to do and, more to the point, what NOT to do: the
+            // one wrong move here is treating it as a sheep with no tree.
+            Self::Unreadable(why) => format!(
+                "has a deploy tree whose record cannot be read: {why}. Repair the record \
+                 before deploying; do not run setup against it, the sheep may be running from \
+                 inside that tree"
+            ),
         }
     }
 }
@@ -221,6 +254,39 @@ pub async fn survey<D: Daemon>(daemon: &D, shep_home: &Path) -> Result<String, E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fails if a target whose record cannot be read is offered `setup`.
+    ///
+    /// A live target's `cwd` is `current`, a git worktree that ships a
+    /// `Flockfile.toml`, so falling through to the checkout questions
+    /// classified it as `NeedsSetup` and the row told an operator to run
+    /// `shep-deploy setup` against a running service, which clones over its
+    /// tree. A record with a key this binary does not know is enough to get
+    /// there: one written by a newer shep-deploy reads this way to an older
+    /// one.
+    #[test]
+    fn a_target_with_an_unreadable_record_is_not_offered_setup() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        std::fs::create_dir_all(tree.root()).expect("tree");
+        std::fs::write(
+            tree.state_file(),
+            "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n\
+             newer_key = true\n",
+        )
+        .expect("a record from the future");
+        let checkout = checkout_fixture(&[("Flockfile.toml", "[[app]]\nname = \"web\"\n")]);
+
+        let standing = classify(home.path(), &app("web", checkout.path().to_str()));
+
+        assert!(
+            matches!(&standing, Standing::Unreadable(why) if why.contains("newer_key")),
+            "must name what was wrong with the record: {standing:?}"
+        );
+        let shown = render(&[("web".to_owned(), standing)]);
+        assert!(!shown.contains("needs setup"), "{shown}");
+        assert!(shown.contains("do not run setup"), "{shown}");
+    }
 
     /// An `AppConfig` with just the two fields this module reads.
     fn app(name: &str, cwd: Option<&str>) -> AppConfig {
@@ -359,7 +425,7 @@ mod tests {
             home.path(),
             "bpm",
             Watch::Manual,
-            Some("a1b2c3d4e5f6"),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
             None,
         );
 
@@ -422,8 +488,8 @@ mod tests {
             home.path(),
             "bpm",
             Watch::Auto,
-            Some("a1b2c3d4e5f6"),
-            Some("d4e5f6a7b8c9"),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            Some("d4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b8c9d4e5"),
         );
 
         let row = render(&[(
@@ -455,8 +521,8 @@ mod tests {
             home.path(),
             "bpm",
             Watch::Manual,
-            Some("a1b2c3d4e5f6"),
-            Some("d4e5f6a7b8c9"),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            Some("d4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b8c9d4e5"),
         );
 
         let row = render(&[(
@@ -480,22 +546,22 @@ mod tests {
                 "bpm".to_owned(),
                 Standing::Watched {
                     branch: "main".to_owned(),
-                    sha: Some("a1b2c3d4e5f6".to_owned()),
+                    sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
                 },
             ),
             (
                 "koji-staging".to_owned(),
                 Standing::Manual {
                     branch: "main".to_owned(),
-                    sha: Some("a1b2c3d4e5f6".to_owned()),
+                    sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
                 },
             ),
             (
                 "reactmap-eu".to_owned(),
                 Standing::Held {
                     branch: "main".to_owned(),
-                    sha: Some("a1b2c3d4e5f6".to_owned()),
-                    failed: "d4e5f6a7b8c9".to_owned(),
+                    sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
+                    failed: "d4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b8c9d4e5".to_owned(),
                 },
             ),
             ("reactmap".to_owned(), Standing::NeedsSetup),
