@@ -7,11 +7,13 @@
 //!
 //! # What a tick asks the shepherd for
 //!
-//! Nothing, until it has something to deploy. Targets are read from the
-//! filesystem - one directory per target under `<shep_home>/deploy`, each
-//! holding its own record - and a target whose branch has not moved is
-//! answered by `git` alone. The shepherd is asked only by a deploy that is
-//! going ahead.
+//! One `set_smit` per target, every tick, and nothing more until it has
+//! something to deploy. Targets are read from the filesystem - one
+//! directory per target under `<shep_home>/deploy`, each holding its own
+//! record - and a target whose branch has not moved is answered by `git`
+//! alone. The smit is republished each tick because the daemon holds it in
+//! memory only for as long as this dog's connection lasts; see [`tick`].
+//! Past that, the shepherd is asked only by a deploy that is going ahead.
 //!
 //! In particular the roll is never read. [`crate::roll::registered`] is how
 //! `survey` learns what shep has registered, and it goes through
@@ -34,9 +36,14 @@
 //! refusal is there for a second OPERATOR invocation - it never has to hold
 //! the loop off itself.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{self, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use tokio::time::sleep;
 
@@ -84,17 +91,19 @@ const fn due(state: &State) -> bool {
 /// cannot be listed at all takes every target with it, and its row is named
 /// for the directory because there is no sheep left to name; silence there
 /// is indistinguishable from a dog with nothing to do.
-async fn tick<D: Daemon>(
-    daemon: &D,
-    shep_home: &Path,
-    config: &DogConfig,
-) -> Vec<(String, Result<Outcome, Error>)> {
+async fn tick<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Tick {
     let names = match paths::targets(shep_home) {
         Ok(names) => names,
-        Err(err) => return vec![(shep_home.join("deploy").display().to_string(), Err(err))],
+        Err(err) => {
+            return Tick {
+                targets: 0,
+                results: vec![(shep_home.join("deploy").display().to_string(), Err(err))],
+            };
+        }
     };
 
     let mut results = Vec::new();
+    let targets = names.len();
     for name in names {
         let tree = Tree::for_sheep(shep_home, &name);
         let mut state = match State::read(&tree.state_file()) {
@@ -113,18 +122,82 @@ async fn tick<D: Daemon>(
         // publish-on-change dog would show nothing after a daemon restart
         // until its next deploy, which for a healthy target could be weeks.
         //
-        // A failure is ignored: this is cosmetic, and a daemon that refuses
-        // it is one this dog can still deploy through.
+        // A failure does not stop the deploy: this is cosmetic, and a daemon
+        // that refuses it is one this dog can still deploy through. It is a
+        // row of its own rather than a bare `eprintln!`, so it reaches the
+        // stream the caller chose and, more to the point, the mute: a daemon
+        // that refuses every smit would otherwise say so once per target per
+        // tick, forever.
         if let Err(err) = smit::publish(daemon, &name, &state).await {
-            eprintln!("{name}: could not publish its smit: {err}");
+            results.push((format!("{name}'s smit"), Err(err)));
         }
         if !due(&state) {
             continue;
         }
-        let outcome = deploy::unattended(daemon, &tree, &mut state, config).await;
+        // Guarded, because this loop's one promise is that a target's
+        // failure does not stop the others, and a panic is the one failure
+        // `unattended`'s `Result` cannot carry. Nothing in the crate panics
+        // on purpose outside tests; this is for the day something does, in
+        // a loop meant to run for months.
+        let deploy = Box::pin(deploy::unattended(daemon, &tree, &mut state, config));
+        let outcome = match CatchUnwind(deploy).await {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(Error::Panicked {
+                sheep: name.clone(),
+                what: panic_message(payload.as_ref()),
+            }),
+        };
         results.push((name, outcome));
     }
-    results
+    Tick { targets, results }
+}
+
+/// What one tick found and did.
+struct Tick {
+    /// How many targets were on disk, due or not.
+    ///
+    /// Kept apart from the results because a manual target produces no
+    /// result and is still a target: a tick with results and no targets is
+    /// impossible, and a tick with targets and no results is the ordinary
+    /// quiet one.
+    targets: usize,
+    /// One row per target that had something to say, plus a row per smit
+    /// that could not be published.
+    results: Vec<(String, Result<Outcome, Error>)>,
+}
+
+/// A future that turns a panic in the one it wraps into an `Err`, so the
+/// loop around it keeps going.
+///
+/// Written here rather than taken from a crate because it is a dozen lines:
+/// each poll is run under [`catch_unwind`], and a payload that comes out is
+/// the future's answer. The inner future is pinned on the heap by the
+/// caller, which is what makes it `Unpin` and lets it be polled through a
+/// plain closure.
+struct CatchUnwind<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.get_mut().0;
+        match catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// The message a panic carried, or a note that it carried none.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic with no message".to_owned()
+    }
 }
 
 /// What one target's outcome is worth saying, and which log it belongs in.
@@ -292,8 +365,29 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
     err: &mut E,
 ) -> Result<(), Error> {
     let mut previous: BTreeMap<String, Repeat> = BTreeMap::new();
+    let deploy_dir = shep_home.join("deploy").display().to_string();
+    let mut had_targets = false;
     loop {
-        let results = tick(daemon, shep_home, config).await;
+        let Tick {
+            targets,
+            mut results,
+        } = tick(daemon, shep_home, config).await;
+
+        // A deploy directory that is gone answers as an empty list, which is
+        // also what a shepherd with no targets yet answers, so the loop went
+        // silent the moment a directory was unmounted or removed from under
+        // it. Said once, through the mute, when the previous tick had
+        // targets and this one has none.
+        if targets == 0 && had_targets {
+            results.push((
+                deploy_dir.clone(),
+                Err(Error::Config(format!(
+                    "no deploy targets are left under {deploy_dir}: every target this dog was \
+                     polling is gone, so it deploys nothing until one is set up again"
+                ))),
+            ));
+        }
+        had_targets = targets > 0;
 
         // A target that is gone stops muting anything. Otherwise a target
         // deleted and recreated has its first line swallowed by the entry
@@ -326,6 +420,34 @@ mod tests {
     use crate::fixtures;
 
     use super::*;
+
+    /// fails if a panic inside a deploy stops being caught. The loop's one
+    /// promise is that a target's failure does not stop the others, and a
+    /// panic is the failure `Result` cannot carry.
+    #[tokio::test]
+    async fn a_panic_becomes_an_err_rather_than_ending_the_loop() {
+        let caught = CatchUnwind(Box::pin(async {
+            tokio::task::yield_now().await;
+            panic!("the deploy fell over");
+        }))
+        .await;
+        let payload = caught.expect_err("the panic must be caught");
+        assert_eq!(panic_message(payload.as_ref()), "the deploy fell over");
+
+        let fine = CatchUnwind(Box::pin(async { 7 })).await;
+        assert_eq!(fine.ok(), Some(7));
+    }
+
+    /// fails if a panic's message is lost on the way to the row. A `String`
+    /// payload is what `panic!` with a format string gives, a `&str` is what
+    /// a literal gives, and anything else has to say it had no message
+    /// rather than print nothing.
+    #[test]
+    fn a_panic_message_is_read_from_either_payload_shape() {
+        assert_eq!(panic_message(&"literal"), "literal");
+        assert_eq!(panic_message(&String::from("formatted")), "formatted");
+        assert_eq!(panic_message(&42_u8), "a panic with no message");
+    }
 
     use core::time::Duration;
     use std::cell::{Cell, RefCell};
@@ -594,7 +716,12 @@ mod tests {
             .expect("reads")
             .deployed;
 
-        assert!(tick(&Ready::new(), home.path(), &config()).await.is_empty());
+        assert!(
+            tick(&Ready::new(), home.path(), &config())
+                .await
+                .results
+                .is_empty()
+        );
 
         assert_eq!(
             State::read(&Tree::for_sheep(home.path(), "paused").state_file())
@@ -617,7 +744,7 @@ mod tests {
         write_target(home.path(), "broken", Watch::Auto, Some("old"));
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
 
-        let results = tick(&Ready::new(), home.path(), &config()).await;
+        let results = tick(&Ready::new(), home.path(), &config()).await.results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "broken");
@@ -645,7 +772,7 @@ mod tests {
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = Ready::new();
-        let results = tick(&daemon, home.path(), &config()).await;
+        let results = tick(&daemon, home.path(), &config()).await.results;
 
         assert_eq!(results.len(), 1);
         assert!(
@@ -662,7 +789,12 @@ mod tests {
     #[tokio::test]
     async fn a_dog_with_no_targets_ticks_quietly() {
         let home = tempfile::tempdir().expect("tempdir");
-        assert!(tick(&Ready::new(), home.path(), &config()).await.is_empty());
+        assert!(
+            tick(&Ready::new(), home.path(), &config())
+                .await
+                .results
+                .is_empty()
+        );
     }
 
     /// fails if a deploy directory that cannot be listed is passed over in
@@ -678,7 +810,7 @@ mod tests {
         // Listable again on drop or not, this test never reads it back.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let results = tick(&Ready::new(), home.path(), &config()).await;
+        let results = tick(&Ready::new(), home.path(), &config()).await.results;
 
         let listable = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         assert_eq!(results.len(), 1);
@@ -699,7 +831,7 @@ mod tests {
         fs::create_dir_all(tree.root()).expect("create the tree");
         fs::write(tree.state_file(), "this is not toml").expect("write deploy.toml");
 
-        let results = tick(&Ready::new(), home.path(), &config()).await;
+        let results = tick(&Ready::new(), home.path(), &config()).await.results;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "garbled");
@@ -1127,8 +1259,20 @@ mod tests {
         // with the smit refusal this test exists to pin - see every other
         // `write_target_ready` caller in this file for the pattern.
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
-        let results = tick(&RefusingSmits, home.path(), &config()).await;
-        assert!(results[0].1.is_ok(), "the deploy still ran");
+        let results = tick(&RefusingSmits, home.path(), &config()).await.results;
+        let row = |name: &str| {
+            results
+                .iter()
+                .find(|(sheep, _)| sheep == name)
+                .unwrap_or_else(|| panic!("no row for {name}: {results:?}"))
+        };
+        assert!(row("fine").1.is_ok(), "the deploy still ran");
+        // And the refusal is a row of its own, so it reaches the mute rather
+        // than being printed once per target per tick forever.
+        assert!(
+            row("fine's smit").1.is_err(),
+            "the refusal is reported as its own row"
+        );
     }
 
     /// fails if a target whose branch name is longer than a smit allows
@@ -1151,7 +1295,7 @@ mod tests {
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = SmitRecording::default();
-        let results = tick(&daemon, home.path(), &config()).await;
+        let results = tick(&daemon, home.path(), &config()).await.results;
 
         assert!(
             !daemon.smits().is_empty(),

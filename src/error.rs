@@ -338,6 +338,19 @@ pub enum Error {
         /// The budget it ran past.
         after: Duration,
     },
+    /// A deploy panicked partway, which is a bug in this dog and not in the
+    /// target.
+    ///
+    /// Caught by the poll loop so that one target's bug does not end the dog
+    /// for every other target, and reported as that target's row. Nothing in
+    /// the crate panics on purpose outside tests, so the row is the whole of
+    /// the evidence an operator has when one does.
+    Panicked {
+        /// The sheep whose deploy panicked.
+        sheep: String,
+        /// The panic's own message, or a note that it had none.
+        what: String,
+    },
 }
 
 impl Error {
@@ -508,6 +521,24 @@ impl fmt::Display for Error {
                          the count against what {sheep} is configured to run."
                     )?;
                 }
+                if !repaired {
+                    // The half an operator cannot see. `shep flock` shows a
+                    // healthy sheep either way; only the persisted roll is
+                    // wrong, and only a restart reveals it. Printed before
+                    // the remove-and-setup paragraph below, and flagged as
+                    // coming first: an operator working in printed order
+                    // must repair the roll before removing the tree, or
+                    // `shep-deploy setup` reads a still-poisoned record.
+                    write!(
+                        f,
+                        " Before that, one thing is NOT back as it was: the shepherd recorded \
+                         the new release against {sheep} when it accepted the start, and that \
+                         record could not be put back. It is correct in the running process and \
+                         wrong on disk, so a daemon restart followed by `shep muster` would bring \
+                         {sheep} back on the release that was just rejected. Re-register it from \
+                         its own Flockfile to correct the record before restarting the shepherd."
+                    )?;
+                }
                 // The half that turns a failed cutover into a false green.
                 // `deploy` does not short-circuit on a record naming no
                 // release, so it would build, swap, reload the sheep at its
@@ -521,20 +552,6 @@ impl fmt::Display for Error {
                      remove {}, and run `shep-deploy setup {sheep}` again.",
                     tree.display()
                 )?;
-                if !repaired {
-                    // The half an operator cannot see. `shep flock` shows a
-                    // healthy sheep either way; only the persisted roll is
-                    // wrong, and only a restart reveals it.
-                    write!(
-                        f,
-                        " One thing is NOT back as it was: the shepherd recorded the new release \
-                         against {sheep} when it accepted the start, and that record could not be \
-                         put back. It is correct in the running process and wrong on disk, so a \
-                         daemon restart followed by `shep muster` would bring {sheep} back on the \
-                         release that was just rejected. Re-register it from its own Flockfile to \
-                         correct the record before restarting the shepherd."
-                    )?;
-                }
                 Ok(())
             }
             Self::Stranded { sheep, sha, ids } => {
@@ -567,6 +584,13 @@ impl fmt::Display for Error {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
             },
+            Self::Panicked { sheep, what } => write!(
+                f,
+                "the deploy of {sheep} panicked partway: {what}. That is a bug in shep-deploy \
+                 rather than in {sheep}. Compare `current`, deploy.toml and `shep describe \
+                 {sheep}` against each other before deploying again, and please report the \
+                 panic"
+            ),
         }
     }
 }
@@ -595,6 +619,7 @@ impl core::error::Error for Error {
             | Self::AlreadyDeploying { .. }
             | Self::Unverified { .. }
             | Self::Stranded { .. }
+            | Self::Panicked { .. }
             | Self::Build { .. } => None,
         }
     }
