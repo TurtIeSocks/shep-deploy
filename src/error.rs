@@ -12,6 +12,8 @@ use std::time::Duration;
 use shep_client::shep_core::protocol::{RpcErrorCode, SmitError};
 use shep_client::{ConnectError, RequestError};
 
+use crate::shared::printable;
+
 /// Anything that can go wrong in one deploy.
 ///
 /// Deliberately `#[derive(Debug)]` rather than a hand-written impl: nothing
@@ -338,9 +340,34 @@ pub enum Error {
         /// The budget it ran past.
         after: Duration,
     },
+    /// A deploy panicked partway, which is a bug in this dog and not in the
+    /// target.
+    ///
+    /// Caught by the poll loop so that one target's bug does not end the dog
+    /// for every other target, and reported as that target's row. Nothing in
+    /// the crate panics on purpose outside tests, so the row is the whole of
+    /// the evidence an operator has when one does.
+    Panicked {
+        /// The sheep whose deploy panicked.
+        sheep: String,
+        /// The panic's own message, or a note that it had none.
+        what: String,
+    },
 }
 
 impl Error {
+    /// The `map_err` for an I/O call on `path`: builds [`Self::Io`] naming
+    /// it.
+    ///
+    /// One spelling for what was thirty hand-written closures across
+    /// thirteen modules, each `|source| Error::Io { path: x.to_owned(),
+    /// source }` with its own choice of how to copy the path. The path is
+    /// taken up front, so a call site reads as `.map_err(Error::at(dir))`.
+    pub(crate) fn at(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> Self {
+        let path = path.into();
+        move |source| Self::Io { path, source }
+    }
+
     /// Whether a failed request is worth asking again.
     ///
     /// The refusal this whole retry exists for is `ReloadInFlight`, which shep
@@ -415,14 +442,27 @@ impl fmt::Display for Error {
                  run `shep-deploy setup {sheep}`.",
                 tree.display()
             ),
-            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            // Through `printable`, because a path here can be one the deployed
+            // repository chose (an artifact's), and git's stderr quotes ref
+            // names the repository chose too.
+            Self::Io { path, source } => {
+                write!(f, "{}: {source}", printable(path.display()))
+            }
             Self::Git {
                 command,
                 status,
                 stderr,
             } => match status {
-                Some(code) => write!(f, "`{command}` exited with status {code}: {stderr}"),
-                None => write!(f, "`{command}` was killed by a signal: {stderr}"),
+                Some(code) => write!(
+                    f,
+                    "`{command}` exited with status {code}: {}",
+                    printable(stderr)
+                ),
+                None => write!(
+                    f,
+                    "`{command}` was killed by a signal: {}",
+                    printable(stderr)
+                ),
             },
             Self::Raced {
                 sheep,
@@ -508,6 +548,24 @@ impl fmt::Display for Error {
                          the count against what {sheep} is configured to run."
                     )?;
                 }
+                if !repaired {
+                    // The half an operator cannot see. `shep flock` shows a
+                    // healthy sheep either way; only the persisted roll is
+                    // wrong, and only a restart reveals it. Printed before
+                    // the remove-and-setup paragraph below, and flagged as
+                    // coming first: an operator working in printed order
+                    // must repair the roll before removing the tree, or
+                    // `shep-deploy setup` reads a still-poisoned record.
+                    write!(
+                        f,
+                        " Before that, one thing is NOT back as it was: the shepherd recorded \
+                         the new release against {sheep} when it accepted the start, and that \
+                         record could not be put back. It is correct in the running process and \
+                         wrong on disk, so a daemon restart followed by `shep muster` would bring \
+                         {sheep} back on the release that was just rejected. Re-register it from \
+                         its own Flockfile to correct the record before restarting the shepherd."
+                    )?;
+                }
                 // The half that turns a failed cutover into a false green.
                 // `deploy` does not short-circuit on a record naming no
                 // release, so it would build, swap, reload the sheep at its
@@ -521,20 +579,6 @@ impl fmt::Display for Error {
                      remove {}, and run `shep-deploy setup {sheep}` again.",
                     tree.display()
                 )?;
-                if !repaired {
-                    // The half an operator cannot see. `shep flock` shows a
-                    // healthy sheep either way; only the persisted roll is
-                    // wrong, and only a restart reveals it.
-                    write!(
-                        f,
-                        " One thing is NOT back as it was: the shepherd recorded the new release \
-                         against {sheep} when it accepted the start, and that record could not be \
-                         put back. It is correct in the running process and wrong on disk, so a \
-                         daemon restart followed by `shep muster` would bring {sheep} back on the \
-                         release that was just rejected. Re-register it from its own Flockfile to \
-                         correct the record before restarting the shepherd."
-                    )?;
-                }
                 Ok(())
             }
             Self::Stranded { sheep, sha, ids } => {
@@ -561,12 +605,19 @@ impl fmt::Display for Error {
             Self::BuildTimedOut { after } => write!(
                 f,
                 "the build did not finish within {after:?} and was abandoned; raise \
-                 build_timeout in [dog.deploy] if it legitimately needs longer"
+                 build_timeout under [deploy] in dogs.toml if it legitimately needs longer"
             ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),
                 None => write!(f, "the build was killed by a signal"),
             },
+            Self::Panicked { sheep, what } => write!(
+                f,
+                "the deploy of {sheep} panicked partway: {what}. That is a bug in shep-deploy \
+                 rather than in {sheep}. Compare `current`, deploy.toml and `shep describe \
+                 {sheep}` against each other before deploying again, and please report the \
+                 panic"
+            ),
         }
     }
 }
@@ -595,6 +646,7 @@ impl core::error::Error for Error {
             | Self::AlreadyDeploying { .. }
             | Self::Unverified { .. }
             | Self::Stranded { .. }
+            | Self::Panicked { .. }
             | Self::Build { .. } => None,
         }
     }
@@ -620,6 +672,23 @@ mod tests {
 
     use shep_client::shep_core::protocol::{RpcError, RpcErrorCode};
 
+    /// fails if the message for a panic stops naming all four things an
+    /// operator needs from it: which sheep, what the panic said, that the
+    /// bug is this dog's, and what to compare before deploying again.
+    #[test]
+    fn a_panic_names_the_sheep_the_text_and_the_way_out() {
+        let err = Error::Panicked {
+            sheep: "web".to_owned(),
+            what: "index out of bounds".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "the deploy of web panicked partway: index out of bounds. That is a bug in \
+             shep-deploy rather than in web. Compare `current`, deploy.toml and `shep describe \
+             web` against each other before deploying again, and please report the panic"
+        );
+    }
+
     /// fails if an Io error stops naming the path it failed on. A deploy
     /// touches many paths and "permission denied" without one is unactionable.
     #[test]
@@ -629,6 +698,24 @@ mod tests {
             source: std::io::Error::other("permission denied"),
         };
         assert!(err.to_string().contains("/srv/x/releases/abc/dist"));
+    }
+
+    /// fails if a path or a git message reaches the log with a character
+    /// that would rewrite the line. An artifact's path is the repository's
+    /// choice, and git quotes ref names, which are too.
+    #[test]
+    fn a_repository_chosen_string_cannot_forge_a_log_line() {
+        let io = Error::Io {
+            path: PathBuf::from("/srv/x/a\nb"),
+            source: std::io::Error::other("denied"),
+        };
+        assert!(io.to_string().contains("a?b"), "{io}");
+        let git = Error::Git {
+            command: "git fetch".to_owned(),
+            status: Some(128),
+            stderr: "fatal: bad ref a\u{202e}b".to_owned(),
+        };
+        assert!(git.to_string().contains("a?b"), "{git}");
     }
 
     /// fails if a git failure hides stderr. git's own message is the only

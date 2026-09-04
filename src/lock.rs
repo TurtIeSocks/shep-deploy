@@ -27,9 +27,26 @@
 //!
 //! `nix` is already in this crate's tree, as a dependency of `shep-core`, so
 //! this is a direct edge on something every build already compiles.
+//!
+//! # The second lock
+//!
+//! [`hold_record`] is the other one, on `deploy.toml.lock`, and it guards
+//! something the tree lock cannot: the record. `set_watch` writes the record
+//! without the tree lock on purpose, because a deploy holds that lock for a
+//! whole build and `--watch manual` is what an operator types during an
+//! incident. Without a lock of its own, a deploy and a `set_watch` could
+//! each read the record, each rename their own snapshot over it, and the
+//! later rename would drop the earlier update: a `deployed` that no longer
+//! matched `current`, or a `manual` that never landed. So every
+//! read-modify-write of the record takes this one, and holds it for exactly
+//! that long. Blocking, unlike the tree lock, because a holder keeps it for
+//! milliseconds and the caller wants the write to land, not a refusal. A
+//! deploy takes the tree lock first and this one inside it; `set_watch`
+//! takes only this one; nothing holding this one ever waits for the tree's.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use nix::errno::Errno;
@@ -37,6 +54,15 @@ use nix::fcntl::{Flock, FlockArg};
 
 use crate::error::Error;
 use crate::paths::Tree;
+
+/// The lock file's mode: owner only.
+///
+/// `flock(2)` needs nothing more than an open descriptor, so a lock file
+/// readable by other accounts is one any local user can take out from under
+/// the dog. Left at the default `0o644`, an unprivileged process could hold
+/// it forever and every deploy of that sheep would report
+/// [`Error::AlreadyDeploying`] against a rival that is not a deploy at all.
+const LOCK_MODE: u32 = 0o600;
 
 /// An exclusive hold on one sheep's deploy tree.
 ///
@@ -61,30 +87,72 @@ pub struct Deploying {
 /// the lock file cannot be created, naming it.
 pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
     let path = tree.lock_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
-    }
-
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
-
-    // `truncate(false)` above, deliberately. The file's contents are never
-    // read and never written, so truncating would be a write to a file another
-    // process is at that moment holding a lock on, for no reason.
+    let file = open_lock_file(&path)?;
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(held) => Ok(Deploying { _held: held }),
         Err((_, errno)) => Err(refusal(tree.sheep(), path, errno)),
     }
+}
+
+/// An exclusive hold on one sheep's record, for one read-modify-write.
+///
+/// Released when dropped, and by the kernel if the holder dies. See the
+/// module doc for why it is separate from [`Deploying`].
+#[derive(Debug)]
+pub struct Recording {
+    /// Held for its `Drop`.
+    _held: Flock<File>,
+}
+
+/// Takes the record lock, waiting for whoever has it.
+///
+/// Blocking, because every holder is inside one read and one write of a
+/// file a few hundred bytes long, and the caller wants its write to land
+/// rather than to be told to try again.
+///
+/// # Errors
+/// [`Error::Io`], naming the lock file, if it cannot be created or the
+/// lock cannot be taken. Never [`Error::AlreadyDeploying`]: contention here
+/// is waited out, not reported.
+pub fn hold_record(tree: &Tree) -> Result<Recording, Error> {
+    let path = tree.record_lock();
+    let file = open_lock_file(&path)?;
+    match Flock::lock(file, FlockArg::LockExclusive) {
+        Ok(held) => Ok(Recording { _held: held }),
+        Err((_, errno)) => Err(Error::Io {
+            path,
+            source: io::Error::from_raw_os_error(errno as i32),
+        }),
+    }
+}
+
+/// Opens (creating if need be) the lock file at `path`, owner-only, never
+/// through a link.
+fn open_lock_file(path: &std::path::Path) -> Result<File, Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::at(parent))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(LOCK_MODE)
+        // Never through a link. The tree is this dog's own, so nothing else
+        // should have put one here; if something has, the lock would land on
+        // whatever it points at, and that is not this tree.
+        .custom_flags(crate::shared::o_nofollow())
+        .open(path)
+        .map_err(Error::at(path))?;
+    // `truncate(false)` above, deliberately. The file's contents are never
+    // read and never written, so truncating would be a write to a file another
+    // process is at that moment holding a lock on, for no reason.
+    //
+    // `mode` only applies when the file is created, so a lock file left at the
+    // default mode by an earlier version is tightened here as well. Best
+    // effort: a file this process cannot chmod is one it does not own, and
+    // the lock still works on it.
+    let _ = file.set_permissions(Permissions::from_mode(LOCK_MODE));
+    Ok(file)
 }
 
 /// Why the lock could not be taken, told apart by the errno.
@@ -117,6 +185,36 @@ fn refusal(sheep: &str, path: PathBuf, errno: Errno) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fails if the record lock stops being exclusive, or stops waiting.
+    /// A holder keeps it for one read and one write; a second taker has
+    /// to wait that out rather than be refused, and then get it.
+    #[test]
+    fn the_record_lock_waits_for_the_holder_and_then_takes_over() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        let held = hold_record(&tree).expect("first hold");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiting = {
+            let tree = Tree::for_sheep(home.path(), "web");
+            std::thread::spawn(move || {
+                let second = hold_record(&tree).expect("second hold");
+                tx.send(()).expect("report");
+                drop(second);
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the second taker must wait while the first holds"
+        );
+
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the second taker gets the lock once the first lets go");
+        waiting.join().expect("thread");
+    }
     use crate::paths::Tree;
 
     /// fails if two holds on one tree can be taken at once.
@@ -181,6 +279,33 @@ mod tests {
                 "{errno:?} must not claim contention: {err}"
             );
         }
+    }
+
+    /// fails if the lock file can be opened by another account.
+    ///
+    /// `flock` needs only an open descriptor, so a file at the default mode
+    /// lets any local user hold the lock and turn every deploy of that sheep
+    /// into a false `AlreadyDeploying`, indefinitely. Both paths are pinned:
+    /// a file this call creates, and one left wide open by an earlier version.
+    #[test]
+    fn the_lock_file_is_owner_only() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("lock file")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        drop(hold(&tree).expect("creates the lock file"));
+        assert_eq!(mode(&tree.lock_file()), LOCK_MODE, "as created");
+
+        std::fs::set_permissions(tree.lock_file(), Permissions::from_mode(0o644))
+            .expect("loosen, as an older version left it");
+        drop(hold(&tree).expect("reopens the lock file"));
+        assert_eq!(mode(&tree.lock_file()), LOCK_MODE, "tightened on reopen");
     }
 
     /// fails if two sheep contend with each other. The lock is per tree, and

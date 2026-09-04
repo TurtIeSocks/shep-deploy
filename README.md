@@ -68,7 +68,12 @@ rather than ignored and silently building nothing.
    sha.
 2. `git worktree add` the new sha, sharing the object store.
 3. Symlink the shared files in: whatever git ignores and `.shepignore` does
-   not.
+   not. A `.shepignore` line is a bare name, matched at any depth, or a path
+   with a `/` in it, anchored to the checkout. A leading `/` anchors too, a
+   leading `./` and a trailing `/` are dropped, and `\!name` names a file
+   that begins with `!`, as in `.gitignore`. A glob, a bare `!` negation, any
+   other backslash escape or a `..` is refused by name rather than matched
+   against nothing.
 4. Run the build, as the app's `user` if it sets one.
 5. `rename(2)` `current` onto the new release.
 6. `Reload` the sheep.
@@ -90,7 +95,8 @@ Everything lives under `$SHEP_HOME/deploy/<sheep>/`:
 git/                 one bare clone, shared by every release
 releases/<sha>/      a worktree per release
 current -> releases/<sha>
-deploy.toml          remote, branch, deployed sha, held sha, verify mode, watch mode
+deploy.toml          remote, branch, deployed sha, held sha, verify mode, watch mode,
+                     and the app as it was before adoption (owner-only: it holds env)
 ```
 
 The sheep's `cwd` is `current`, permanently. Set it explicitly when you
@@ -115,10 +121,10 @@ where every registered sheep stands and starts, registers and writes nothing.
 
 Adopted as a dog, `shep-deploy` takes no arguments and polls instead. Every 30
 seconds by default, it deploys any `watch = "auto"` target whose branch has
-moved. Configure it in `shep.toml`:
+moved. Configure it in `$SHEP_HOME/dogs.toml`:
 
 ```toml
-[dog.deploy]
+[deploy]
 interval = "30s"
 retention = 5
 git_timeout = "5m"
@@ -127,13 +133,22 @@ passthrough = ["CARGO_HOME"]
 ```
 
 All five are read once, when the dog starts, so changing any takes a `shep
-restart deploy`.
+restart deploy`. A shep older than 0.1.32 read the same keys from
+`[dog.deploy]` in `shep.toml`; a newer one moves that section into
+`dogs.toml` the next time the shepherd boots.
 
-`retention` is how many releases each target keeps **besides the live one**, so
-a target holds up to `retention + 1` directories. The live release is spared
-unconditionally, whatever its age. It cannot be below 2: the release a failed
-deploy rolls back to is the second newest, so anything lower would silently
-disable rollback, and it is refused rather than clamped.
+`retention` is how many of the newest releases each target keeps. Two are
+spared whatever their age: the one `current` points at, and the one
+`deploy.toml` names. They are the same release except after a deploy died
+between its swap and its record write, so a target holds `retention`
+directories in the ordinary case and up to two more after that. It cannot be
+below 2: the release a failed deploy rolls back to is the second newest, so
+anything lower would silently disable rollback, and it is refused rather than
+clamped.
+
+`interval`, `git_timeout` and `build_timeout` are refused under a second. A
+bare number is milliseconds, so `interval = "30"` is thirty milliseconds and a
+dog fetching thirty times a second; write `"30s"`.
 
 `git_timeout` bounds the fetch, which is the only git call that talks to a network. The rest operate on local directories and cannot hang on a remote. Targets are deployed one at a
 time, so without it a remote that drops packets rather than refusing them stops
@@ -150,7 +165,9 @@ per-target failure, not to put a schedule on slow work. A build past it is
 killed as a process group, so whatever the build command started goes with it.
 
 `passthrough` names environment variables a build may keep from the dog's own
-environment. See Security below for why that list starts empty.
+environment. See Security below for why that list starts empty. An entry that
+is not a variable name, or is listed twice, is refused; one that names a
+variable the dog was not started with is said at build time, once per build.
 
 One target's failure never stops the others, and never stops the dog. Each
 target's outcome is reported on its own and the loop carries on. `up to date`
@@ -226,7 +243,9 @@ cleared still shows until the next tick.
 
 `setup` takes a sheep over: it builds the tree, fetches the repository, links
 the shared files in, builds the first release, and re-registers the sheep with
-its `cwd` set to `current`.
+its `cwd` set to `current`. A Flockfile that names no `interpreter` keeps the
+one the sheep already ran under: `shep start` fills that in from `shep.toml`'s
+`[interpreters]`, and this dog cannot read that map.
 
 The first cutover is the one deploy that may have downtime. It runs two
 instances at once, so an app that does not bind with `SO_REUSEPORT` cannot take
@@ -273,6 +292,18 @@ yet, so there is nothing to verify against and the deploy is refused.
 `verify = "alive"` is the deliberate downgrade: a new process, still running
 ten seconds later.
 
+Both modes watch the flock after the turnover. `probed` requires the same
+processes, all `Online`, at every look for ten seconds; `alive` sleeps ten
+seconds and then polls for `Online` until the reload budget runs out, or one
+more ten seconds, whichever is longer. `Online` is a verdict shep gives once:
+a replacement that passes its probe and dies moments later is respawned under
+a new pid with the reload already committed, and a replacement whose second
+probe fails is put back to `starting` and left there. The pid and the status
+are the evidence of either, and only inside the dwell. An app that sets
+`reuse_port` with a probe gets a longer one, its own `listen_timeout`, because
+shep re-runs its probe after the old instance drains and can demote it any
+time up to that.
+
 The first cutover is also the one deploy that is not verified against the
 readiness probe. shep reports a freshly started process `Online` once its
 `listen_timeout` elapses, whatever the probe said, and only aborts a *reload*
@@ -312,7 +343,10 @@ serving. Both are caught.
 ## Removing it
 
 `shep-deploy on-remove` is the lifecycle hook: shep runs it before forgetting
-the dog, and it puts every sheep back where it ran before the dog took over. A
+the dog, and it puts every sheep back as it ran before the dog took over: the
+whole definition `setup` recorded, `env`, instances and probes included. A
+record written before 2026-09-04 carries only the old `cwd` and script, and
+those go back over the shepherd's current definition. A
 sheep the dog bootstrapped has nowhere to go back to, so it is left running
 from `current` and the report says exactly that, with the path.
 
@@ -349,6 +383,14 @@ docs recommend running the shepherd as root so it can drop privileges per app.
 So the default arrangement is a repository's build script running as root, once
 per deploy.
 
+A committed Flockfile is refused for setting anything the shepherd acts on at
+its own uid: `user` and `group`, an `exec` probe (the daemon runs it through
+`sh -c`, forever, ignoring `user`), `out_file` and `err_file` (the daemon
+opens and `shep flush` truncates them), an `http` or `tcp` probe whose target
+is not loopback (the daemon makes the connection), and `watch` (the daemon
+walks the working directory as itself, following symlinks). Every one of them
+stays available in `Flockfile.override.toml`, which is yours.
+
 Set `user` on the app and the build drops to that user's uid and primary group,
 with the shepherd's supplementary groups cleared, before it runs anything. A
 compromised build then gets that app's privileges and nothing more.
@@ -359,7 +401,7 @@ operator's, not a deploy dog's.
 
 A build starts from a cleared environment, not this process's. It gets `PATH`,
 `HOME`, `LANG`, `LC_ALL` and `TZ`, whatever `passthrough` names in
-`[dog.deploy]` in `shep.toml`, and the release's own `[dog.deploy.build] env`.
+`[deploy]` in `dogs.toml`, and the release's own `[dog.deploy.build] env`.
 Nothing else. Dropping uid and gid bounds what a build can touch; it does
 nothing about what it can read out of its own environment, because those values
 are copied in before the drop happens. A dog started with a registry token in
@@ -370,6 +412,12 @@ a build lets the build authenticate as you anywhere that agent is trusted.
 Fetching happens in the dog's own process and keeps its own environment, so a
 private repository still clones; only the build loses the socket. Name it in
 `passthrough` if a build genuinely needs it.
+
+The release's own `Flockfile.toml` is read in the dog's process too, before
+any build drops to `user`, so a committed one that is a symlink is refused
+unread, and a parse error names a line number and never quotes the line. Your
+`Flockfile.override.toml` is the one file that is followed through its link,
+because this dog made that link.
 
 `build.artifacts` may only name paths that really land inside the release or
 the dog's own build cache, resolved rather than spelled. A `..`, an absolute

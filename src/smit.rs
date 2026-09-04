@@ -60,18 +60,25 @@ pub fn text(state: &State) -> String {
     format!("{mark} {}@{sha}", state.branch)
 }
 
-/// Shorten `text` to [`Smit::MAX_CHARS`], if it is already not that short.
+/// Shorten `text` to [`Smit::MAX_CHARS`] and drop any control character, so
+/// what is published is something the shepherd's own
+/// [`Smit::from_str`](core::str::FromStr::from_str) accepts.
 ///
 /// A branch name is the only variable-length part of a smit, and a branch
 /// name long enough to matter is a real thing an operator can name, not a
 /// mistake to refuse over. Publishing is cosmetic: showing a shortened mark
-/// beats showing nothing at all because [`Smit::from_str`](core::str::FromStr::from_str)
-/// would have refused the full one.
+/// beats showing nothing at all because the daemon would have refused the
+/// full one.
+///
+/// Control characters get the same treatment for the same reason. git
+/// refuses them in a ref name, so nothing this crate writes produces one,
+/// but `deploy.toml` is hand-edited and a smit the daemon refuses is
+/// refused on every tick for as long as the record says so.
 fn fit(text: String) -> String {
-    if text.chars().count() <= Smit::MAX_CHARS {
-        return text;
-    }
-    text.chars().take(Smit::MAX_CHARS).collect()
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(Smit::MAX_CHARS)
+        .collect()
 }
 
 /// Publish `sheep`'s smit, built from `state`, to the shepherd.
@@ -94,15 +101,9 @@ mod tests {
 
     fn target(watch: Watch, deployed: Option<&str>) -> State {
         State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
             deployed: deployed.map(str::to_owned),
-            failed: None,
-            verify: crate::state::Verify::default(),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: std::path::PathBuf::from("/srv/x"),
+            ..crate::fixtures::state()
         }
     }
 
@@ -195,44 +196,16 @@ mod tests {
     struct Recording(std::cell::RefCell<Vec<(String, String)>>);
 
     impl Daemon for Recording {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(
-            &self,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn describe(
-            &self,
-            _sheep: &str,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn start(
-            &self,
-            _apps: Vec<shep_client::shep_core::config::AppConfig>,
-        ) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
-            unimplemented!()
-        }
         async fn set_smit(&self, sheep: &str, text: &str) -> Result<(), Error> {
             self.0
                 .borrow_mut()
                 .push((sheep.to_owned(), text.to_owned()));
             Ok(())
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, describe, start, delete, reload, restart, save_roll,
+        );
     }
 
     /// fails if `publish` asks the daemon for the wrong sheep, or for text

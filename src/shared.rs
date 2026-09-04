@@ -16,11 +16,14 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 
 use crate::error::Error;
 
@@ -57,10 +60,13 @@ use crate::error::Error;
 /// `wait_with_output` does internally and the reason it cannot be used here:
 /// it also waits, and waiting is what this function needs to bound.
 ///
-/// Residual, stated rather than hidden: this still occupies the caller for up
-/// to `budget`. The runtime is single-threaded, so a target whose remote is a
-/// black hole delays the others by that much. Bounded and reported beats
-/// unbounded and silent, which is the whole of what this buys.
+/// Residual, stated rather than hidden: this still occupies its caller for up
+/// to `budget`, and the poll loop deploys targets one at a time, so a target
+/// whose remote is a black hole delays the others by that much. It no longer
+/// occupies the RUNTIME: every caller runs it through [`off_thread`], so a
+/// stop, a refused handshake or the client's reconnect are all still served
+/// while it waits. Bounded and reported beats unbounded and silent, which is
+/// the whole of what this buys.
 ///
 /// # Errors
 /// [`Error::Git`] naming the command and a `None` status if `budget` elapses
@@ -76,10 +82,7 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         // bounded and not.
         .process_group(0)
         .spawn()
-        .map_err(|source| Error::Io {
-            path: dir.to_owned(),
-            source,
-        })?;
+        .map_err(Error::at(dir))?;
 
     // Taken before the loop so the child always has a reader, whatever the
     // loop then decides about the clock. See the doc above.
@@ -148,7 +151,7 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         // NOT `abandon` here. That signals the process group by negating
         // `child.id()`, which is only safe while the child is alive: by this
         // point `try_wait` has reaped it, and the wait above can have taken
-        // the whole budget, which `[dog.deploy]` allows to be minutes. A pid
+        // the whole budget, which the dog's `[deploy]` section allows to be minutes. A pid
         // recycled in that window would put a SIGKILL into an unrelated
         // process group, and the dog runs as root under the arrangement
         // shep's own docs recommend, so the usual same-uid check would not
@@ -180,6 +183,72 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
     decode(dir, args, status, stdout, stderr)
 }
 
+/// Kills a whole process group by the leader's pid.
+///
+/// One spelling, shared, because two are what drift. `crate::build` abandons a
+/// build the same way and cannot share the rest: its child is a
+/// `tokio::process::Child` and this one is a `std::process::Child`, so the
+/// fallback differs while the signal and the group form must not.
+///
+/// `killpg(2)` through `nix` rather than spawning `kill`. The spawn was there
+/// because the crate forbids unsafe and `libc::killpg` is unsafe; `nix` wraps
+/// the same call safely and is already a dependency. It also removes the one
+/// place this crate ran a binary found on `PATH` other than `git`, and the
+/// fork it cost on every abandoned build.
+///
+/// The failure is ignored on purpose. Every caller is already giving up on the
+/// child, and a kill that cannot be delivered leaves nothing they can do about
+/// it that they have not already decided. A pid too large for `pid_t` is the
+/// same case: no such group can exist.
+pub(crate) fn kill_group(pid: u32) {
+    // Zero is not a group either: `killpg(0)` signals the CALLER's group,
+    // which is this dog and every build it has running.
+    if pid == 0 {
+        return;
+    }
+    if let Ok(pid) = i32::try_from(pid) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+}
+
+/// `text` with every control character replaced by `?`, for a message that
+/// quotes something the deployed repository chose.
+///
+/// `Display` and `Path::display` pass control bytes through, so a committed
+/// `artifacts = ["\u{1b}[2J..."]` would write raw terminal escapes into the
+/// dog's log, and a newline would forge a second log line. Replaced rather
+/// than escaped, because the reader wants to recognise the entry, not
+/// reconstruct it: the file is right there.
+pub(crate) fn printable(text: impl std::fmt::Display) -> String {
+    text.to_string()
+        .chars()
+        .map(|c| if forges_a_line(c) { '?' } else { c })
+        .collect()
+}
+
+/// Whether `c` can change how a log line is read: a control character, or
+/// one of the Unicode format and separator characters that reverse, split
+/// or hide text (the bidi marks, overrides and isolates, the zero-width and
+/// soft-hyphen family, the line and paragraph separators, the byte order
+/// mark, and the tag block that carries invisible text). None of them
+/// belongs in a file name or a TOML key an operator meant. Shared with
+/// `paths::is_sheep_name` and `State::validate`, so what is refused in a
+/// name is the same set that is replaced in a message.
+pub(crate) fn forges_a_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
 /// Kills a timed-out child and everything it spawned, then reaps it.
 ///
 /// The group, not just the pid. `Child::kill` signals the immediate process
@@ -190,31 +259,12 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
 /// past the budget, which is the exact failure this function exists to
 /// prevent.
 ///
-/// `kill` the command rather than `libc::killpg`, because the crate forbids
-/// unsafe outright. Same "ask the host rather than reimplement its answer"
-/// idiom `crate::build` uses for `id`, and for the same reason.
-///
 /// Reaped afterwards: leaving a zombie git would keep the bare clone's lock
 /// and fail the next tick for a reason that looks unrelated.
-/// Kills a whole process group by the leader's pid.
-///
-/// One spelling, shared, because two are what drift. `crate::build` abandons a
-/// build the same way and cannot share the rest: its child is a
-/// `tokio::process::Child` and this one is a `std::process::Child`, so the
-/// fallback differs while the signal and the group form must not.
-///
-/// The failure is ignored on purpose. Every caller is already giving up on the
-/// child, and a kill that cannot be delivered leaves nothing they can do about
-/// it that they have not already decided.
-pub(crate) fn kill_group(pid: u32) {
-    let group = format!("-{pid}");
-    let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
-}
-
 fn abandon(child: &mut std::process::Child) {
     kill_group(child.id());
-    // The group signal is the one that matters; this covers a host whose
-    // `kill` refuses the group form.
+    // The group signal is the one that matters; this covers a child that
+    // left its group before the signal landed.
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -235,6 +285,68 @@ fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8
         let _ = tx.send(buf);
     });
     rx
+}
+
+/// Runs `work` on tokio's blocking pool and answers with its result.
+///
+/// Every git call in this crate is a blocking `std::process::Command`, and
+/// the artifact copy is blocking I/O. Run on the runtime's one thread, each
+/// stalled everything else polled on it for its whole duration: a five
+/// minute fetch against a remote that drops packets meant five minutes in
+/// which a `SIGTERM` went unanswered, a refused handshake went unnoticed and
+/// the client's reconnect could not run. On the pool, the runtime keeps
+/// turning and the caller alone waits.
+///
+/// A panic inside `work` is re-raised here rather than turned into an
+/// error, so it reaches the poll loop's own guard and is reported as the
+/// bug it is. The only other way a blocking task ends without a result is
+/// the runtime shutting down underneath it, which is the process ending.
+///
+/// # Errors
+/// Whatever `work` returns.
+pub(crate) async fn off_thread<T, F>(work: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(join) => match join.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(join) => panic!("a blocking task was cancelled: {join}"),
+        },
+    }
+}
+
+/// `O_NOFOLLOW`, without a libc dependency or an unsafe block.
+///
+/// The value is fixed by each platform's ABI and cannot change without
+/// breaking every compiled program on it. Same "ask the host rather than
+/// reimplement its answer" spirit as `crate::build`'s use of `id`, except
+/// here the host's answer is a constant. Shared by the artifact copy and the
+/// Flockfile read, which both open a path the deployed repository chose.
+pub(crate) const fn o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0o400_000
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        0x0100
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        compile_error!("O_NOFOLLOW's value is not known for this target")
+    }
+}
+
+/// Whether `err` is `ELOOP`: the kernel refusing to follow a symlink, which
+/// is what an `O_NOFOLLOW` open answers when the last component is one.
+///
+/// By errno rather than `io::ErrorKind::FilesystemLoop`, which is not stable
+/// yet. `nix` already names the number for each platform.
+pub(crate) fn is_eloop(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32)
 }
 
 /// How often [`run_git_within`] asks whether the child has finished.
@@ -273,10 +385,7 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|source| Error::Io {
-            path: dir.to_owned(),
-            source,
-        })?;
+        .map_err(Error::at(dir))?;
 
     decode(dir, args, output.status, output.stdout, output.stderr)
 }
@@ -334,26 +443,60 @@ fn decode(
 /// file impossible to symlink without dragging its tracked siblings along
 /// as dangling links.
 ///
+/// `-z` terminates each entry with NUL instead of newline, and it is the
+/// only output mode in which a path is never quoted. Without it git wraps
+/// any path holding a space, a quote or a non-ASCII byte in `"..."` with
+/// C-style escapes, `core.quotePath=false` notwithstanding, which covers only
+/// the non-ASCII case. The quotes then became part of the path: a
+/// gitignored `sp ace` was linked into the release as `"sp ace"`, pointing at
+/// a file of that name that does not exist, and `symlink(2)` does not check.
+/// Measured 2026-09-03.
+///
 /// # Errors
 /// [`Error::Io`] if `git` cannot be launched or answers with non-UTF-8
 /// bytes; [`Error::Git`] if it launches but exits non-zero.
 pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
     let stdout = run_git(
         checkout,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "status",
-            "--ignored=matching",
-            "--porcelain",
-        ],
+        &["status", "--ignored=matching", "--porcelain", "-z"],
     )?;
 
-    Ok(stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("!! "))
-        .map(|path| PathBuf::from(path.trim_end_matches('/')))
-        .collect())
+    // Walked as records rather than filtered as fields: a rename or a copy
+    // (`R` or `C` in either status column) is followed by a second field
+    // holding the original path, with no status of its own, and a bare field
+    // must not be read as an entry.
+    let mut fields = stdout.split('\0');
+    let mut found = Vec::new();
+    while let Some(entry) = fields.next() {
+        let Some((status, path)) = entry.split_at_checked(3) else {
+            continue;
+        };
+        if status.as_bytes()[..2]
+            .iter()
+            .any(|b| matches!(b, b'R' | b'C'))
+        {
+            fields.next();
+        }
+        if status == "!! " {
+            found.push(PathBuf::from(path.trim_end_matches('/')));
+        }
+    }
+    Ok(found)
+}
+
+/// One `.shepignore` entry, with the two things it can mean told apart at
+/// parse time rather than at every match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// A bare name: matches a path component at any depth, so `node_modules`
+    /// excludes the top-level directory and every `packages/*/node_modules`
+    /// beneath it. `.gitignore`'s own rule for a pattern with no `/`.
+    Anywhere(String),
+    /// A path: matches only that subtree from the checkout root, so
+    /// `packages/app/dist` never touches a top-level `dist`. Written with a
+    /// `/` inside it, or with a leading `/`, which `.gitignore` also reads
+    /// as "anchor this here".
+    Anchored(PathBuf),
 }
 
 /// The patterns listed in `checkout`'s `.shepignore`, one per line, blank
@@ -363,20 +506,27 @@ pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// zero-configuration case - no `.shepignore` means share everything
 /// [`ignored_present`] finds.
 ///
-/// A pattern containing a glob metacharacter (`*`, `?`, `[`) is refused
-/// with [`Error::Config`] rather than accepted and silently matched
-/// against nothing. `.shepignore`'s syntax is narrower than `.gitignore`'s,
-/// see [`to_link`] for what it does support, and an operator who writes
-/// `*.log` believing otherwise deserves a failure they see immediately,
-/// naming the pattern, rather than an artifact this subtraction was built
-/// to keep out quietly staying shared forever because the glob never
-/// matched anything.
+/// Every spelling `.gitignore` allows and this file does not is refused with
+/// [`Error::Config`] naming the pattern, never accepted and silently matched
+/// against nothing: a glob (`*`, `?`, `[`), a negation (`!name`), any
+/// backslash escape other than `\!`, and a `..` component. `.shepignore`'s syntax is narrower than `.gitignore`'s, see
+/// [`to_link`] for what it does support, and an operator who writes `*.log`
+/// believing otherwise deserves a failure they see immediately rather than
+/// an artifact this subtraction was built to keep out quietly staying shared
+/// forever because the glob never matched anything.
+///
+/// Three spellings `.gitignore` allows ARE honoured, because each used to be
+/// accepted and then matched nothing: a leading `/` anchors the pattern to
+/// the checkout root, a leading `./` is dropped, and a trailing `/` is not
+/// part of the name. Before 2026-09-03 `/dist` was read as a two-component
+/// path that no relative entry could ever start with, so the build output it
+/// named stayed shared. `\!name` names a file that really begins with `!`.
 ///
 /// # Errors
 /// [`Error::Io`], naming `checkout/.shepignore`, if the file exists but
 /// cannot be read for any reason other than simply not being there.
-/// [`Error::Config`] if any pattern contains a glob metacharacter.
-pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<String>, Error> {
+/// [`Error::Config`] if any pattern is one of the refused spellings above.
+pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<Pattern>, Error> {
     let path = checkout.join(".shepignore");
 
     let text = match fs::read_to_string(&path) {
@@ -388,41 +538,208 @@ pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<String>, Error> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|pattern| {
-            if pattern.contains(['*', '?', '[']) {
-                Err(Error::Config(format!(
-                    ".shepignore pattern {pattern:?} uses glob syntax (`*`, `?`, `[`), which \
-                     is not supported - a .shepignore pattern is a bare name (matches at any \
-                     depth) or a path containing `/` (anchored to the checkout root), nothing \
-                     else"
-                )))
-            } else {
-                Ok(pattern.to_owned())
-            }
-        })
+        .map(parse_pattern)
         .collect()
 }
 
-/// Whether `path` (relative to the checkout) is named by `.shepignore`
-/// entry `pattern`.
+/// One trimmed, non-blank, non-comment `.shepignore` line as a [`Pattern`].
 ///
-/// Follows `.gitignore`'s own anchoring rule and nothing more: a pattern
-/// with no `/` in it matches a path component at any depth, so
-/// `node_modules` excludes both the top-level directory and every
-/// `packages/*/node_modules` beneath it. A pattern containing `/` is
-/// anchored to the checkout root instead and matches only that exact
-/// subtree, so `packages/app/dist` never touches a top-level `dist`.
-/// Wildcards never reach this function: `shepignore_patterns` refuses any
-/// pattern containing a glob metacharacter before `to_link` ever calls
-/// this, rather than accepting one and silently matching nothing.
-fn pattern_matches(path: &Path, pattern: &str) -> bool {
-    let pattern = Path::new(pattern);
+/// # Errors
+/// [`Error::Config`] naming the line, for a glob, a negation, a backslash
+/// other than the leading `\!` escape, a `..` component, or a line that is
+/// nothing but slashes and dots.
+fn parse_pattern(line: &str) -> Result<Pattern, Error> {
+    let refuse = |why: &str| {
+        Error::Config(format!(
+            ".shepignore pattern {line:?} {why} - a .shepignore pattern is a bare name \
+             (matches at any depth) or a path containing `/` (anchored to the checkout root), \
+             nothing else"
+        ))
+    };
 
-    if pattern.components().count() == 1 {
-        path.components()
-            .any(|component| component.as_os_str() == pattern.as_os_str())
+    if line.contains(['*', '?', '[']) {
+        return Err(refuse(
+            "uses glob syntax (`*`, `?`, `[`), which is not supported",
+        ));
+    }
+    if line.starts_with('!') {
+        return Err(refuse(
+            "is a negation, which is not supported: everything is shared unless named here. A \
+             name that really begins with `!` is written `\\!name`, as in .gitignore",
+        ));
+    }
+    // `.gitignore`'s escape for a name that begins with `!`, honoured for the
+    // same reason the bare form is refused: the two spellings mean different
+    // things, and this one is the only way to name such a file.
+    let unescaped;
+    let line = match line.strip_prefix("\\!") {
+        Some(rest) => {
+            unescaped = format!("!{rest}");
+            unescaped.as_str()
+        }
+        None => line,
+    };
+    // Every other backslash is a `.gitignore` escape this file does not
+    // read, and a pattern carrying one would be kept verbatim and match
+    // nothing: `\#name` never names `#name`.
+    if line.contains('\\') {
+        return Err(refuse(
+            "carries a backslash; the only escape this file reads is a leading `\\!`",
+        ));
+    }
+
+    let anchored_by_slash = line.starts_with('/');
+    // Leading `/` and `./` are stripped until neither is left: one pass
+    // each left `.//x` as `/x`, which no relative entry starts with. What
+    // remains is either empty, or a body whose first component is a name.
+    let mut body = line;
+    loop {
+        let stripped = body.trim_start_matches('/').trim_start_matches("./");
+        if stripped == body {
+            break;
+        }
+        body = stripped;
+    }
+    let body = body.trim_end_matches('/');
+    // Nothing left, or a lone `.`, is a name no path component ever has.
+    // `Path` keeps only a leading `.` as a component and drops interior ones,
+    // so this catches `.` and `/./` while `x/./y` is left alone: it matches
+    // as `x/y`, the same way on both sides of the comparison.
+    if body.is_empty()
+        || Path::new(body)
+            .components()
+            .any(|component| component == Component::CurDir)
+    {
+        return Err(refuse("names nothing"));
+    }
+    if Path::new(body)
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(refuse(
+            "climbs out of the checkout with `..`, so it cannot name anything in it",
+        ));
+    }
+
+    if anchored_by_slash || body.contains('/') {
+        Ok(Pattern::Anchored(PathBuf::from(body)))
     } else {
-        path.starts_with(pattern)
+        Ok(Pattern::Anywhere(body.to_owned()))
+    }
+}
+
+/// Whether `path` (relative to the checkout) is named by `pattern`.
+///
+/// The two arms are the two meanings [`Pattern`] documents. Wildcards never
+/// reach here: [`shepignore_patterns`] refuses them before [`to_link`] ever
+/// calls this.
+fn pattern_matches(path: &Path, pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Anywhere(name) => path
+            .components()
+            .any(|component| component.as_os_str() == name.as_str()),
+        Pattern::Anchored(prefix) => path.starts_with(prefix),
+    }
+}
+
+/// `path` with every symlink and `..` resolved as far as the filesystem
+/// allows, for comparing two spellings of one place.
+///
+/// The dog and the daemon can resolve `$SHEP_HOME` to different spellings
+/// of the same directory (one through a symlinked home, say), and the
+/// daemon hands back the spelling it registered. A literal comparison then
+/// calls two names for one directory different, and both places that
+/// compare a registered `cwd` with a tree's `current` decide something
+/// irreversible on the answer: whether a sheep is already running from the
+/// tree (`optin::prepare`, which otherwise tells the operator to remove
+/// it), and whether the cutover registered it (`restore`, which otherwise
+/// leaves it there).
+///
+/// Three rungs, each taken only when the one above cannot be. The whole
+/// path canonicalised; failing that, the parent canonicalised with the
+/// last component kept as written, which is what a `current` that dangles
+/// needs, since the link itself is real even when its target is gone; and
+/// failing that too, the path as given. Never an error: a path that cannot
+/// be resolved at all is compared as spelled, the way it always was.
+#[must_use]
+pub fn resolved(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(real_parent) = fs::canonicalize(parent)
+    {
+        return real_parent.join(name);
+    }
+    path.to_path_buf()
+}
+
+/// Whether `a` and `b` name the same place, by [`resolved`].
+#[must_use]
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    resolved(a) == resolved(b)
+}
+
+/// The relative paths a release shares from the operator's own checkout.
+///
+/// Only [`to_link`] builds one, and that is the whole point of the type.
+/// [`crate::flockfile`] treats the presence of `Flockfile.override.toml` in
+/// this list as proof that the override is the operator's file rather than
+/// one the repository committed, and proof has to come from the thing that
+/// did the linking. A plain slice any caller could assemble was the same
+/// evidence with no chain of custody: a wrong or lazy caller could mint the
+/// answer. With the constructor private the only way to hold one is to have
+/// asked [`to_link`], which read the operator's checkout to make it.
+///
+/// Read-only afterwards. It derefs to a slice for [`link_into`] and the
+/// tests, and answers [`Self::includes_override`] for `flockfile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromCheckout(Vec<PathBuf>);
+
+impl FromCheckout {
+    /// Whether the operator's `Flockfile.override.toml` is among the paths.
+    ///
+    /// Answered from this list, not from the filesystem. Three versions of
+    /// this check asked the filesystem and all three were wrong, the last
+    /// one subtly enough to be worth recording.
+    ///
+    /// It required the override to resolve OUTSIDE the release, on the
+    /// grounds that the operator's arrives as a symlink into their checkout.
+    /// A repository can satisfy that in two commits. Release A ships an
+    /// ordinary tracked file holding `user = "root"` under some innocuous
+    /// name, and goes live, which by this crate's own invariant means
+    /// `current` points at it. Release B then commits
+    /// `Flockfile.override.toml` as a symlink to
+    /// `../../current/.deploy-payload.toml`. That resolves into release A,
+    /// which is outside release B, so the check passed and the refusal was
+    /// skipped. Demonstrated 2026-08-28.
+    ///
+    /// The lesson is not that the rule needed another clause. It is that
+    /// provenance cannot be recovered from a path once the path exists:
+    /// whoever can write the tree can write the evidence. [`to_link`] is
+    /// the only thing that knows which files came from the operator's
+    /// checkout, because it is what chose them, so the answer travels from
+    /// there instead of being reconstructed later.
+    #[must_use]
+    pub fn includes_override(&self) -> bool {
+        self.0
+            .iter()
+            .any(|path| path == Path::new(crate::flockfile::OVERRIDE))
+    }
+
+    /// A list the tests assemble by hand. Test builds only, so production
+    /// code has exactly one way to hold one: asking [`to_link`].
+    #[cfg(test)]
+    pub fn of(paths: Vec<PathBuf>) -> Self {
+        Self(paths)
+    }
+}
+
+impl std::ops::Deref for FromCheckout {
+    type Target = [PathBuf];
+
+    fn deref(&self) -> &[PathBuf] {
+        &self.0
     }
 }
 
@@ -441,28 +758,30 @@ fn pattern_matches(path: &Path, pattern: &str) -> bool {
 ///
 /// # Errors
 /// Whatever [`ignored_present`] or [`shepignore_patterns`] returns.
-pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
+pub fn to_link(checkout: &Path) -> Result<FromCheckout, Error> {
     let ignored = ignored_present(checkout)?;
     let patterns = shepignore_patterns(checkout)?;
 
-    Ok(ignored
-        .into_iter()
-        .filter(|path| {
-            // The operator's override is the one entry `.shepignore` cannot
-            // reach. `.shepignore` is committed by the deployed repository,
-            // and this list is the whole of the evidence
-            // `flockfile::is_operators` has that the override came from the
-            // operator rather than from the repo. A repo that can delete the
-            // entry deletes every pin the operator wrote in the override,
-            // `user` among them, and a build pinned to an unprivileged
-            // account runs as the dog's own uid instead. Silently: nothing
-            // errors, because an absent override is a legitimate state.
-            path == Path::new(crate::flockfile::OVERRIDE)
-                || !patterns
-                    .iter()
-                    .any(|pattern| pattern_matches(path, pattern))
-        })
-        .collect())
+    Ok(FromCheckout(
+        ignored
+            .into_iter()
+            .filter(|path| {
+                // The operator's override is the one entry `.shepignore` cannot
+                // reach. `.shepignore` is committed by the deployed repository,
+                // and this list is the whole of the evidence
+                // `FromCheckout::includes_override` has that the override came
+                // from the operator rather than from the repo. A repo that can delete the
+                // entry deletes every pin the operator wrote in the override,
+                // `user` among them, and a build pinned to an unprivileged
+                // account runs as the dog's own uid instead. Silently: nothing
+                // errors, because an absent override is a legitimate state.
+                path == Path::new(crate::flockfile::OVERRIDE)
+                    || !patterns
+                        .iter()
+                        .any(|pattern| pattern_matches(path, pattern))
+            })
+            .collect(),
+    ))
 }
 
 /// Symlinks every path in `paths` from `checkout` into `release`, creating
@@ -500,21 +819,15 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// `.shepignore` that shares something the release builds for itself, which
 /// the operator fixes by editing that file rather than by looking at the
 /// filesystem. The message names the colliding path and the file to edit.
-pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(), Error> {
-    let checkout = fs::canonicalize(checkout).map_err(|source| Error::Io {
-        path: checkout.to_owned(),
-        source,
-    })?;
+pub fn link_into(release: &Path, checkout: &Path, paths: &FromCheckout) -> Result<(), Error> {
+    let checkout = fs::canonicalize(checkout).map_err(Error::at(checkout))?;
 
-    for relative in paths {
+    for relative in paths.iter() {
         let target = checkout.join(relative);
         let link = release.join(relative);
 
         if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent).map_err(|source| Error::Io {
-                path: parent.to_owned(),
-                source,
-            })?;
+            fs::create_dir_all(parent).map_err(Error::at(parent))?;
         }
 
         symlink(&target, &link).map_err(|source| {
@@ -561,21 +874,68 @@ pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(
 /// already being there.
 pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
     let link = release.join("target");
-    if link.exists() || link.symlink_metadata().is_ok() {
+    // `symlink_metadata` answers for a directory, a file, a live link and a
+    // dangling one alike, which is every "something is already there".
+    if link.symlink_metadata().is_ok() {
         return Ok(());
     }
 
-    fs::create_dir_all(cache_target).map_err(|source| Error::Io {
-        path: cache_target.to_owned(),
-        source,
-    })?;
+    fs::create_dir_all(cache_target).map_err(Error::at(cache_target))?;
 
-    symlink(cache_target, &link).map_err(|source| Error::Io { path: link, source })
+    symlink(cache_target, &link).map_err(Error::at(link))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::fixtures;
+
+    /// fails if `off_thread` stops passing a result through, or turns a
+    /// panic into an error. The poll loop's guard is what should see a
+    /// panic, so it has to leave here as one.
+    #[tokio::test]
+    async fn off_thread_answers_with_the_result_and_re_raises_a_panic() {
+        let answered = off_thread(|| Ok::<_, Error>(41 + 1))
+            .await
+            .expect("passes through");
+        assert_eq!(answered, 42);
+
+        let refused = off_thread(|| Err::<(), _>(Error::Config("no".to_owned())))
+            .await
+            .expect_err("passes the error through");
+        assert!(matches!(refused, Error::Config(_)));
+
+        let caught = std::panic::AssertUnwindSafe(off_thread(|| -> Result<(), Error> {
+            panic!("inside the pool");
+        }));
+        let outcome = futures_catch(caught).await;
+        assert!(outcome.is_err(), "the panic must come out as a panic");
+    }
+
+    /// `catch_unwind` for a future, the same dozen lines `crate::poll`
+    /// keeps, spelled here so this module's test does not reach into that
+    /// one's.
+    async fn futures_catch<F: std::future::Future>(
+        fut: std::panic::AssertUnwindSafe<F>,
+    ) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        struct Catch<F>(Pin<Box<F>>);
+        impl<F: Future> Future for Catch<F> {
+            type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let inner = &mut self.get_mut().0;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inner.as_mut().poll(cx)
+                })) {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(v)) => Poll::Ready(Ok(v)),
+                    Err(payload) => Poll::Ready(Err(payload)),
+                }
+            }
+        }
+        Catch(Box::pin(fut.0)).await
+    }
 
     /// fails if a chatty-but-healthy git subprocess is killed as if it hung.
     ///
@@ -726,30 +1086,15 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Builds a throwaway git repo for one test: `entries` are (path,
-    /// contents) pairs written to disk, then `git add .` and committed.
-    /// `git add` silently skips anything matched by `.gitignore`, so an
-    /// entry meant to be "ignored and present" - `config/local.json` in the
+    /// [`fixtures::checkout`] under the name every test here calls it by.
+    ///
+    /// `git add` silently skips anything matched by `.gitignore`, so an entry
+    /// meant to be "ignored and present" - `config/local.json` in the
     /// fixtures below - simply stays untracked while a `.gitignore` or
     /// `tracked.txt` entry lands in the commit. That is exactly the split
     /// every test here needs: something tracked, something ignored.
     fn fixture_repo(entries: &[(&str, &str)]) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(dir.path(), &["init", "-q"]);
-        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
-
-        for (path, contents) in entries {
-            let full = dir.path().join(path);
-            if let Some(parent) = full.parent() {
-                fs::create_dir_all(parent).expect("mkdir fixture parent");
-            }
-            fs::write(&full, contents).expect("write fixture file");
-        }
-
-        fixtures::run_git(dir.path(), &["add", "."]);
-        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "seed"]);
-        dir
+        fixtures::checkout(entries)
     }
 
     /// Guards `link_into_resolves_even_when_checkout_is_relative`, the one
@@ -795,6 +1140,66 @@ mod tests {
         assert!(!found.iter().any(|p| p.ends_with("scratch.txt")));
     }
 
+    /// fails if two spellings of one place compare unequal, or if a
+    /// `current` whose release is gone stops comparing at all. The dog and
+    /// the daemon can spell `$SHEP_HOME` differently, and both comparisons
+    /// that use this decide something irreversible on the answer.
+    #[test]
+    fn two_spellings_of_one_path_resolve_alike_even_when_the_target_is_gone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("deploy/web")).expect("tree");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("a second spelling");
+
+        let current = home.join("deploy/web/current");
+        let through_link = link.join("deploy/web/current");
+        // Dangling: the link exists, what it names does not.
+        std::os::unix::fs::symlink(home.join("deploy/web/releases/gone"), &current)
+            .expect("current");
+        assert!(
+            same_path(&current, &through_link),
+            "parent resolves, name kept"
+        );
+
+        fs::remove_file(&current).expect("unlink");
+        assert!(
+            same_path(&current, &through_link),
+            "nothing exists but the parent"
+        );
+        assert!(!same_path(&current, &home.join("deploy/web/previous")));
+        assert_eq!(
+            resolved(Path::new("/nonexistent/anywhere/x")),
+            PathBuf::from("/nonexistent/anywhere/x"),
+            "unresolvable stays as spelled"
+        );
+    }
+
+    /// fails if the provenance answer stops following the list. The
+    /// override's presence among the linked paths is the only evidence
+    /// `flockfile` has that the file is the operator's; an answer from
+    /// anywhere else is one the repository can forge (see
+    /// `FromCheckout::includes_override`).
+    #[test]
+    fn the_override_is_recognised_only_when_it_was_linked() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        fixtures::run_git(repo.path(), &["init", "-q"]);
+        fs::write(repo.path().join(".gitignore"), "Flockfile.override.toml\n").expect("ignore");
+        fs::write(
+            repo.path().join("Flockfile.override.toml"),
+            "[[app]]\nname = 'web'\nuser = 'app'\n",
+        )
+        .expect("override");
+
+        let linked = to_link(repo.path()).expect("computes");
+        assert!(linked.includes_override(), "{linked:?}");
+
+        fs::remove_file(repo.path().join("Flockfile.override.toml")).expect("removed");
+        let linked = to_link(repo.path()).expect("computes");
+        assert!(!linked.includes_override(), "{linked:?}");
+        assert!(!FromCheckout::of(vec![PathBuf::from("config/local.json")]).includes_override());
+    }
+
     /// fails if a `.shepignore` entry is still linked. This is the whole
     /// reason `.shepignore` exists: symlinking a build output means release
     /// B's build writes through the link and replaces what release A is
@@ -817,7 +1222,7 @@ mod tests {
     ///
     /// `.shepignore` is a repo-committed file, so the deployed repository
     /// writes it. `Flockfile.override.toml` is the operator's, and
-    /// `flockfile::is_operators` treats presence in this list as the whole
+    /// `FromCheckout::includes_override` treats presence in this list as the whole
     /// proof of that. Letting the repo delete the entry silently drops every
     /// pin the operator put in the override, `user` included, which is the
     /// one that keeps a build off the dog's own uid. One innocuous-looking
@@ -871,7 +1276,129 @@ mod tests {
             ("dist/app.js", "//"),
         ]);
         let patterns = shepignore_patterns(repo.path()).expect("reads");
-        assert_eq!(patterns, vec!["dist".to_string()]);
+        assert_eq!(patterns, vec![Pattern::Anywhere("dist".to_owned())]);
+    }
+
+    /// fails if a leading `/` stops anchoring a pattern to the checkout
+    /// root. `.gitignore` reads `/dist` that way, so an operator will write
+    /// it; before 2026-09-03 it parsed as a two-component path no relative
+    /// entry could start with, and matched nothing while saying nothing.
+    #[test]
+    fn a_leading_slash_anchors_a_pattern_to_the_checkout_root() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "/dist\n"),
+            ("dist/app.js", "//"),
+            ("packages/app/dist/bundle.js", "//"),
+        ]);
+        let linked = to_link(repo.path()).expect("computes");
+        assert!(!linked.contains(&PathBuf::from("dist")), "{linked:?}");
+        assert!(
+            linked.contains(&PathBuf::from("packages/app/dist")),
+            "anchored means only the root one: {linked:?}"
+        );
+    }
+
+    /// fails if a trailing `/` is read as part of the name. `dist/` is how
+    /// `.gitignore` spells "the directory", and the same operator copies the
+    /// line across.
+    #[test]
+    fn a_trailing_slash_is_not_part_of_the_name() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "dist/\n"),
+            ("dist/app.js", "//"),
+        ]);
+        let linked = to_link(repo.path()).expect("computes");
+        assert!(!linked.contains(&PathBuf::from("dist")), "{linked:?}");
+    }
+
+    /// fails if `\!name` stops naming a file that really begins with `!`,
+    /// or if a lone `.` is accepted. The first is `.gitignore`'s own escape
+    /// and the only way to name such a file once the bare form is refused;
+    /// the second is a name no path component ever has.
+    #[test]
+    fn an_escaped_bang_names_the_file_and_a_lone_dot_is_refused() {
+        assert_eq!(
+            parse_pattern("\\!weird").expect("the escape is honoured"),
+            Pattern::Anywhere("!weird".to_owned())
+        );
+        for pattern in [".", "./.", "./", ".//", "/./"] {
+            let err = parse_pattern(pattern).expect_err(pattern);
+            assert!(
+                err.to_string().contains("names nothing"),
+                "{pattern}: {err}"
+            );
+        }
+        // And the spellings that mean something still parse to it. `/./x`
+        // used to come out as `Anchored("./x")`, which no entry starts with.
+        assert_eq!(
+            parse_pattern("./dist").expect("a leading ./ is dropped"),
+            Pattern::Anywhere("dist".to_owned())
+        );
+        assert_eq!(
+            parse_pattern("/./x").expect("a leading /./ is an anchor"),
+            Pattern::Anchored(PathBuf::from("x"))
+        );
+        assert_eq!(
+            parse_pattern(".//x").expect("stripped to a fixed point"),
+            Pattern::Anywhere("x".to_owned())
+        );
+        let err = parse_pattern("\\#name").expect_err("an escape this file does not read");
+        assert!(err.to_string().contains("backslash"), "{err}");
+    }
+
+    /// fails if `printable` lets a character through that can reverse,
+    /// split or hide a log line. Control characters are the obvious half;
+    /// the bidi override and the zero-width space are format characters
+    /// `is_control` does not cover.
+    #[test]
+    fn printable_replaces_everything_that_can_forge_a_line() {
+        let shown = printable("a\u{1b}[2Jb\u{202e}c\u{200b}d\ne\u{061c}f\u{e0041}g");
+        assert_eq!(shown, "a?[2Jb?c?d?e?f?g");
+        assert_eq!(printable("plain/name.txt"), "plain/name.txt");
+    }
+
+    /// fails if a rename in the operator's checkout is read as an ignored
+    /// entry. With `-z` a rename is two fields, the second a bare path with
+    /// no status, and a field-by-field filter would take a second field that
+    /// happens to begin `!! ` for an entry.
+    #[test]
+    fn a_staged_rename_is_one_record_not_two() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            ("dist/app.js", "//"),
+            ("old.txt", "x"),
+        ]);
+        // A file whose new name would parse as an ignored entry if its record
+        // were split into two.
+        fixtures::run_git(repo.path(), &["mv", "old.txt", "!! x"]);
+
+        let found = ignored_present(repo.path()).expect("enumerates");
+
+        assert!(found.contains(&PathBuf::from("dist")), "{found:?}");
+        assert!(
+            !found.iter().any(|p| p.ends_with("x")),
+            "the rename's own path must not be read as ignored: {found:?}"
+        );
+    }
+
+    /// fails if a spelling this file cannot honour is accepted and silently
+    /// matches nothing. Each of these is valid `.gitignore`, and each used
+    /// to parse: `!dist` as a name beginning with `!`, `../x` as a path no
+    /// entry starts with, `/` as an empty name.
+    #[test]
+    fn a_negation_a_parent_component_and_a_bare_slash_are_refused_by_name() {
+        for pattern in ["!dist", "../sibling", "/", "./"] {
+            let repo = fixture_repo(&[(".gitignore", "dist/\n"), (".shepignore", pattern)]);
+            let err = shepignore_patterns(repo.path())
+                .expect_err(&format!("{pattern:?} must be refused"));
+            assert!(matches!(err, Error::Config(_)), "{pattern:?}: {err}");
+            assert!(
+                err.to_string().contains(pattern),
+                "the refusal must name the pattern: {err}"
+            );
+        }
     }
 
     /// fails if a bare `.shepignore` pattern stops matching a nested
@@ -958,7 +1485,7 @@ mod tests {
             .expect("chdir into repo's parent");
         let relative_checkout = PathBuf::from(repo.path().file_name().expect("repo has a name"));
 
-        let result = link_into(release.path(), &relative_checkout, &paths);
+        let result = link_into(release.path(), &relative_checkout, &FromCheckout::of(paths));
 
         std::env::set_current_dir(&original_cwd).expect("restore cwd");
         result.expect("links despite a relative checkout");
@@ -978,7 +1505,7 @@ mod tests {
         let missing_checkout = release.path().join("no-such-checkout");
         let paths = vec![PathBuf::from("config/local.json")];
 
-        let err = link_into(release.path(), &missing_checkout, &paths)
+        let err = link_into(release.path(), &missing_checkout, &FromCheckout::of(paths))
             .expect_err("a checkout that does not exist cannot be canonicalised");
         assert!(matches!(err, Error::Io { .. }));
     }
@@ -1086,7 +1613,12 @@ mod tests {
         fs::create_dir_all(checkout.join("target")).expect("their own target");
         link_cache(&release, &root.path().join("cache/target")).expect("links");
 
-        let err = link_into(&release, &checkout, &[PathBuf::from("target")]).expect_err("collides");
+        let err = link_into(
+            &release,
+            &checkout,
+            &FromCheckout::of(vec![PathBuf::from("target")]),
+        )
+        .expect_err("collides");
         let shown = err.to_string();
         assert!(shown.contains(".shepignore"), "{shown}");
         assert!(shown.contains("target"), "{shown}");

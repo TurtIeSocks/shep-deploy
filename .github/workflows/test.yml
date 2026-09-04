@@ -19,8 +19,11 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       - run: cargo fmt --all -- --check
       # `--all-targets` reaches the integration tier's own source, which is
@@ -30,8 +33,11 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       - run: cargo doc --no-deps --all-features
     env:
@@ -43,8 +49,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       - run: cargo test --locked
       # Both platforms, because this dog is filesystem code (worktrees,
@@ -53,8 +62,11 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # Matches `rust-version` in Cargo.toml, which matches shep's. A dog
       # that needs a newer compiler than the daemon it serves is a bad
       # example.
@@ -71,10 +83,34 @@ jobs:
     # here is a real signal against shep's current published surface, not
     # against whatever `main` happens to look like on a given day.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       - name: Build a real shep
         run: cargo install shep --locked
       - name: Run the integration tier against it
         run: SHEP_BIN="$(command -v shep)" cargo test --features integration --locked
+
+  audit:
+    # The whole premise of this crate is running code from a tracked branch,
+    # so an advisory against something in its own tree is worth a red job.
+    # `cargo install` rather than a third-party action: one fewer moving tag
+    # in a workflow, at the cost of a minute's compile.
+    #
+    # It scans the lockfile, so a dev-dependency's advisory goes red too.
+    # Deliberate: the two dev-dependencies are tokio's test-util and
+    # tempfile, and neither is worth a second opinion on. An advisory that
+    # genuinely does not apply is silenced by id with `cargo audit --ignore
+    # RUSTSEC-...`, next to a comment saying why.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

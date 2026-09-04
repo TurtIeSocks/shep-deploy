@@ -14,10 +14,12 @@
 //! at opt-in and never touched again.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shep_client::shep_core::atomic_file::{create_staging_file, sync_dir};
+use shep_client::shep_core::config::AppConfig;
 
 use crate::error::Error;
 
@@ -62,12 +64,14 @@ pub enum Watch {
 /// left running from a path under `$SHEP_HOME` they have no reason to know
 /// about.
 ///
-/// `Debug` is derived deliberately: nothing here is a secret. `remote` is a
-/// git URL an operator already has in their own checkout, `origin_script` is
-/// a shell command line their own `shep.toml`/process manager already ran in
-/// plaintext, and every other field is a path, a sha, or one of the two
-/// small enums above. This dog does no credential handling of its own (see
-/// `error::Error`'s own doc comment), so nothing here carries one either.
+/// `Debug` is derived, and since 2026-09-04 that rests on one thing:
+/// [`Self::origin`] carries the app's `env` verbatim, and `AppConfig`'s own
+/// hand-written `Debug` prints that as `<N vars>` (shep-core, IR-41). Every
+/// other field is a git URL an operator already has in their checkout, a
+/// path, a sha, a shell command line their own `shep.toml` already held in
+/// plaintext, or one of the two small enums above. A field added here that
+/// could carry a secret needs its own redaction; the derive is not a
+/// blanket exemption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
@@ -114,64 +118,248 @@ pub struct State {
     /// the dog clones from it once at opt-in and never restructures, moves,
     /// or writes to it again.
     pub checkout: PathBuf,
+    /// The whole app definition as the shepherd had it BEFORE adoption, so
+    /// removal can put back everything and not only `cwd` and `script`.
+    ///
+    /// `origin_cwd` and `origin_script` predate this field and are kept for
+    /// the records that carry only them; a record with both is restored
+    /// from this one. It is what makes `deploy.toml` hold the app's `env`
+    /// verbatim, which is why the file is written owner-only, the same
+    /// mode shep's own roll uses for the same reason.
+    ///
+    /// It serialises as `[origin]` with `[origin.env]` and the probe tables
+    /// under it, at the END of the file whatever this field's position:
+    /// this crate's `toml` hoists every scalar above every table. So the
+    /// record an operator opens still starts with the lines they edit.
+    #[serde(default)]
+    pub origin: Option<AppConfig>,
 }
 
 impl State {
-    /// Read and parse the `deploy.toml` at `path`.
+    /// Read and parse the `deploy.toml` at `path`, refusing a record whose
+    /// values cannot work.
     ///
     /// # Errors
     /// [`Error::Io`], naming `path`, if the file cannot be read - most
     /// often because this sheep is not a deploy target at all.
-    /// [`Error::Config`] if it is not valid TOML, or is missing a field
-    /// that has no default.
+    /// [`Error::Config`] if it is not valid TOML, is missing a field that
+    /// has no default, or fails [`Self::validate`].
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let text = fs::read_to_string(path).map_err(|source| Error::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-        toml::from_str(&text)
-            .map_err(|source| Error::Config(format!("{}: {source}", path.display())))
+        let text = fs::read_to_string(path).map_err(Error::at(path))?;
+        let state: Self = toml::from_str(&text)
+            .map_err(|source| Error::Config(format!("{}: {source}", path.display())))?;
+        state.validate(path)?;
+        Ok(state)
     }
 
-    /// Serialise to TOML and write to `path` atomically.
+    /// Refuses a record that parses and still cannot be acted on, naming the
+    /// field and what is wrong with it.
     ///
-    /// The write lands at `<path>.tmp` in the same directory first, then
-    /// `rename(2)`s it over `path`. `rename(2)` within one directory is a
-    /// single atomic syscall, so a process killed mid-write leaves either
-    /// the old `deploy.toml` intact or the new one in full - never a
-    /// truncated file. That matters here specifically because this file is
-    /// the only record of how to restore the sheep once the dog is removed.
+    /// This file is hand-edited, and every field here is handed to git or
+    /// joined onto a path later, where a bad value fails in words that name
+    /// the mechanism rather than the mistake. An empty `branch` reaches
+    /// `git rev-parse --verify refs/heads/` and fails as "needed a single
+    /// revision". A `deployed` of `""` makes `Tree::release("")` the
+    /// `releases/` directory itself, which exists, so a rollback would point
+    /// `current` at it. A `remote` beginning with `-` is an option to git
+    /// rather than a URL, and `--upload-pack=<command>` is one it runs.
+    /// Measured 2026-09-03, all three.
     ///
     /// # Errors
-    /// [`Error::Io`], naming whichever of `path` or `<path>.tmp` the
-    /// failing operation touched. This includes the (practically
+    /// [`Error::Config`], naming `path` and the field, for: an empty
+    /// `remote`, `branch` or `checkout`; a `remote` or `branch` beginning
+    /// with `-` or carrying a character that would rewrite a log line; a
+    /// relative `checkout`; a
+    /// `deployed` or `failed` that is not a full commit sha; `deployed` and
+    /// `failed` naming the same sha; or exactly one of `origin_cwd` and
+    /// `origin_script` set.
+    pub(crate) fn validate(&self, path: &Path) -> Result<(), Error> {
+        let refuse =
+            |field: &str, why: &str| Error::Config(format!("{}: `{field}` {why}", path.display()));
+
+        for (field, value) in [("remote", &self.remote), ("branch", &self.branch)] {
+            if value.trim().is_empty() {
+                return Err(refuse(field, "is empty"));
+            }
+            if value.starts_with('-') {
+                return Err(refuse(
+                    field,
+                    "begins with `-`, which git would read as an option rather than a name",
+                ));
+            }
+            if value.chars().any(crate::shared::forges_a_line) {
+                return Err(refuse(
+                    field,
+                    "carries a control or invisible character that would rewrite a log line",
+                ));
+            }
+        }
+
+        if self.checkout.as_os_str().is_empty() {
+            return Err(refuse("checkout", "is empty"));
+        }
+        if !self.checkout.is_absolute() {
+            return Err(refuse(
+                "checkout",
+                "is not an absolute path, and a relative one would be resolved against \
+                 wherever the dog happens to be running",
+            ));
+        }
+
+        for (field, value) in [("deployed", &self.deployed), ("failed", &self.failed)] {
+            if let Some(sha) = value
+                && !is_sha(sha)
+            {
+                return Err(refuse(
+                    field,
+                    "is not a full commit sha: 40 (or 64) hexadecimal characters, as `git \
+                     rev-parse` prints one",
+                ));
+            }
+        }
+        if self.deployed.is_some() && self.deployed == self.failed {
+            return Err(refuse(
+                "failed",
+                "names the sha `deployed` names. A release that is serving cannot also be the \
+                 one being held; remove `failed`",
+            ));
+        }
+
+        if self.origin.is_some() && (self.origin_cwd.is_none() || self.origin_script.is_none()) {
+            return Err(refuse(
+                "origin",
+                "is set while origin_cwd or origin_script is missing. All three are written \
+                 together at setup, and removal needs the pair to say where the sheep goes \
+                 back to; set the pair or remove `origin`",
+            ));
+        }
+
+        if self.origin_cwd.is_some() != self.origin_script.is_some() {
+            let missing = if self.origin_cwd.is_none() {
+                "origin_cwd"
+            } else {
+                "origin_script"
+            };
+            return Err(refuse(
+                missing,
+                "is missing while its partner is set. Both are written together at setup and \
+                 both are needed to put the sheep back on removal; set both or neither",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Serialise to TOML and write to `path` atomically and durably.
+    ///
+    /// The write lands in a uniquely named staging file beside `path` first
+    /// (shep-core's `atomic_file::create_staging_file`, created exclusively
+    /// and owner-only at the `open` itself), is flushed to disk, then
+    /// `rename(2)`d over `path`, and the directory is flushed after that. `rename(2)` within one directory is a single
+    /// atomic syscall, so a process killed mid-write leaves either the old
+    /// `deploy.toml` intact or the new one in full - never a truncated file.
+    /// The two flushes extend that from a killed process to a lost power
+    /// supply: without them the rename can reach the disk ahead of the bytes
+    /// it names, which leaves a zero-length record. That matters here
+    /// specifically because this file is the only record of how to restore
+    /// the sheep once the dog is removed.
+    ///
+    /// A failed write or rename removes the staging file it leaves behind,
+    /// so one failure does not sit next to the record forever, unread by
+    /// anything. Exclusive creation with a name nothing else can predict is
+    /// also what keeps a link planted at a staging name from being written
+    /// through: the open never follows one, and a `rename` over `path`
+    /// replaces a link there rather than writing through it.
+    ///
+    /// The file is created owner-only. Since 2026-09-04 it can carry the
+    /// app's `env` verbatim in [`Self::origin`], and shep writes its own
+    /// roll at the same mode for the same reason. A record left at a wider
+    /// mode by an earlier version is tightened on the next write, because
+    /// the rename replaces it with the fresh file.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if the record fails [`Self::validate`]: nothing is
+    /// written. [`Error::Io`], naming whichever of `path`, the staging file
+    /// or the directory the failing operation touched, and a directory that
+    /// cannot be flushed is a failure: the rename has landed, and what did
+    /// not happen is the durability this doc promises. This includes the
+    /// (practically
     /// unreachable, but not impossible) case of a `checkout` or
     /// `origin_cwd` containing non-UTF-8 bytes, which TOML cannot represent
     /// as a string; that failure is reported against `path` before any
     /// write is attempted, so it never touches the temp file at all.
     pub fn write(&self, path: &Path) -> Result<(), Error> {
+        // Validated on the way out as well as on the way in, because every
+        // writer is inside this crate: a record this crate persists and then
+        // refuses to read on every later command is a target nothing can
+        // touch, and the mistake is cheaper at the moment it is made.
+        self.validate(path)?;
         let text = toml::to_string_pretty(self).map_err(|source| Error::Io {
             path: path.to_owned(),
             source: io::Error::other(source),
         })?;
 
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
+        // A unique name, because `set_watch` writes without the tree lock
+        // (see its doc for why) and two processes staging into one fixed
+        // name would truncate each other's file: the second rename then
+        // fails, and a rename landing between the other's truncate and
+        // write exposes an empty record. Created exclusively, so a link
+        // planted at the name is never followed, and owner-only at the
+        // open, so the `env` inside is never briefly wider.
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("deploy.toml");
+        let mut staged =
+            create_staging_file(dir, &format!("{name}."), ".tmp").map_err(Error::at(dir))?;
 
-        fs::write(&tmp, text).map_err(|source| Error::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        fs::rename(&tmp, path).map_err(|source| Error::Io {
+        let written = staged
+            .as_file_mut()
+            .write_all(text.as_bytes())
+            .and_then(|()| staged.as_file().sync_all());
+        if let Err(source) = written {
+            // Dropping `staged` removes it.
+            return Err(Error::Io {
+                path: staged.path().to_owned(),
+                source,
+            });
+        }
+
+        // `persist` is the rename; a refusal hands the staging file back,
+        // and dropping it removes it.
+        staged.persist(path).map_err(|failed| Error::Io {
             path: path.to_owned(),
-            source,
-        })
+            source: failed.error,
+        })?;
+
+        // The directory entry, so the rename itself survives a power loss.
+        // Not best effort: the helper already forgives the one answer
+        // (`EINVAL`) that means "no such step here", so what reaches this
+        // is a flush that did not happen.
+        sync_dir(dir).map_err(Error::at(dir))
     }
+}
+
+/// Whether `text` is a full git object id: 40 hexadecimal characters for
+/// SHA-1, 64 for SHA-256.
+///
+/// The one rule for what a release is named by, shared with
+/// `crate::retention` so the two cannot disagree about which directories
+/// under `releases/` are releases.
+#[must_use]
+pub fn is_sha(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::fixtures::{self, SHA};
+
     /// fails if a typo in `deploy.toml` is silently dropped.
     ///
     /// This file is not ours alone: `crate::deploy` tells an operator to type
@@ -180,7 +368,7 @@ mod tests {
     /// `Probed`, and the next deploy fails on the identical message with
     /// nothing anywhere indicating the edit did nothing.
     ///
-    /// Matches what `crate::config` already does to a `[dog.deploy]` typo, and
+    /// Matches what `crate::config` already does to a `[deploy]` typo, and
     /// for the same stated reason: a setting that silently does something
     /// other than what it says is worse than one that is refused.
     #[test]
@@ -204,8 +392,6 @@ verfiy = "alive"
         );
     }
 
-    use super::*;
-
     /// fails if state does not survive a write-then-read. This file is the
     /// only record of how a sheep ran BEFORE the dog took over, so losing a
     /// field means removal cannot restore the sheep and the operator is
@@ -225,17 +411,253 @@ verfiy = "alive"
         let original = State {
             remote: "https://github.com/WatWowMap/ReactMap".into(),
             branch: "main".into(),
-            deployed: Some("a1b2c3d".into()),
+            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".into()),
             failed: None,
             verify: Verify::Probed,
             watch: Watch::Manual,
             origin_cwd: Some(PathBuf::from("/srv/reactmap")),
             origin_script: Some("bun .".into()),
             checkout: PathBuf::from("/srv/reactmap"),
+            origin: None,
         };
         let text = toml::to_string(&original).expect("serialises");
         let back: State = toml::from_str(&text).expect("parses");
         assert_eq!(back, original);
+    }
+
+    /// Whether any `*.tmp` sits in `dir`: the staging file a write leaves
+    /// behind when it does not finish.
+    fn any_tmp(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .expect("list")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+    }
+
+    /// Writes `text` as a record and reads it back through `State::read`,
+    /// so the validation runs the way it does in production.
+    fn read_text(text: &str) -> Result<State, Error> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        fs::write(&path, text).expect("write record");
+        State::read(&path)
+    }
+
+    /// fails if a record that parses is acted on when its values cannot
+    /// work. Each of these used to reach git, or a path join, and fail
+    /// there in words about the mechanism: an empty `branch` as "needed a
+    /// single revision", `deployed = ""` as a rollback onto `releases/`
+    /// itself, a `remote` beginning with `-` as whatever git made of the
+    /// option. The refusal has to name the field an operator typed.
+    #[test]
+    fn a_record_whose_values_cannot_work_is_refused_by_field() {
+        let base = |extra: &str| {
+            format!(
+                "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n{extra}"
+            )
+        };
+        let cases = [
+            (
+                "remote",
+                "remote = \"\"\nbranch = \"main\"\ncheckout = \"/srv/x\"".to_owned(),
+            ),
+            (
+                "remote",
+                "remote = \"--upload-pack=x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"".to_owned(),
+            ),
+            (
+                "branch",
+                "remote = \"https://example.com/x\"\nbranch = \"\"\ncheckout = \"/srv/x\""
+                    .to_owned(),
+            ),
+            (
+                "branch",
+                "remote = \"https://example.com/x\"\nbranch = \"-x\"\ncheckout = \"/srv/x\""
+                    .to_owned(),
+            ),
+            (
+                "branch",
+                "remote = \"https://example.com/x\"\nbranch = \"ma\\nin\"\ncheckout = \"/srv/x\""
+                    .to_owned(),
+            ),
+            (
+                "checkout",
+                "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"\"".to_owned(),
+            ),
+            (
+                "checkout",
+                "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"srv/x\""
+                    .to_owned(),
+            ),
+            ("deployed", base("deployed = \"\"")),
+            ("deployed", base("deployed = \"main\"")),
+            ("deployed", base("deployed = \"abc123\"")),
+            ("failed", base("failed = \"..\"")),
+            (
+                "failed",
+                base(&format!("deployed = \"{SHA}\"\nfailed = \"{SHA}\"")),
+            ),
+            ("origin_script", base("origin_cwd = \"/srv/x\"")),
+            ("origin_cwd", base("origin_script = \"bun .\"")),
+        ];
+        for (field, text) in cases {
+            let err = read_text(&text).expect_err(&format!("must refuse: {text}"));
+            assert!(matches!(err, Error::Config(_)), "{text}: {err}");
+            assert!(
+                err.to_string().contains(&format!("`{field}`")),
+                "must name `{field}`: {err}"
+            );
+        }
+    }
+
+    /// fails if a record with every value in shape is refused, or if a
+    /// zero-length one - what a crash mid-write used to be able to leave -
+    /// is read as anything but a named failure.
+    #[test]
+    fn a_sound_record_reads_and_an_empty_one_is_refused() {
+        let text = format!(
+            "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n\
+             deployed = \"{SHA}\"\norigin_cwd = \"/srv/x\"\norigin_script = \"bun .\"\n"
+        );
+        let state = read_text(&text).expect("a sound record");
+        assert_eq!(state.deployed.as_deref(), Some(SHA));
+
+        let err = read_text("").expect_err("nothing to read");
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(err.to_string().contains("deploy.toml"), "{err}");
+    }
+
+    /// fails if the pre-adoption app definition does not survive a
+    /// write-then-read, `env` and probe included, or if a record written
+    /// before the field existed stops reading. The first is what removal
+    /// restores from; the second is every record on disk today.
+    #[test]
+    fn the_origin_round_trips_and_an_older_record_still_reads() {
+        let origin: AppConfig = toml::from_str(
+            "name = \"web\"\nscript = \"server.js\"\ninstances = 2\n[env]\nTOKEN = \"s3cret\"\n\
+             [readiness_probe]\nkind = \"http\"\ntarget = \"http://127.0.0.1:3000/health\"\n",
+        )
+        .expect("an app");
+        let mut with = sample(None);
+        with.origin = Some(origin.clone());
+        with.origin_cwd = Some(PathBuf::from("/srv/web"));
+        with.origin_script = Some("server.js".to_owned());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        with.write(&path).expect("writes");
+        let back = State::read(&path).expect("reads");
+        assert_eq!(back.origin.as_ref(), Some(&origin));
+
+        let older = read_text(
+            "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n",
+        )
+        .expect("a record from before the field");
+        assert_eq!(older.origin, None);
+    }
+
+    /// fails if a `State` printed with `{:?}` shows an `env` value. The
+    /// record carries the app's `env` verbatim in `origin`, and the derive
+    /// is safe only because `AppConfig`'s own `Debug` prints the map as a
+    /// count; this pins that exact shape so a change to either side shows
+    /// up here rather than in a log.
+    #[test]
+    fn debug_output_redacts_the_origins_env() {
+        let origin: AppConfig = toml::from_str(
+            "name = \"web\"\nscript = \"server.js\"\n[env]\nTOKEN = \"hunter2-distinctive\"\n",
+        )
+        .expect("an app");
+        let state = State {
+            origin: Some(origin),
+            ..fixtures::state()
+        };
+
+        let shown = format!("{state:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("TOKEN"), "{shown}");
+        assert!(shown.contains("env: <1 vars>"), "{shown}");
+    }
+
+    /// fails if a record carrying `origin` without the legacy pair reads.
+    /// Removal puts the sheep back through both, and a record with one and
+    /// not the other was accepted and then skipped as a dog-bootstrapped
+    /// sheep, leaving it under the tree with its origin unread.
+    #[test]
+    fn an_origin_without_the_legacy_pair_is_refused_by_name() {
+        let origin: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"server.js\"\ncwd = \"/srv/web\"\n")
+                .expect("an app");
+        let state = State {
+            origin: Some(origin),
+            origin_cwd: None,
+            origin_script: None,
+            ..fixtures::state()
+        };
+
+        let err = state
+            .validate(Path::new("/x/deploy.toml"))
+            .expect_err("origin without the pair");
+        let shown = err.to_string();
+        assert!(shown.contains("origin"), "{shown}");
+        assert!(shown.contains("origin_cwd"), "{shown}");
+    }
+
+    /// fails if a write follows a link planted where the record goes. The
+    /// rename replaces the link with the real file; the file the link named
+    /// is never opened, let alone written with the record's `env`.
+    #[test]
+    fn a_link_at_the_record_path_is_replaced_not_written_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "untouched").expect("victim");
+        let path = dir.path().join("deploy.toml");
+        std::os::unix::fs::symlink(&victim, &path).expect("a planted link");
+
+        sample(None).write(&path).expect("writes");
+
+        assert_eq!(fs::read_to_string(&victim).expect("victim"), "untouched");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .expect("record")
+                .file_type()
+                .is_symlink(),
+            "the record is a real file now"
+        );
+        assert!(State::read(&path).is_ok());
+    }
+
+    /// fails if the record is readable by anyone but its owner. It carries
+    /// the app's `env` verbatim once an origin is recorded, and shep's own
+    /// roll is owner-only for the same reason.
+    #[test]
+    fn the_record_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use shep_client::shep_core::atomic_file::OWNER_ONLY_FILE_MODE;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        sample(None).write(&path).expect("writes");
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, OWNER_ONLY_FILE_MODE);
+    }
+
+    /// fails if a rename that cannot land leaves its temporary file behind.
+    /// Nothing reads `deploy.toml.tmp`, so a stale one would sit beside the
+    /// record forever, a full copy of it that no listing ever mentions.
+    #[test]
+    fn a_failed_write_leaves_no_tmp_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the record should go, so the rename fails.
+        let path = dir.path().join("deploy.toml");
+        fs::create_dir_all(&path).expect("something in the way");
+
+        sample(None)
+            .write(&path)
+            .expect_err("cannot rename onto a directory");
+
+        assert!(
+            !any_tmp(dir.path()),
+            "the temporary file must be removed with the failure"
+        );
     }
 
     /// fails if reading a `deploy.toml` that is not there produces
@@ -282,15 +704,8 @@ verfiy = "alive"
     /// values don't matter - only that they change between the two writes.
     fn sample(deployed: Option<&str>) -> State {
         State {
-            remote: "https://example.com/x".into(),
-            branch: "main".into(),
             deployed: deployed.map(str::to_owned),
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
-            origin_cwd: None,
-            origin_script: None,
-            checkout: PathBuf::from("/srv/x"),
+            ..fixtures::state()
         }
     }
 
@@ -306,20 +721,20 @@ verfiy = "alive"
     fn write_survives_a_second_write_and_leaves_no_tmp_file_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("deploy.toml");
-        let tmp = dir.path().join("deploy.toml.tmp");
+        let tmp = dir.path();
 
         let first = sample(None);
         first.write(&path).expect("first write");
         assert!(path.exists(), "the state file must exist after a write");
         assert!(
-            !tmp.exists(),
+            !any_tmp(tmp),
             "a completed write must not leave a .tmp file"
         );
 
-        let second = sample(Some("a1b2c3d"));
+        let second = sample(Some(fixtures::OTHER_SHA));
         second.write(&path).expect("second write");
         assert!(
-            !tmp.exists(),
+            !any_tmp(tmp),
             "a second, overwriting write must also leave no .tmp file"
         );
 

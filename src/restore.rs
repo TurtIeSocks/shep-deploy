@@ -79,11 +79,24 @@ pub enum Restored {
         /// Where it is still running from.
         from: PathBuf,
     },
-    /// Nothing was changed. The sheep is still registered and running,
-    /// exactly as it was before this call.
+    /// Nothing was changed by this dog. This says nothing about whether the
+    /// sheep is still registered or running: `all` also uses it for a
+    /// `deploy.toml` it could not even read, and `put_back` uses it for a
+    /// sheep the shepherd no longer has registered at all.
     Failed {
         /// The sheep that could not be restored.
         sheep: String,
+        /// Why.
+        why: String,
+    },
+    /// A directory under the deploy root that could not be read as targets
+    /// at all: the root itself, or one entry with a name no sheep can have.
+    ///
+    /// Not a [`Self::Failed`], whose `sheep` names a sheep; this names a
+    /// path, and nothing under it was looked at.
+    Unlisted {
+        /// The directory.
+        dir: PathBuf,
         /// Why.
         why: String,
     },
@@ -156,9 +169,21 @@ pub enum Restored {
 /// of five sheep would not restart would be worse than one that did nothing
 /// at all.
 pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
-    let Ok(names) = paths::targets(shep_home) else {
-        return Vec::new();
+    let found = match paths::targets(shep_home) {
+        Ok(found) => found,
+        // The deploy directory exists but could not be listed. There is
+        // nothing to iterate, but silence here reads as success: `report(&[])`
+        // is empty, so `on_remove` prints nothing and exits 0 with every
+        // sheep under the tree left running. One row naming the directory
+        // says something instead.
+        Err(err) => {
+            return vec![Restored::Unlisted {
+                dir: shep_home.join("deploy"),
+                why: err.to_string(),
+            }];
+        }
     };
+    let names = found.named;
     // Read once for every target rather than once per target: it costs a
     // SaveRoll round trip, and a removal is not the moment to make N of
     // them. Kept as a `Result` rather than `.unwrap_or_default()`: an empty
@@ -169,6 +194,18 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
     let registered = roll::registered(daemon).await;
 
     let mut results = Vec::new();
+    // A target the dog cannot name cannot be restored either, and a sheep
+    // may still be running out of it.
+    for dir in found.unnamed {
+        results.push(Restored::Unlisted {
+            why: "its directory's name cannot be a sheep's, so it was never polled and is not \
+                  restored. A sheep may still be running from inside it: `shep flock` lists \
+                  every sheep and `shep describe <sheep>` its cwd. Rename the directory once \
+                  none does, then restore by hand"
+                .to_owned(),
+            dir,
+        });
+    }
     // Pre-existing sheep whose restore needs the roll, deferred here rather
     // than reported as they are found: a roll that cannot be read is one
     // failure shared by every one of them, not N separate ones.
@@ -194,6 +231,7 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
         // touch it.
         // Read before the origin fields move out below.
         let never_moved = state.deployed.is_none();
+        let origin = state.origin;
         let (Some(cwd), Some(script)) = (state.origin_cwd, state.origin_script) else {
             results.push(Restored::LeftRunning {
                 sheep,
@@ -227,9 +265,16 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             continue;
         }
 
+        // The report names where the sheep went: the origin's own cwd when
+        // the record carries one, the legacy field otherwise, which is the
+        // same choice `put_back` makes.
+        let to = origin
+            .as_ref()
+            .and_then(|origin| origin.cwd.as_deref())
+            .map_or_else(|| cwd.clone(), PathBuf::from);
         results.push(
-            match put_back(daemon, &sheep, registered, &cwd, &script).await {
-                PutBack::Done => Restored::Returned { sheep, to: cwd },
+            match put_back(daemon, &sheep, registered, origin.as_ref(), &cwd, &script).await {
+                PutBack::Done => Restored::Returned { sheep, to },
                 PutBack::Untouched(err) => Restored::Failed {
                     sheep,
                     why: err.to_string(),
@@ -285,8 +330,9 @@ enum PutBack {
     Deleted(Error),
 }
 
-/// Re-registers one sheep against the `cwd` and `script` it ran with
-/// before this dog took over.
+/// Re-registers one sheep as it was before this dog took over: the whole
+/// definition when the record carries one, or the `cwd` and `script` it ran
+/// with over the shepherd's current definition when it does not.
 ///
 /// Delete THEN start, and the order is tested. `Request::Start` on an
 /// already-registered name adds an instance rather than re-registering it,
@@ -308,6 +354,7 @@ async fn put_back<D: Daemon>(
     daemon: &D,
     sheep: &str,
     registered: &BTreeMap<String, AppConfig>,
+    origin: Option<&AppConfig>,
     cwd: &Path,
     script: &str,
 ) -> PutBack {
@@ -317,9 +364,30 @@ async fn put_back<D: Daemon>(
         )));
     };
 
-    let mut restored = current.clone();
-    restored.cwd = Some(cwd.display().to_string());
-    restored.script = script.to_owned();
+    // The whole pre-adoption definition when the record has it, so `env`,
+    // `instances`, the probes and the rest go back too. A record from before
+    // that field carries only `cwd` and `script`, and those go over whatever
+    // the shepherd has now, which is the deployed repository's definition.
+    let restored = match origin {
+        Some(origin) => {
+            let mut restored = origin.clone();
+            restored.name = sheep.to_owned();
+            // `prepare` refuses a sheep with no cwd, so an origin without
+            // one is a hand-edited record. The legacy field is the next
+            // best witness, and using it here is what keeps the report,
+            // which names the same field, truthful.
+            restored
+                .cwd
+                .get_or_insert_with(|| cwd.display().to_string());
+            restored
+        }
+        None => {
+            let mut restored = current.clone();
+            restored.cwd = Some(cwd.display().to_string());
+            restored.script = script.to_owned();
+            restored
+        }
+    };
 
     let live = match daemon.describe(sheep).await {
         Ok(live) => live,
@@ -345,7 +413,7 @@ async fn put_back<D: Daemon>(
     }
 
     match daemon.start(vec![restored]).await {
-        Ok(()) => PutBack::Done,
+        Ok(_) => PutBack::Done,
         Err(err) => {
             // The sheep is deregistered at this point. Put the shepherd's
             // own config back rather than leaving it deleted, because a
@@ -365,6 +433,12 @@ async fn put_back<D: Daemon>(
 /// they see about this.
 #[must_use]
 pub fn report(results: &[Restored]) -> String {
+    if results.is_empty() {
+        // Silence here is indistinguishable from success. There were no
+        // deploy targets at all, and the operator is entitled to be told
+        // that rather than left to guess why nothing printed.
+        return "no deploy targets, nothing to restore\n".to_owned();
+    }
     results
         .iter()
         .map(|result| match result {
@@ -387,8 +461,12 @@ pub fn report(results: &[Restored]) -> String {
                 format!("{sheep} still running from {}\n", from.display())
             }
             Restored::Failed { sheep, why } => {
-                format!("{sheep} could not be restored and was left as it is: {why}\n")
+                format!("{sheep} could not be restored ({why}); nothing was changed by this dog\n")
             }
+            Restored::Unlisted { dir, why } => format!(
+                "{} could not be listed ({why}); nothing under it was changed by this dog\n",
+                crate::shared::printable(dir.display())
+            ),
             // NOT the same wording as `Failed`: this sheep was stopped and
             // a fresh instance started to get its own previous config back,
             // so nothing mid-flight survived even though the config an
@@ -438,7 +516,11 @@ fn registered_against(registered: &BTreeMap<String, AppConfig>, sheep: &str, tre
     registered
         .get(sheep)
         .and_then(|app| app.cwd.as_deref())
-        .is_some_and(|cwd| Path::new(cwd) == tree.current())
+        // Two spellings of one directory compare equal, and a `current`
+        // whose release is already gone still compares by its parent: see
+        // `shared::resolved` for why a literal comparison here left a
+        // sheep the cutover DID register running from the tree.
+        .is_some_and(|cwd| crate::shared::same_path(Path::new(cwd), &tree.current()))
 }
 
 #[cfg(test)]
@@ -481,7 +563,7 @@ mod tests {
     use shep_client::shep_core::status::ProcStatus;
 
     use super::*;
-    use crate::state::{Verify, Watch};
+    use crate::fixtures;
 
     /// Writes a `deploy.toml` for `sheep` recording `origin_cwd` and
     /// `origin_script`, as opt-in would have.
@@ -490,17 +572,132 @@ mod tests {
         fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: Some("a1b2c3d".to_owned()),
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
             origin_cwd: Some(PathBuf::from(origin_cwd)),
             origin_script: Some(origin_script.to_owned()),
             checkout: PathBuf::from(origin_cwd),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
+    }
+
+    /// Writes a `deploy.toml` for `sheep` carrying the whole pre-adoption
+    /// definition, as `prepare` writes since 2026-09-04.
+    fn write_target_with_full_origin(home: &Path, sheep: &str, origin: &AppConfig) {
+        let tree = Tree::for_sheep(home, sheep);
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let cwd = origin.cwd.clone().expect("an origin with a cwd");
+        let state = State {
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
+            origin_cwd: Some(PathBuf::from(&cwd)),
+            origin_script: Some(origin.script.clone()),
+            checkout: PathBuf::from(&cwd),
+            origin: Some(origin.clone()),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("write state");
+    }
+
+    /// fails if removal puts back only `cwd` and `script`. The record
+    /// carries the app as the shepherd had it before adoption; a restore
+    /// from the shepherd's current definition kept the deployed
+    /// repository's `env`, `instances` and probes past the dog's removal.
+    #[tokio::test]
+    async fn a_sheep_is_restored_to_its_whole_pre_adoption_definition() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin: AppConfig = toml::from_str(
+            "name = \"web\"\nscript = \"server.js\"\ncwd = \"/srv/web\"\ninstances = 3\n\
+             [env]\nPORT = \"8080\"\n",
+        )
+        .expect("an app");
+        write_target_with_full_origin(home.path(), "web", &origin);
+        let daemon = Recording::new(&["web"], Refuse::Never);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(&results[0], Restored::Returned { .. }),
+            "{results:?}"
+        );
+        let started = daemon.started();
+        let put_back = started.first().expect("one Start");
+        assert_eq!(put_back.instances, 3, "instances come back");
+        assert_eq!(
+            put_back.env.get("PORT").map(String::as_str),
+            Some("8080"),
+            "env comes back"
+        );
+        assert_eq!(put_back.cwd.as_deref(), Some("/srv/web"));
+        assert_eq!(put_back.script, "server.js");
+    }
+
+    /// fails if the report names a directory the sheep was not put back in.
+    /// `put_back` starts the origin's own `cwd` when the record carries an
+    /// origin, and `origin_cwd` is a hand-editable legacy field that can
+    /// disagree with it; the report has to follow the same choice.
+    #[tokio::test]
+    async fn the_report_names_the_origins_cwd_when_the_record_carries_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"server.js\"\ncwd = \"/srv/web\"\n")
+                .expect("an app");
+        let tree = Tree::for_sheep(home.path(), "web");
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let state = State {
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
+            origin_cwd: Some(PathBuf::from("/srv/stale")),
+            origin_script: Some("stale.js".to_owned()),
+            checkout: PathBuf::from("/srv/web"),
+            origin: Some(origin),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("write state");
+        let daemon = Recording::new(&["web"], Refuse::Never);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(&results[0], Restored::Returned { to, .. } if to == Path::new("/srv/web")),
+            "{results:?}"
+        );
+        let started = daemon.started();
+        assert_eq!(started[0].cwd.as_deref(), Some("/srv/web"));
+        assert_eq!(started[0].script, "server.js");
+    }
+
+    /// fails if an origin with no `cwd` is put back with none while the
+    /// report names the legacy field. `prepare` refuses a sheep without a
+    /// cwd, so this is a hand-edited record; the legacy field is the next
+    /// witness, and what is started and what is reported have to agree.
+    #[tokio::test]
+    async fn an_origin_without_a_cwd_is_put_back_at_the_legacy_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"server.js\"\n").expect("an app");
+        assert!(origin.cwd.is_none());
+        let tree = Tree::for_sheep(home.path(), "web");
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let state = State {
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
+            origin_cwd: Some(PathBuf::from("/srv/web")),
+            origin_script: Some("server.js".to_owned()),
+            checkout: PathBuf::from("/srv/web"),
+            origin: Some(origin),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("write state");
+        let daemon = Recording::new(&["web"], Refuse::Never);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(&results[0], Restored::Returned { to, .. } if to == Path::new("/srv/web")),
+            "{results:?}"
+        );
+        assert_eq!(daemon.started()[0].cwd.as_deref(), Some("/srv/web"));
     }
 
     /// Writes a `deploy.toml` for `sheep` with no `origin_cwd` or
@@ -510,15 +707,9 @@ mod tests {
         fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: Some("a1b2c3d".to_owned()),
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
-            origin_cwd: None,
-            origin_script: None,
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
             checkout: PathBuf::from("/srv/deploy-tree"),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -661,12 +852,6 @@ mod tests {
     }
 
     impl Daemon for Recording {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             if self.describe_fails {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
@@ -683,7 +868,7 @@ mod tests {
                 })
                 .collect())
         }
-        async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+        async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
             let attempt = self.attempts.get();
             self.attempts.set(attempt + 1);
             let refused = match self.refuse {
@@ -705,7 +890,7 @@ mod tests {
             // `calls()` tracks only what actually changed the flock, so a
             // refused start does not appear here.
             self.calls.borrow_mut().push("start");
-            Ok(())
+            Ok(Vec::new())
         }
         async fn delete(&self, _id: u32) -> Result<(), Error> {
             let attempt = self.delete_attempts.get() + 1;
@@ -719,12 +904,6 @@ mod tests {
             }
             self.calls.borrow_mut().push("delete");
             Ok(())
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
         }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -758,9 +937,10 @@ mod tests {
             fs::write(&path, format!("{{\"apps\":[{}]}}", apps.join(","))).expect("write roll");
             Ok(path)
         }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, reload, restart, set_smit,
+        );
     }
 
     /// fails if a sheep that pre-existed the dog is not put back where its
@@ -891,15 +1071,10 @@ mod tests {
         fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: None,
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
             origin_cwd: Some(PathBuf::from(origin_cwd)),
             origin_script: Some(script.to_owned()),
             checkout: PathBuf::from(origin_cwd),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -1143,7 +1318,7 @@ mod tests {
             results[0]
         );
         let text = report(&results);
-        assert!(text.contains("left as it is"), "{text}");
+        assert!(text.contains("nothing was changed by this dog"), "{text}");
         assert!(
             !text.contains("neither fully running nor fully removed"),
             "{text}"
@@ -1170,5 +1345,108 @@ mod tests {
         let text = report(&results);
         assert!(text.contains("aaa"), "{text}");
         assert!(text.contains("zzz"), "{text}");
+    }
+
+    /// fails if a deploy directory that exists but cannot be listed is
+    /// swallowed into an empty report. `paths::targets` returns that error
+    /// rather than treating it as "nothing here", and dropping it left
+    /// `report(&[])` printing nothing and `on_remove` exiting 0 with every
+    /// sheep under the tree left running.
+    #[tokio::test]
+    async fn a_deploy_directory_that_cannot_be_listed_is_reported_not_silenced() {
+        let home = tempfile::tempdir().expect("tempdir");
+        // A file where a directory is expected makes `read_dir` fail with
+        // something other than `NotFound`, which `paths::targets` does not
+        // treat as "nothing to restore".
+        fs::write(home.path().join("deploy"), b"not a directory").expect("write file");
+
+        let results = all(&Recording::new(&[], Refuse::Never), home.path()).await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "the failure must be reported, not swallowed: {results:?}"
+        );
+        assert!(
+            matches!(&results[0], Restored::Unlisted { dir, .. } if dir.ends_with("deploy")),
+            "got: {:?}",
+            results[0]
+        );
+        assert!(
+            !report(&results).is_empty(),
+            "silence here reads as success"
+        );
+    }
+
+    /// fails if a run with no deploy targets at all prints nothing. Silence
+    /// is indistinguishable from success, and `main.rs`'s sibling branch
+    /// prints a sentence for exactly this reason.
+    #[test]
+    fn an_empty_report_says_there_was_nothing_to_restore() {
+        assert_eq!(report(&[]), "no deploy targets, nothing to restore\n");
+    }
+
+    /// fails if the dog and the daemon spell `$SHEP_HOME` differently and a
+    /// sheep the cutover DID register reads as never moved because of it.
+    /// `daemon.rs:141` says the two can resolve the same directory through
+    /// different paths, so the comparison has to see through that rather
+    /// than compare spellings literally.
+    #[tokio::test]
+    async fn a_registration_reached_through_a_symlinked_parent_is_recognised() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("create home");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("symlink parent");
+
+        let tree = Tree::for_sheep(&home, "ctm");
+        fs::create_dir_all(tree.root()).expect("create tree");
+        let release = tmp.path().join("release");
+        fs::create_dir_all(&release).expect("create release dir");
+        std::os::unix::fs::symlink(&release, tree.current()).expect("symlink current");
+
+        write_target_never_cut_over(&home, "ctm", "/srv/ctm", "./run.sh");
+        let cwd_through_link = link.join("deploy").join("ctm").join("current");
+        let daemon = Recording::with_registered(&["ctm"]).registered_at(&cwd_through_link);
+
+        let results = all(&daemon, &home).await;
+
+        let text = report(&results);
+        assert!(
+            !text.contains("never moved"),
+            "the two spellings resolve to the same directory: {text}"
+        );
+        assert!(
+            !daemon.calls().is_empty(),
+            "it must actually be put back, not merely reported"
+        );
+    }
+
+    /// fails if the same recognition breaks once the release `current`
+    /// pointed at is gone. Both full canonicalisations fail on a dangling
+    /// link, and a fallback to the literal spellings called the two names
+    /// for one `current` different, so the sheep read as never moved and
+    /// stayed registered against the tree.
+    #[tokio::test]
+    async fn a_registration_through_a_symlinked_parent_is_recognised_when_current_dangles() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("create home");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("symlink parent");
+
+        let tree = Tree::for_sheep(&home, "ctm");
+        fs::create_dir_all(tree.root()).expect("create tree");
+        std::os::unix::fs::symlink(tree.release("gone"), tree.current()).expect("dangling current");
+
+        write_target_never_cut_over(&home, "ctm", "/srv/ctm", "./run.sh");
+        let cwd_through_link = link.join("deploy").join("ctm").join("current");
+        let daemon = Recording::with_registered(&["ctm"]).registered_at(&cwd_through_link);
+
+        let results = all(&daemon, &home).await;
+
+        let text = report(&results);
+        assert!(!text.contains("never moved"), "{text}");
+        assert!(!daemon.calls().is_empty(), "put back, not merely reported");
     }
 }

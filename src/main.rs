@@ -185,12 +185,40 @@ fn route<'a>(args: &[&'a str]) -> Route<'a> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+/// How long the runtime waits for blocking work after the main future ends.
+///
+/// One second. The only blocking work is git and the artifact copy, both on
+/// tokio's pool through `shared::off_thread`; a stop that lands during a
+/// fetch must not wait the fetch out, which dropping the runtime without a
+/// timeout would do. The git child left behind is bounded by `git_timeout`
+/// and finishes or dies on its own after the dog has gone.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let outcome = match route(&args) {
+    // Built by hand rather than through `#[tokio::main]`, which drops the
+    // runtime without a timeout and therefore waits for every blocking task
+    // to finish: see `DRAIN`.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("shep-deploy: cannot start a runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let code = runtime.block_on(run(&args));
+    runtime.shutdown_timeout(DRAIN);
+    code
+}
+
+/// The whole program past argument parsing, on the runtime `main` built.
+async fn run(args: &[&str]) -> ExitCode {
+    let outcome = match route(args) {
         Route::Poll => poll_forever().await,
         // Its own connection, matching every sibling verb, rather than
         // reaching for a `daemon` that does not exist in this scope. It
@@ -387,11 +415,12 @@ impl Stop {
     /// # What a stop does NOT interrupt
     ///
     /// Not a tick boundary: cancelling [`poll::run`] can land inside a
-    /// deploy, which is acceptable and documented there. It IS deferred
-    /// while a `git` call is in flight, because those run through blocking
-    /// `std::process::Command` on a current-thread runtime, so nothing else
-    /// is polled until the child exits - and a fetch against a host that is
-    /// not answering is not a bounded wait.
+    /// deploy, which is acceptable and documented there. It used to be
+    /// deferred while a `git` call was in flight, because those ran through
+    /// blocking `std::process::Command` on the runtime's one thread; they
+    /// run on tokio's blocking pool now (`shared::off_thread`), so a stop
+    /// is answered during a fetch and `main` gives the pool [`DRAIN`] to
+    /// wind down rather than waiting the fetch out.
     async fn arrives(&mut self) {
         let asked = match (&mut self.term, &mut self.interrupt) {
             (Some(term), Some(interrupt)) => tokio::select! {
@@ -571,10 +600,10 @@ async fn on_remove() -> ExitCode {
 /// Sets `sheep`'s watch mode and returns, without deploying.
 ///
 /// # Errors
-/// [`Error::Config`] if `mode` is neither `auto` nor `manual`, or if `auto`
-/// was asked for on a tree the cutover never landed on - see
-/// [`deploy::set_watch`]. [`Error::Io`] if `deploy.toml` cannot be read or
-/// written.
+/// [`Error::Config`] if `mode` is neither `auto` nor `manual`, if `auto` was
+/// asked for on a tree the cutover never landed on, or if `deploy.toml` does
+/// not parse or fails validation - see [`deploy::set_watch`]. [`Error::Io`]
+/// if it cannot be read or written.
 fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
     let watch = match mode {
         "auto" => Watch::Auto,
@@ -587,10 +616,10 @@ fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
     };
 
     let tree = Tree::for_sheep(&shep_home()?, sheep);
-    let mut state = State::read(&tree.state_file())?;
-    let was = state.watch;
-
-    deploy::set_watch(&tree, &mut state, watch)?;
+    // Both the record before and the record after come back from the write:
+    // `set_watch` reads immediately before writing, and a read made here
+    // would be the older copy the "was already" line must not be true of.
+    let (was, state) = deploy::set_watch(&tree, watch)?;
 
     if was == watch {
         println!("{sheep} was already watch = {}", named(watch));

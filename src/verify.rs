@@ -74,7 +74,16 @@ use crate::state::Verify;
 /// exists at all, and why it is pids.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Generation {
+    /// The pids that had a process.
     pids: BTreeSet<u32>,
+    /// Every row the shepherd listed, with or without a pid.
+    ///
+    /// Kept apart from `pids` because they can differ, and the difference
+    /// used to fail healthy deploys: a replica in `WaitingRestart` has no
+    /// pid, so it was missing from `pids` and present in the listing, and
+    /// [`Self::has_turned_over`] compared the pid count against the row
+    /// count and never found them equal.
+    rows: u32,
 }
 
 impl Generation {
@@ -88,9 +97,7 @@ impl Generation {
     /// Whatever [`Daemon::describe`] returns.
     pub async fn of<D: Daemon>(daemon: &D, sheep: &str) -> Result<Self, Error> {
         let flock = daemon.describe(sheep).await?;
-        Ok(Self {
-            pids: flock.iter().filter_map(|info| info.pid).collect(),
-        })
+        Ok(Self::of_infos(&flock.iter().collect::<Vec<_>>()))
     }
 
     /// How many instances this generation has.
@@ -98,14 +105,12 @@ impl Generation {
     /// Measured, which is the point: `AppConfig::instances` is the count the
     /// release's Flockfile ASKS for, and `shep stock <sheep> <n>` changes
     /// what is actually running without touching that file. A reload costs
-    /// one swap per RUNNING instance, so this is the number
-    /// `crate::deploy`'s budget has to multiply by.
+    /// one swap per instance the shepherd lists, so this is the number
+    /// `crate::deploy`'s budget has to multiply by, and the number a
+    /// turnover has to come back at.
     #[must_use]
     pub fn instances(&self) -> u32 {
-        // A flock of more than u32::MAX processes is not a thing this host
-        // could be running, but saturating says so without a cast that
-        // could wrap.
-        u32::try_from(self.pids.len()).unwrap_or(u32::MAX)
+        self.rows
     }
 
     /// The generation a listing already in hand describes.
@@ -123,6 +128,10 @@ impl Generation {
     pub(crate) fn of_infos(infos: &[&ProcessInfo]) -> Self {
         Self {
             pids: infos.iter().filter_map(|info| info.pid).collect(),
+            // A flock of more than u32::MAX processes is not a thing this
+            // host could be running, but saturating says so without a cast
+            // that could wrap.
+            rows: u32::try_from(infos.len()).unwrap_or(u32::MAX),
         }
     }
 
@@ -169,22 +178,19 @@ impl Generation {
         // compared the survivor against itself. A sheep that came back at half
         // strength verified.
         //
-        // Checked here rather than at the dwell, though the dwell is where it
-        // was found. `Verify::Probed` returns as soon as the turnover lands and
-        // never reaches a dwell, so a check placed there would leave the
-        // stricter of the two modes the blind one.
+        // Checked here rather than only at the dwell, though the dwell is
+        // where it was found: this is where `settled` is frozen, and both
+        // modes then re-check the count at their dwell against
+        // `settled.instances()`.
         //
         // Skipped when nothing was running before, because then there is no
         // count to hold to and `!flock.is_empty()` is the whole of what can be
         // asked.
-        // `flock.len()` and not a count of pids, which look like they could
-        // disagree and cannot. `settled` is built from `filter_map(|i| i.pid)`,
-        // so an instance without one would be dropped from the generation
-        // while still counting here. It never gets that far: `is_new` is
-        // `pid.is_some_and(..)`, so a pidless instance is not new, the `all`
-        // below is false, and no flock containing one is ever accepted as a
-        // turnover. That is what makes `settled.instances()` equal to this
-        // count afterwards, which the dwell then relies on.
+        // Rows against rows. `instances()` counts every row the shepherd
+        // listed before the reload, pid or no pid, so a replica that was
+        // between restarts at capture time still counts as one the reload
+        // has to bring back. Counting pids instead undercounted by exactly
+        // those, and a flock that came back whole could never match.
         let count_holds = self.instances() == 0
             || u32::try_from(flock.len()).is_ok_and(|listed| listed == self.instances());
 
@@ -210,26 +216,60 @@ pub(crate) const DWELL: Duration = Duration::from_secs(10);
 /// because "how often do we ask the shepherd again" has one answer here.
 pub(crate) const POLL: Duration = Duration::from_millis(100);
 
-/// Watch `sheep` for up to `budget`, judging health the way `mode` says to,
-/// against the generation that was serving before the reload.
+/// The most any wait on the shepherd may last, whatever the Flockfile says.
+///
+/// An hour. Every budget in this crate is built from the release's own
+/// `listen_timeout` and `graceful_timeout`, and those come out of a file
+/// the deployed repository commits. `UpDuration` accepts values up to
+/// `u64::MAX` milliseconds, so a Flockfile could ask this dog to watch a
+/// reload for half a billion years, holding the tree's lock and the poll
+/// loop with it, and a value large enough overflowed `Instant + Duration`
+/// and took the dog down instead. An hour is past any reload that could
+/// still succeed and short of any of that.
+pub(crate) const MAX_WAIT: Duration = Duration::from_secs(60 * 60);
+
+/// `budget`, held under [`MAX_WAIT`].
+///
+/// Every budget derived from a Flockfile goes through here before it is
+/// added to a clock. Both callers say so at the site.
+#[must_use]
+pub(crate) fn bounded(budget: Duration) -> Duration {
+    budget.min(MAX_WAIT)
+}
+
+/// Watch `sheep` until the flock has turned over, which it gets `budget` to
+/// do, judging health the way `mode` says to against the generation that
+/// was serving before the reload.
 ///
 /// Both modes poll, and both wait for the same turnover: every instance the
 /// shepherd reports running under a pid `before` never had. They differ only
 /// in what they then accept, and in what they do afterwards.
 ///
-/// `Probed` returns as soon as the turned-over flock is all
-/// [`ProcStatus::Online`]. That can only mean anything for a sheep whose
-/// readiness is gated - a probe, or `wait_ready` on the channel - since
-/// otherwise shep reports `Online` for a process that merely has not died;
-/// `deploy` refuses a `Probed` target with neither before it touches
-/// anything.
+/// `Probed` waits for the turned-over flock to be all
+/// [`ProcStatus::Online`], then watches it for `dwell`, requiring the same
+/// pids and every one `Online` at every look. The wait can only mean
+/// anything for a sheep whose readiness is gated - a probe, or
+/// `wait_ready` on the channel - since otherwise shep reports `Online` for
+/// a process that merely has not died; `deploy` refuses a `Probed` target
+/// with neither before it touches anything. The dwell is there because
+/// `Online` is a verdict given once: a replacement that passes its probe
+/// and dies moments later is respawned under a new pid with the reload
+/// already committed, and one whose post-drain re-probe fails is demoted to
+/// `Starting` under the same pid; the pid and the status are the only
+/// things that say so. `dwell` is [`DWELL`] for most apps and longer for one
+/// whose post-drain re-probe can take longer: see `deploy::land`.
 ///
 /// `Alive` accepts `Starting` as well, because a sheep with no gate is
-/// exactly what it exists for, and then dwells: it sleeps [`DWELL`] and
-/// looks once more, requiring the same pids to still be there. A process
-/// that came up and died inside the dwell has a different pid by then (shep
-/// restarts it) or none at all, either of which fails. `WaitingRestart` is a
-/// fail throughout for the same reason.
+/// exactly what it exists for, and then dwells: it sleeps [`DWELL`], then
+/// polls for the same pids to still be there AND to have reached `Online`,
+/// for as long as the turnover left of `budget` or one more [`DWELL`],
+/// whichever is longer. So `Alive` can run past `budget` by up to three
+/// dwells (the sleep, the floor on the deadline, and one `describe` that
+/// starts just inside it), and that is the shape the spec asks for: "wait N
+/// seconds and confirm the process is still running". A process that came up and died
+/// inside the dwell has a different pid by then (shep restarts it) or none
+/// at all, either of which fails. `WaitingRestart` is a fail throughout for
+/// the same reason.
 ///
 /// # Why `Alive` polls at all
 ///
@@ -252,21 +292,62 @@ pub async fn wait<D: Daemon>(
     mode: Verify,
     before: &Generation,
     budget: Duration,
+    dwell: Duration,
 ) -> Result<bool, Error> {
     let accept = match mode {
         Verify::Probed => is_online,
         Verify::Alive => is_alive,
     };
 
+    let started = Instant::now();
     let Some(settled) = turnover(daemon, sheep, before, accept, budget).await? else {
         return Ok(false);
     };
 
     if mode == Verify::Probed {
-        return Ok(true);
+        // `Online` is a one-time verdict. Read out of shep-daemon on
+        // 2026-09-04: once a probed replacement has answered its probe and
+        // the old instance has drained, the reload is committed and nothing
+        // re-checks it. A replacement that dies two seconds later is
+        // restarted under a NEW pid, re-enters `Online` when its probe
+        // passes again (or on the ordinary path even when it does not), and
+        // no event retracts the reload. A replacement whose post-drain
+        // re-probe fails is DEMOTED to `Starting` under the same pid and
+        // left there. So a probed release used to be recorded deployed on
+        // a process that was already gone. The dwell watches for `dwell`,
+        // which the caller sizes to the app (see `deploy::land`): the same
+        // pids, every one of them `Online`, at every look. A pid that
+        // changed or a status that fell is a verdict at once.
+        let deadline = Instant::now() + dwell;
+        loop {
+            sleep(POLL).await;
+            let flock = describe_within(daemon, sheep, dwell).await?;
+            let still = u32::try_from(flock.len()).is_ok_and(|n| n == settled.instances())
+                && flock
+                    .iter()
+                    .all(|info| settled.holds(info) && is_online(info));
+            if !still {
+                return Ok(false);
+            }
+            if Instant::now() >= deadline {
+                return Ok(true);
+            }
+        }
     }
 
     sleep(DWELL).await;
+    // How long the replacement gets to reach `Online` after the dwell: what
+    // is left of the budget, and never less than one more dwell.
+    //
+    // The budget, because the budget is what knows the app. A probeless
+    // instance is marked `Online` by shep's heuristic path when its
+    // `listen_timeout` elapses, and `budget` is built from that field. A
+    // fixed second dwell here capped the whole wait at twenty seconds
+    // whatever the app declared, so `verify = "alive"` on an app with
+    // `listen_timeout = "30s"` was rolled back, healthy, every time, at the
+    // cost of a second live reload. The README's own example uses fifteen
+    // seconds, which is why it looked fine.
+    let deadline = (started + budget).max(Instant::now() + DWELL);
     // Retried like the one in `turnover`, and for the same reason. Retrying
     // there and not here left `Verify::Alive` with exactly the bug the retry
     // was added to fix: one transient answer after the dwell propagates,
@@ -299,7 +380,6 @@ pub async fn wait<D: Daemon>(
     // So the question is not "is it Starting" but "is it STILL Starting after
     // long enough". A slow app reaches `Online` on its own; an abandoned
     // replacement never does, because nothing is left to move it.
-    let deadline = Instant::now() + DWELL;
     loop {
         let flock = describe_within(daemon, sheep, DWELL).await?;
         // The COUNT as well as the pids. `all` over a listing that shrank is
@@ -424,9 +504,9 @@ async fn turnover<D: Daemon>(
         )
         .await?;
         if before.has_turned_over(&flock, accept) {
-            return Ok(Some(Generation {
-                pids: flock.iter().filter_map(|info| info.pid).collect(),
-            }));
+            return Ok(Some(Generation::of_infos(
+                &flock.iter().collect::<Vec<_>>(),
+            )));
         }
         if Instant::now() >= deadline {
             return Ok(None);
@@ -454,7 +534,6 @@ mod tests {
     use std::cell::Cell;
 
     use shep_client::RequestError;
-    use shep_client::shep_core::config::AppConfig;
 
     use super::*;
 
@@ -469,6 +548,15 @@ mod tests {
     fn serving(pid: u32) -> Generation {
         Generation {
             pids: [pid].into_iter().collect(),
+            rows: 1,
+        }
+    }
+
+    /// The generation a reload would be replacing: one instance per pid.
+    fn serving_all(pids: &[u32]) -> Generation {
+        Generation {
+            pids: pids.iter().copied().collect(),
+            rows: u32::try_from(pids.len()).expect("a small flock"),
         }
     }
 
@@ -504,12 +592,6 @@ mod tests {
     }
 
     impl Daemon for Blips {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let n = self.calls.get();
             self.calls.set(n + 1);
@@ -520,24 +602,10 @@ mod tests {
             }
             Ok(self.after.clone())
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if one transient `describe` failure costs a live reload.
@@ -554,9 +622,7 @@ mod tests {
     /// `crate::error` pins from the other side.
     #[tokio::test]
     async fn a_transient_describe_failure_does_not_fail_verification() {
-        let before = Generation {
-            pids: [111].into_iter().collect(),
-        };
+        let before = serving(111);
         let daemon = Blips {
             calls: Cell::new(0),
             after: vec![instance(0, ProcStatus::Online, 222)],
@@ -574,12 +640,6 @@ mod tests {
     }
 
     impl Daemon for Listings {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let Some(last) = self.sequence.len().checked_sub(1) else {
                 return Ok(Vec::new());
@@ -588,24 +648,10 @@ mod tests {
             self.next.set((index + 1).min(last));
             Ok(self.sequence[index].clone())
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if the process that was already serving passes for the one the
@@ -623,6 +669,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -646,6 +693,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -671,7 +719,8 @@ mod tests {
                 "web",
                 Verify::Probed,
                 &serving(12835),
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                DWELL
             )
             .await
             .unwrap()
@@ -694,6 +743,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -713,10 +763,95 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
         assert!(!ok);
+    }
+
+    /// fails if `Probed` believes a replacement that passed its probe and
+    /// died moments later. shep restarts it under a new pid and the reload
+    /// stays committed, so the only evidence is the pid at the dwell.
+    #[tokio::test(start_paused = true)]
+    async fn probed_rejects_a_replacement_that_dies_after_its_probe_passed() {
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Online, 13002)],
+            // Respawned by the dwell: same id, new pid, Online again.
+            vec![instance(2, ProcStatus::Online, 13099)],
+        ]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            DWELL,
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "a new pid at the dwell is a process that died");
+    }
+
+    /// fails if `Probed` believes a replacement shep demoted. A failed
+    /// post-drain re-probe puts the replacement back to `Starting` under
+    /// the same pid and leaves it there; status is the only evidence.
+    #[tokio::test(start_paused = true)]
+    async fn probed_rejects_a_replacement_demoted_after_the_drain() {
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Online, 13002)],
+            vec![instance(2, ProcStatus::Starting, 13002)],
+        ]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            DWELL,
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "demoted out of Online is not deployed");
+    }
+
+    /// fails if the probed dwell stops at ten seconds when the caller asked
+    /// for more. A `reuse_port` app's post-drain re-probe can demote it any
+    /// time up to its `listen_timeout`, which `deploy::dwell_for` passes in
+    /// here; a demotion fifteen seconds after the turnover has to be seen.
+    #[tokio::test(start_paused = true)]
+    async fn probed_watches_for_the_whole_dwell_it_was_given() {
+        // Turnover, then `Online` for 150 polls (fifteen seconds at `POLL`),
+        // then demoted for good.
+        let demoted_late = || {
+            let mut sequence = vec![vec![instance(2, ProcStatus::Online, 13002)]; 151];
+            sequence.push(vec![instance(2, ProcStatus::Starting, 13002)]);
+            Listings::new(sequence)
+        };
+
+        let ok = wait(
+            &demoted_late(),
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "a demotion inside a thirty-second dwell is seen");
+
+        let ok = wait(
+            &demoted_late(),
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            DWELL,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "the plain dwell has already returned by then");
     }
 
     /// fails if `Verify::Alive` starts demanding a prompt probe. Alive is the
@@ -742,7 +877,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_millis(50)
+                Duration::from_millis(50),
+                DWELL
             )
             .await
             .unwrap()
@@ -762,6 +898,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -782,6 +919,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -814,7 +952,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_secs(120)
+                Duration::from_secs(120),
+                DWELL
             )
             .await
             .unwrap()
@@ -835,9 +974,7 @@ mod tests {
     async fn a_turnover_that_lost_a_replica_is_not_a_turnover() {
         // Two before, one after, and that one is new and healthy.
         let daemon = Listings::new(vec![vec![instance(1, ProcStatus::Online, 200)]]);
-        let before = Generation {
-            pids: [100, 101].into_iter().collect(),
-        };
+        let before = serving_all(&[100, 101]);
 
         let ok = wait(
             &daemon,
@@ -845,6 +982,7 @@ mod tests {
             Verify::Probed,
             &before,
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -874,9 +1012,7 @@ mod tests {
             // count.
             vec![instance(1, ProcStatus::Online, 200)],
         ]);
-        let before = Generation {
-            pids: [100, 101].into_iter().collect(),
-        };
+        let before = serving_all(&[100, 101]);
 
         let ok = wait(
             &daemon,
@@ -884,6 +1020,7 @@ mod tests {
             Verify::Alive,
             &before,
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -916,6 +1053,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -943,6 +1081,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -978,9 +1117,7 @@ mod tests {
                 instance(2, ProcStatus::Starting, 202),
             ],
         ]);
-        let before = Generation {
-            pids: [100, 101].into_iter().collect(),
-        };
+        let before = serving_all(&[100, 101]);
 
         let ok = wait(
             &daemon,
@@ -988,6 +1125,7 @@ mod tests {
             Verify::Alive,
             &before,
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1014,6 +1152,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1036,6 +1175,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1054,7 +1194,8 @@ mod tests {
                 "web",
                 Verify::Probed,
                 &serving(12835),
-                Duration::from_millis(50)
+                Duration::from_millis(50),
+                DWELL
             )
             .await
             .unwrap()
@@ -1066,7 +1207,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_millis(50)
+                Duration::from_millis(50),
+                DWELL
             )
             .await
             .unwrap()
@@ -1091,6 +1233,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(350),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1111,8 +1254,96 @@ mod tests {
         assert_eq!(
             generation,
             Generation {
-                pids: [12835, 12836].into_iter().collect()
+                pids: [12835, 12836].into_iter().collect(),
+                rows: 3,
             }
         );
+    }
+
+    /// fails if a replica that was between restarts when the generation was
+    /// captured stops the reload from ever being seen as complete.
+    ///
+    /// `WaitingRestart` has no pid, so it was missing from the pid set and
+    /// present in the shepherd's listing. `has_turned_over` compared the two
+    /// counts, found two against three forever, and rolled back a flock that
+    /// had come back whole. Three rows before, three new pids after, must be
+    /// a turnover.
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_between_restarts_before_the_reload_still_counts() {
+        let capture = Listings::new(vec![vec![
+            instance(1, ProcStatus::Online, 100),
+            instance(2, ProcStatus::Online, 101),
+            ProcessInfo::builder(3, "web", ProcStatus::WaitingRestart).build(),
+        ]]);
+        let before = Generation::of(&capture, "web").await.unwrap();
+
+        let daemon = Listings::new(vec![vec![
+            instance(1, ProcStatus::Online, 200),
+            instance(2, ProcStatus::Online, 201),
+            instance(3, ProcStatus::Online, 202),
+        ]]);
+        assert!(
+            wait(
+                &daemon,
+                "web",
+                Verify::Probed,
+                &before,
+                Duration::from_secs(5),
+                DWELL
+            )
+            .await
+            .unwrap(),
+            "three rows replaced by three new pids is a turnover"
+        );
+    }
+
+    /// fails if `Alive` gives a replacement a fixed twenty seconds to reach
+    /// `Online` whatever the app declared.
+    ///
+    /// A probeless app is marked `Online` by shep's heuristic path when its
+    /// `listen_timeout` elapses, and the budget is built from that field.
+    /// The post-dwell deadline was a second `DWELL` instead, so any app with
+    /// `listen_timeout` past twenty seconds was rolled back healthy. Here
+    /// the fake reaches `Online` at the thirty-first poll of a sixty-second
+    /// budget, which the old deadline never saw.
+    #[tokio::test(start_paused = true)]
+    async fn alive_waits_for_online_as_long_as_the_budget_allows() {
+        // The turnover lands at once; then `Starting` for well past two
+        // dwells worth of polls; then `Online`.
+        let mut sequence = vec![vec![instance(2, ProcStatus::Starting, 13002)]; 2];
+        // The dwell's own polls: 10s of DWELL at 100ms is 100 polls, and the
+        // old cap was another 100. Stay `Starting` for 250 polls.
+        sequence.extend(std::iter::repeat_n(
+            vec![instance(2, ProcStatus::Starting, 13002)],
+            250,
+        ));
+        sequence.push(vec![instance(2, ProcStatus::Online, 13002)]);
+        let daemon = Listings::new(sequence);
+
+        assert!(
+            wait(
+                &daemon,
+                "web",
+                Verify::Alive,
+                &serving(12835),
+                Duration::from_secs(60),
+                DWELL
+            )
+            .await
+            .unwrap(),
+            "a replacement that reaches Online inside the budget is healthy"
+        );
+    }
+
+    /// fails if a budget past [`MAX_WAIT`] reaches a clock. Added to a
+    /// `tokio::time::Instant`, `Duration::MAX` panics, and a release's
+    /// Flockfile can ask for any `listen_timeout` up to `u64::MAX`
+    /// milliseconds.
+    #[test]
+    fn a_budget_is_held_under_the_ceiling() {
+        assert_eq!(bounded(Duration::MAX), MAX_WAIT);
+        assert_eq!(bounded(Duration::from_secs(5)), Duration::from_secs(5));
+        // And the ceiling itself is something a clock can hold.
+        let _ = Instant::now() + MAX_WAIT;
     }
 }

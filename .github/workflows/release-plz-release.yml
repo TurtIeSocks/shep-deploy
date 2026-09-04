@@ -29,6 +29,7 @@ jobs:
   release-plz-release:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # An environment, so a required reviewer can be added here if this ever
     # wants a human gate between merging and spending a version number.
     # Inert until one is configured.

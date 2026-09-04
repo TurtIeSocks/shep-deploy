@@ -10,13 +10,19 @@ keywords = ["shep", "process-manager", "deploy", "git"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-shep-client = "0.1.23"
+shep-client = "0.2.0"
 # Already in the tree: shep-core depends on it, so this is a direct edge on
-# something every build of this crate already compiles. Only `fs` is wanted,
-# for `flock(2)`.
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+# something every build of this crate already compiles. `fs` for `flock(2)`,
+# `signal` for `killpg(2)`; both are safe wrappers, which is what lets a crate
+# that forbids unsafe use them at all.
+nix = { version = "0.29", default-features = false, features = ["fs", "signal"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "process", "signal"] }
 toml = "0.8"
+# The staging file `State::write` goes through is shep-core's
+# `atomic_file::create_staging_file`, which hands back a `NamedTempFile`;
+# naming that type here is what needs the crate as a dependency in its own
+# right, and it was already in the tree as a dev-dependency.
+tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

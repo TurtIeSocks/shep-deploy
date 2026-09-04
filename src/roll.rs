@@ -55,10 +55,7 @@ struct Entry {
 /// roll if it cannot be read and [`Error::Config`] if it cannot be parsed.
 pub async fn registered<D: Daemon>(daemon: &D) -> Result<BTreeMap<String, AppConfig>, Error> {
     let path = daemon.save_roll().await?;
-    let text = fs::read_to_string(&path).map_err(|source| Error::Io {
-        path: path.clone(),
-        source,
-    })?;
+    let text = fs::read_to_string(&path).map_err(Error::at(&path))?;
     read(&path, &text)
 }
 

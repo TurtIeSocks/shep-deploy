@@ -25,8 +25,8 @@
 //! lift this into a library and it starts firing, at which point the
 //! trade-off wants deciding rather than silencing.
 //!
-//! Do not add trait methods speculatively. These eight are the surface plan
-//! one and plan two need between them, not eight that looked useful:
+//! Do not add trait methods speculatively. These nine are the surface plan
+//! one and plan two need between them, not nine that looked useful:
 //! `list_flock`, `describe` and `reload` are exercised inside plan one
 //! (`adopted_name` below, probe-based verification, and the deploy
 //! sequence). `dog_config` reads the `[dog.<name>]` section that names the
@@ -67,7 +67,7 @@ use crate::error::Error;
 
 /// Everything this dog asks the shepherd for.
 ///
-/// Narrow on purpose: eight methods cover the whole plan, and each is written
+/// Narrow on purpose: nine methods cover the whole plan, and each is written
 /// against whatever the shepherd itself calls the operation (`shep reload`,
 /// `shep restart`, ...) rather than against this crate's own vocabulary for
 /// it, so a reader who knows shep already knows what each one does.
@@ -99,11 +99,18 @@ pub trait Daemon {
     /// As [`Self::dog_config`].
     async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error>;
 
-    /// Register and start every app in `apps`.
+    /// Register and start every app in `apps`, answering the ids of the
+    /// instances this `Start` registered.
+    ///
+    /// The ids are the daemon's own answer to "which rows are yours", so a
+    /// caller that later has to take exactly those rows down can name them
+    /// rather than guess from a listing which rows are new. `Start` is an
+    /// acceptance: the rows are registered when this returns and spawned
+    /// afterwards, so a `describe` straight after can still be missing them.
     ///
     /// # Errors
     /// As [`Self::dog_config`].
-    async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error>;
+    async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error>;
 
     /// Stop and deregister one instance, by its stable numeric id.
     ///
@@ -281,9 +288,9 @@ impl Daemon for Live {
         }
     }
 
-    async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+    async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
         match self.0.request(Request::Start { apps }).await? {
-            Response::Started(_) => Ok(()),
+            Response::Started(flock) => Ok(flock.iter().map(|info| info.id).collect()),
             other => Err(unexpected("Start", &other)),
         }
     }
@@ -362,9 +369,15 @@ fn named(response: &Response) -> String {
         Response::SmitPainted(flock) => format!("a SmitPainted of {}", flock.len()),
         // `Response` is `#[non_exhaustive]`, so this arm is not optional. A
         // variant added to the protocol after this dog was written is
-        // exactly the one worth naming, and only `Debug` can name it.
-        // Truncated, because some of them are listings.
-        other => format!("{other:?}").chars().take(60).collect(),
+        // exactly the one worth naming, and only `Debug` can name it. Only
+        // the name: `Debug` goes on to print the body, and a variant nobody
+        // here has reviewed is exactly the one whose body might carry a
+        // credential, as `DogSection`'s does. The first run of identifier
+        // characters is the variant's name and nothing else.
+        other => format!("{other:?}")
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect(),
     }
 }
 
@@ -414,33 +427,13 @@ mod tests {
     struct Flock(Vec<ProcessInfo>);
 
     impl Daemon for Flock {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
         async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
             Ok(self.0.clone())
         }
-        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, describe, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// A [`Daemon`] that cannot be reached at all - every method answers
@@ -449,33 +442,10 @@ mod tests {
     struct Unreachable;
 
     impl Daemon for Unreachable {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
+        crate::fixtures::daemon_methods!(
+            answering Err(Error::Protocol("no session".to_owned()));
+            dog_config, list_flock, describe, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if `named` starts printing a `DogSection`'s body. That
@@ -544,7 +514,7 @@ mod tests {
 
     /// fails if `unexpected` stops saying which request the answer was to.
     /// "a Flock of 2" alone does not tell an operator which call went
-    /// wrong, and this dog makes eight different ones.
+    /// wrong, and this dog makes nine different ones.
     #[test]
     fn an_unexpected_answer_names_the_request_it_answered() {
         let err = unexpected("Reload", &Response::Flock(Vec::new()));

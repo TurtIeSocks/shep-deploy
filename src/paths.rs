@@ -13,6 +13,9 @@
 //! │                        release as `target` so builds stay warm and a
 //! │                        hardcoded `./target/release/x` still resolves
 //! ├── current -> releases/<sha>   swapped with rename(2) at cutover
+//! ├── complete/<sha>       per-release completion marker, kept outside the
+//! │                        release on purpose - see `Tree::completion`
+//! ├── deploy.lock          exclusive flock so only one deploy runs at once
 //! └── deploy.toml          the sheep's `State` - see `crate::state`
 //! ```
 
@@ -20,7 +23,24 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::Error;
 
-/// Every sheep that is a deploy target, by name.
+/// What is under `<shep_home>/deploy`: every sheep that is a deploy target,
+/// by name, and every directory there that holds a record and cannot be
+/// named.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Targets {
+    /// The targets, sorted by name.
+    pub named: Vec<String>,
+    /// Directories holding a `deploy.toml` whose name cannot be a sheep's:
+    /// not valid UTF-8, or carrying a character that would rewrite a log
+    /// line (see `shared::forges_a_line`). Each is a target
+    /// the dog cannot poll or restore, reported by every caller as its own
+    /// row rather than skipped, and rather than stopping the listing for the
+    /// targets that can be named.
+    pub unnamed: Vec<PathBuf>,
+}
+
+/// Every sheep that is a deploy target, by name, and every directory that
+/// holds a record and cannot be named.
 ///
 /// A target is a directory under `<shep_home>/deploy` holding a
 /// `deploy.toml`. Reading the directory rather than a list held anywhere
@@ -32,29 +52,32 @@ use crate::error::Error;
 /// # Errors
 /// [`Error::Io`], naming `<shep_home>/deploy`, if it exists but cannot be
 /// listed. An absent directory is an empty list, not an error: that is
-/// every shepherd with no targets yet.
-pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
+/// every shepherd with no targets yet. A directory that cannot be named is
+/// not an error either, it is in [`Targets::unnamed`]: one such entry used
+/// to stop the whole listing and with it every deploy of every target.
+pub fn targets(shep_home: &Path) -> Result<Targets, Error> {
     let root = shep_home.join("deploy");
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Targets::default());
+        }
         Err(source) => return Err(Error::Io { path: root, source }),
     };
 
-    let mut found = Vec::new();
+    let mut found = Targets::default();
     for entry in entries {
-        let entry = entry.map_err(|source| Error::Io {
-            path: root.clone(),
-            source,
-        })?;
+        let entry = entry.map_err(Error::at(&root))?;
         if !entry.path().join("deploy.toml").is_file() {
             continue;
         }
-        if let Some(name) = entry.file_name().to_str() {
-            found.push(name.to_owned());
+        match entry.file_name().to_str() {
+            Some(name) if is_sheep_name(name) => found.named.push(name.to_owned()),
+            _ => found.unnamed.push(entry.path()),
         }
     }
-    found.sort();
+    found.named.sort();
+    found.unnamed.sort();
     Ok(found)
 }
 
@@ -82,17 +105,25 @@ pub struct Tree {
 /// line. The poll loop's names come from directory entries under
 /// `$SHEP_HOME/deploy` that this crate created, so they are already inside.
 ///
-/// The test is that the string is exactly one ordinary path component: that
-/// rejects the empty string, `.`, `..`, anything absolute, and anything with a
-/// separator in it, without a charset rule that would have to guess at what an
-/// operator may call their app.
+/// The test is that the string is exactly one ordinary path component with
+/// nothing in it that would rewrite a log line (`shared::forges_a_line`'s
+/// set): that rejects the empty string, `.`, `..`, anything absolute,
+/// anything with a separator in it and anything invisible or bidirectional,
+/// without a charset rule that would have to guess at what an operator may
+/// call their app.
 #[must_use]
 pub fn is_sheep_name(sheep: &str) -> bool {
     let mut components = Path::new(sheep).components();
     let one_ordinary_component =
         matches!(components.next(), Some(Component::Normal(only)) if only == sheep);
 
-    one_ordinary_component && components.next().is_none()
+    // Nothing that forges a line either. The name is interpolated into every
+    // log line about the target, and a newline or a bidi override in it
+    // rewrites the line around it; the set is `shared::forges_a_line`'s, the
+    // same one messages replace.
+    one_ordinary_component
+        && components.next().is_none()
+        && !sheep.chars().any(crate::shared::forges_a_line)
 }
 
 impl Tree {
@@ -103,6 +134,13 @@ impl Tree {
     /// off one `ReactMap` checkout), and each gets its own tree.
     #[must_use]
     pub fn for_sheep(shep_home: &Path, sheep: &str) -> Self {
+        // The real check lives in `main::route`; this keeps the contract
+        // next to the constructor instead of trusting every caller to have
+        // gone through there first.
+        debug_assert!(
+            is_sheep_name(sheep),
+            "a sheep name is one path component, got {sheep:?}"
+        );
         Self {
             root: shep_home.join("deploy").join(sheep),
             sheep: sheep.to_owned(),
@@ -168,7 +206,18 @@ impl Tree {
     /// Under the tree's own root, which only this dog writes.
     #[must_use]
     pub fn completion(&self, sha: &str) -> PathBuf {
-        self.root.join("complete").join(sha)
+        self.completions().join(sha)
+    }
+
+    /// The directory every completion marker lives in.
+    ///
+    /// Named on its own because retention sweeps it. Deriving it from
+    /// `completion("")` gave a path with a trailing separator whose
+    /// `parent()` was the tree root, and a sweep of the root removed
+    /// `current`. Measured by the suite on 2026-09-03, before it shipped.
+    #[must_use]
+    pub fn completions(&self) -> PathBuf {
+        self.root.join("complete")
     }
 
     /// The file a deploy takes an exclusive `flock` on, so only one process
@@ -186,6 +235,18 @@ impl Tree {
     #[must_use]
     pub fn state_file(&self) -> PathBuf {
         self.root.join("deploy.toml")
+    }
+
+    /// The lock every read-modify-write of [`Self::state_file`] holds, so
+    /// two writers cannot each rename their own snapshot over the other's.
+    ///
+    /// Separate from [`Self::lock_file`], which a deploy holds for as long
+    /// as a build takes: this one is held for one read and one write, so
+    /// `--watch manual` typed during a build lands at once. See
+    /// `crate::lock::hold_record`.
+    #[must_use]
+    pub fn record_lock(&self) -> PathBuf {
+        self.root.join("deploy.toml.lock")
     }
 
     /// The dog's own build cache for this sheep, shared by every release.
@@ -228,9 +289,80 @@ mod tests {
         );
         assert_eq!(tree.current(), Path::new("/srv/shep/deploy/bpm/current"));
         assert_eq!(
+            tree.completion("a1b2c3d"),
+            Path::new("/srv/shep/deploy/bpm/complete/a1b2c3d")
+        );
+        assert_eq!(
+            tree.lock_file(),
+            Path::new("/srv/shep/deploy/bpm/deploy.lock")
+        );
+        assert_eq!(
             tree.state_file(),
             Path::new("/srv/shep/deploy/bpm/deploy.toml")
         );
+    }
+
+    /// fails if `is_sheep_name` accepts a name that would traverse out of
+    /// the tree, or rejects an ordinary one. This is the one check standing
+    /// between an operator-typed name and a tree rooted somewhere nobody
+    /// pointed it.
+    #[test]
+    fn is_sheep_name_accepts_one_component_and_rejects_everything_else() {
+        for accepted in ["bpm", "reactmap-staging", "web.2"] {
+            assert!(is_sheep_name(accepted), "should accept {accepted:?}");
+        }
+        for rejected in ["", ".", "..", "/tmp/x", "../x", "a/b", "a/"] {
+            assert!(!is_sheep_name(rejected), "should reject {rejected:?}");
+        }
+    }
+
+    /// fails if a directory whose name is not valid UTF-8 is silently
+    /// dropped from the target list. A target the dog cannot name never
+    /// polls and never restores, with nothing said anywhere, so this has
+    /// to be a loud error instead of a skip.
+    #[test]
+    fn a_non_utf8_target_name_is_an_error_naming_the_entry() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let deploy = home.path().join("deploy");
+        let bad_dir = deploy.join(OsStr::from_bytes(&[0xff, 0xfe]));
+        if let Err(err) = std::fs::create_dir_all(&bad_dir) {
+            // APFS refuses a name that is not valid UTF-8 outright, so on
+            // macOS the entry this pins cannot exist. Linux filesystems
+            // accept it, and CI runs there.
+            eprintln!("skipped: this filesystem refuses the name ({err})");
+            return;
+        }
+        std::fs::write(bad_dir.join("deploy.toml"), "").expect("write deploy.toml");
+
+        let found = targets(home.path()).expect("the listing itself succeeds");
+        assert_eq!(
+            found.unnamed,
+            vec![bad_dir],
+            "the entry is reported, not skipped"
+        );
+        assert!(found.named.is_empty());
+    }
+
+    /// fails if a target the dog cannot name stops the targets it can. One
+    /// such entry used to abort the whole listing, and `poll::tick` then
+    /// deployed nothing, every tick, for as long as it sat there.
+    #[test]
+    fn an_unnameable_target_does_not_hide_the_named_ones() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let deploy = home.path().join("deploy");
+        for name in ["web", "bad\nname"] {
+            let dir = deploy.join(name);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join("deploy.toml"), "").expect("record");
+        }
+
+        let found = targets(home.path()).expect("lists");
+
+        assert_eq!(found.named, vec!["web".to_owned()]);
+        assert_eq!(found.unnamed, vec![deploy.join("bad\nname")]);
     }
 
     /// fails if a tree stops knowing which sheep it belongs to. The

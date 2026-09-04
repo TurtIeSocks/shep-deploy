@@ -69,6 +69,16 @@ const DEFAULT_BUILD_TIMEOUT: UpDuration = UpDuration::from_millis(3_600_000);
 /// newest N, so N of one prunes the rollback target.
 const MINIMUM_RETENTION: usize = 2;
 
+/// The shortest interval, git timeout or build timeout accepted.
+///
+/// One second, and the number is less the point than the unit. `UpDuration`
+/// reads a bare number as MILLISECONDS, so `interval = "30"`, the obvious
+/// hand-edit for thirty seconds, is thirty milliseconds: a dog fetching
+/// thirty times a second, which is the exact harm the zero refusal below
+/// names, one keystroke away. Anything under a second is that mistake and
+/// not a setting anybody meant.
+const MINIMUM_DURATION: Duration = Duration::from_secs(1);
+
 /// The `[dog.<name>]` section, parsed.
 ///
 /// `Debug` is derived: a poll interval and a count are not secrets, and
@@ -83,11 +93,13 @@ const MINIMUM_RETENTION: usize = 2;
 pub struct DogConfig {
     /// How long the poll loop sleeps between ticks.
     pub interval: Duration,
-    /// How many releases per target retention keeps.
+    /// How many of the newest releases per target retention keeps.
     ///
-    /// This is a count of releases kept *besides* the live one, so a target
-    /// holds up to `retention + 1` directories. See `crate::retention::doomed`
-    /// for why the live release is spared unconditionally.
+    /// The release `current` names and the one `deploy.toml` names are
+    /// spared whatever their age, so a target holds `retention` directories
+    /// in the ordinary case and up to two more after a deploy that died
+    /// between its swap and its record write. See `crate::retention` for
+    /// why those two are named rather than counted.
     pub retention: usize,
     /// How long any single git subprocess may run before it is abandoned.
     pub git_timeout: Duration,
@@ -98,7 +110,7 @@ pub struct DogConfig {
     /// A build otherwise starts from a cleared environment plus a small fixed
     /// set (see `crate::build::BASE_ENV`), so anything a build needs from the
     /// dog's own environment is opted into here by name and is visible in
-    /// `shep.toml` rather than inherited invisibly.
+    /// `dogs.toml` rather than inherited invisibly.
     pub passthrough: Vec<String>,
 }
 
@@ -136,8 +148,9 @@ impl DogConfig {
     /// # Errors
     /// [`Error::Config`] if the text is not valid TOML, carries a key this
     /// dog does not know, gives a value of the wrong type, asks for a
-    /// retention below two, asks for a zero interval, or asks for a zero
-    /// `git_timeout` or `build_timeout`.
+    /// retention below two, asks for an `interval`, `git_timeout` or
+    /// `build_timeout` under a second, or names a `passthrough` entry that
+    /// is empty, repeated, or not an environment variable name.
     ///
     /// Every case except the first names the offending key, because the
     /// section is one an operator edited by hand and a complaint they cannot
@@ -157,33 +170,43 @@ impl DogConfig {
             )));
         }
 
-        let interval = raw.interval.as_duration();
-        if interval.is_zero() {
-            return Err(Error::Config(
-                "interval = \"0\" would fetch continuously rather than on a schedule, which \
-                 reads as a hung dog and hammers the remote it is watching"
-                    .to_owned(),
-            ));
-        }
+        let interval = at_least_a_second(
+            "interval",
+            raw.interval,
+            "would fetch continuously rather than on a schedule, which reads as a hung dog and \
+             hammers the remote it is watching",
+        )?;
+        let git_timeout = at_least_a_second(
+            "git_timeout",
+            raw.git_timeout,
+            "would abandon every fetch the moment it started; the point of the bound is to \
+             turn a hung remote into an ordinary per-target failure, not to disable git",
+        )?;
+        let build_timeout = at_least_a_second(
+            "build_timeout",
+            raw.build_timeout,
+            "would abandon every build the moment it started; the point of the bound is to \
+             turn a build that never finishes into an ordinary per-target failure, not to \
+             disable building",
+        )?;
 
-        let git_timeout = raw.git_timeout.as_duration();
-        if git_timeout.is_zero() {
-            return Err(Error::Config(
-                "git_timeout = \"0\" would abandon every fetch the moment it started; \
-                 the point of the bound is to turn a hung remote into an ordinary \
-                 per-target failure, not to disable git"
-                    .to_owned(),
-            ));
-        }
-
-        let build_timeout = raw.build_timeout.as_duration();
-        if build_timeout.is_zero() {
-            return Err(Error::Config(
-                "build_timeout = \"0\" would abandon every build the moment it started; \
-                 the point of the bound is to turn a build that never finishes into an \
-                 ordinary per-target failure, not to disable building"
-                    .to_owned(),
-            ));
+        let mut seen = std::collections::BTreeSet::new();
+        for name in &raw.passthrough {
+            let why = if name.is_empty() {
+                Some("is empty")
+            } else if name.contains(['=', '\0']) {
+                Some("is not an environment variable name: one cannot contain `=` or NUL")
+            } else if !seen.insert(name.as_str()) {
+                Some("is listed twice")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(Error::Config(format!(
+                    "passthrough entry {name:?} {why}; each entry names one variable to copy \
+                     from the dog's environment into a build"
+                )));
+            }
         }
 
         Ok(Self {
@@ -194,6 +217,27 @@ impl DogConfig {
             passthrough: raw.passthrough,
         })
     }
+}
+
+/// `value` as a [`Duration`], refused by `key` if it is under
+/// [`MINIMUM_DURATION`].
+///
+/// The refusal spells the value out in milliseconds and says what a bare
+/// number means, because that is the mistake it exists to catch: `"30"` is
+/// thirty milliseconds, and the operator meant `"30s"`.
+///
+/// # Errors
+/// [`Error::Config`] naming `key`, the value as read, and `harm`.
+fn at_least_a_second(key: &str, value: UpDuration, harm: &str) -> Result<Duration, Error> {
+    let duration = value.as_duration();
+    if duration < MINIMUM_DURATION {
+        return Err(Error::Config(format!(
+            "{key} = {}ms is under a second, which {harm}. A bare number is read as \
+             milliseconds: write `{key} = \"30s\"` for thirty seconds",
+            duration.as_millis()
+        )));
+    }
+    Ok(duration)
 }
 
 /// This dog's own section, read from the shepherd.
@@ -266,6 +310,58 @@ mod tests {
         assert!(err.to_string().contains("interval"), "{err}");
     }
 
+    /// fails if a bare number is accepted as seconds. `UpDuration` reads
+    /// `"30"` as thirty MILLISECONDS, so the obvious hand-edit for the
+    /// documented default fetched thirty times a second and was accepted
+    /// because it was not zero. The refusal has to name the key, say what
+    /// the number was read as, and show the spelling that was meant.
+    #[test]
+    fn a_duration_under_a_second_is_refused_and_the_unit_is_named() {
+        for key in ["interval", "git_timeout", "build_timeout"] {
+            let err = DogConfig::parse(&format!("{key} = \"30\"")).expect_err(key);
+            let shown = err.to_string();
+            assert!(shown.contains(key), "{shown}");
+            assert!(
+                shown.contains("30ms"),
+                "must say what it was read as: {shown}"
+            );
+            assert!(
+                shown.contains("\"30s\""),
+                "must show the spelling meant: {shown}"
+            );
+        }
+        // And a second exactly is the floor, not past it.
+        DogConfig::parse("interval = \"1s\"\ngit_timeout = \"1s\"\nbuild_timeout = \"1s\"")
+            .expect("one second is allowed");
+    }
+
+    /// fails if the two timeouts and the passthrough list stop being read.
+    /// `both_keys_are_read` predates all three, and a config silently
+    /// running on defaults looks exactly like one being honoured.
+    #[test]
+    fn the_timeouts_and_passthrough_are_read() {
+        let config = DogConfig::parse(
+            "git_timeout = \"2m\"\nbuild_timeout = \"3h\"\npassthrough = [\"CARGO_HOME\", \"NPM_TOKEN\"]",
+        )
+        .expect("parses");
+        assert_eq!(config.git_timeout, Duration::from_secs(120));
+        assert_eq!(config.build_timeout, Duration::from_secs(3 * 3600));
+        assert_eq!(config.passthrough, vec!["CARGO_HOME", "NPM_TOKEN"]);
+    }
+
+    /// fails if a passthrough entry that cannot name a variable is accepted.
+    /// `passthrough` is the only door for a registry token, and an entry
+    /// that can never match anything is dropped in silence at build time,
+    /// which this module's own doc says is the wrong shape for a setting.
+    #[test]
+    fn a_passthrough_entry_that_is_not_a_variable_name_is_refused() {
+        for entry in ["\"\"", "\"A=B\"", "\"X\", \"X\""] {
+            let err = DogConfig::parse(&format!("passthrough = [{entry}]")).expect_err(entry);
+            let shown = err.to_string();
+            assert!(shown.contains("passthrough"), "{shown}");
+        }
+    }
+
     /// fails if a typo is ignored instead of refused. `retenton = 2` that
     /// parses to the default of 5 is a config an operator will believe is
     /// in force for as long as the disk lasts. Same reasoning as
@@ -277,7 +373,7 @@ mod tests {
     }
 
     /// fails if a wrong-typed value produces a message that does not name
-    /// the key. This section is hand-edited in `shep.toml`, and
+    /// the key. This section is hand-edited in `dogs.toml`, and
     /// `retention = "five"` is a plausible thing to write; a bare "invalid
     /// type: string" with no key names nothing an operator can go and fix.
     #[test]

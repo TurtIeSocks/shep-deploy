@@ -53,7 +53,6 @@ use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::deploy::RELOAD_DEADLINE_SLACK;
 use crate::error::Error;
-use crate::flockfile;
 use crate::git;
 use crate::lock;
 use crate::paths::Tree;
@@ -61,15 +60,20 @@ use crate::roll;
 use crate::shared;
 use crate::state::{State, Verify, Watch};
 use crate::swap;
-use crate::verify::{DWELL, Generation, POLL, is_alive};
+use crate::verify::{self, DWELL, Generation, POLL, is_alive};
 
 /// Everything opt-in built, ready for a cutover to register and swap into
 /// place.
 ///
-/// `Clone` is needed by the cutover's own tests, which assert on what it
-/// did with a value they still hold afterwards.
-#[derive(Debug, Clone)]
+/// Carries the tree's exclusive hold as well, so the lock [`prepare`] took
+/// is still held while [`cut_over`] registers, deletes and writes the
+/// record. Released between the two, a second `setup` in that window read a
+/// record with no `deployed` and told the operator to remove a tree a live
+/// cutover was using.
+#[derive(Debug)]
 pub struct Prepared {
+    /// The tree's exclusive hold, kept for the cutover. See the type doc.
+    hold: lock::Deploying,
     /// The deploy tree this release was built into.
     pub tree: Tree,
     /// The tree's own record, with `current` already pointed at `sha`.
@@ -107,8 +111,9 @@ pub struct Prepared {
 /// working directory for it. Otherwise, whatever [`roll::registered`],
 /// [`git::remote_url`], [`git::current_branch`], [`git::init_bare`],
 /// [`git::fetch`], [`git::remote_head`], [`git::worktree_add`],
-/// [`shared::link_cache`], [`shared::link_into`], [`flockfile::app_config`],
-/// [`flockfile::build_spec`], [`build::run`] or [`swap::point_at`] return.
+/// [`crate::deploy::stage_release`] (the worktree, the cache link, the shared
+/// files and both Flockfiles),
+/// [`build::run`] or [`swap::point_at`] return.
 pub async fn prepare<D: Daemon>(
     daemon: &D,
     shep_home: &Path,
@@ -116,6 +121,99 @@ pub async fn prepare<D: Daemon>(
     config: &DogConfig,
 ) -> Result<Prepared, Error> {
     let tree = Tree::for_sheep(shep_home, sheep);
+
+    // Cloned rather than borrowed, and named `previous_config` rather than
+    // `app`, because the release's own definition shadows the name below and
+    // these two must never be confused: this one is the operator's, and it
+    // is the only copy of it that exists once Task 8 sends its Start.
+    let registered = roll::registered(daemon).await?;
+    let previous_config = registered.get(sheep).cloned().ok_or_else(|| {
+        Error::Config(format!(
+            "the shepherd has no sheep named {sheep:?} registered, so there is nothing to take \
+             over: `shep-deploy survey` lists every registered sheep and where it stands"
+        ))
+    })?;
+    let checkout = PathBuf::from(previous_config.cwd.as_deref().ok_or_else(|| {
+        Error::Config(format!(
+            "shep records no working directory for {sheep}, so there is no checkout to deploy \
+             from"
+        ))
+    })?);
+    // The shepherd already runs the sheep from this tree's `current`: a
+    // cutover landed and its record was not written, or the record was lost
+    // afterwards. Either way the tree is live, and the advice the record
+    // branch below gives an unrecorded tree, remove it and run setup again,
+    // would take a running service's cwd with it. The record is repaired
+    // from what `current` names instead, and the sheep is then what it is:
+    // a deploy target, refused here like any other.
+    if shared::same_path(&checkout, &tree.current())
+        && let Some(release) = swap::resolve(&tree.current())?
+        && let Some(sha) = release.file_name().and_then(|name| name.to_str())
+        && crate::state::is_sha(sha)
+        && release.is_dir()
+    {
+        // The tree exists in this case, so the hold litters nothing, and the
+        // repair below writes the record under it.
+        let _deploying = lock::hold(&tree)?;
+        let _record = lock::hold_record(&tree)?;
+        let next = format!(
+            "Deploy it with `shep deploy {sheep}`, or change how it is watched with `shep \
+             deploy {sheep} --watch auto|manual`."
+        );
+        let record = match State::read(&tree.state_file()) {
+            Ok(mut state @ State { deployed: None, .. }) => {
+                state.deployed = Some(sha.to_owned());
+                state.write(&tree.state_file())?;
+                format!(
+                    "Its record named no deployed release and has been brought up to date \
+                     with that. {next}"
+                )
+            }
+            Ok(state) if state.deployed.as_deref() == Some(sha) => {
+                format!("Its record agrees. {next}")
+            }
+            Ok(State {
+                deployed: Some(other),
+                ..
+            }) => format!(
+                "Its record names {} instead, which is what a deploy whose record could not \
+                 be written leaves; the next deploy corrects it. {next}",
+                &other[..7.min(other.len())]
+            ),
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                "Its record is missing, and this dog cannot rebuild the origin fields removal \
+                 needs: write a deploy.toml by hand from another target's as a model, with \
+                 `deployed` set to that sha, before deploying."
+                    .to_owned()
+            }
+            Err(_) => "Its record cannot be read: repair it before deploying, and do NOT \
+                       remove the tree, the service runs from inside it."
+                .to_owned(),
+        };
+        return Err(Error::Config(format!(
+            "{sheep} is already a deploy target: the shepherd runs it from {}, which names {}. \
+             {record}",
+            tree.current().display(),
+            &sha[..7]
+        )));
+    }
+
+    // A cwd anywhere else inside this sheep's own deploy tree is what an
+    // abandoned cutover leaves in the shepherd's record once the tree's own
+    // record is gone, and capturing it as the origin would make removal put
+    // the sheep back INTO the tree. Refused by name rather than left to
+    // `current_branch`, which happened to refuse it only because releases
+    // are detached worktrees.
+    if shared::resolved(&checkout).starts_with(shared::resolved(tree.root())) {
+        return Err(Error::Config(format!(
+            "{sheep} is registered with its working directory inside its own deploy tree ({}), \
+             so there is no operator checkout to take it over from. That is what an abandoned \
+             cutover leaves in the shepherd's record: re-register {sheep} from its own \
+             Flockfile in the checkout it should deploy from, then run setup again",
+            checkout.display()
+        )));
+    }
+
     if tree.state_file().is_file() {
         // Two very different situations share this one condition, and
         // telling them apart is not a nicety. A target that was cut over
@@ -167,24 +265,6 @@ pub async fn prepare<D: Daemon>(
         }));
     }
 
-    // Cloned rather than borrowed, and named `previous_config` rather than
-    // `app`, because the release's own definition shadows the name below and
-    // these two must never be confused: this one is the operator's, and it
-    // is the only copy of it that exists once Task 8 sends its Start.
-    let registered = roll::registered(daemon).await?;
-    let previous_config = registered.get(sheep).cloned().ok_or_else(|| {
-        Error::Config(format!(
-            "the shepherd has no sheep named {sheep:?} registered, so there is nothing to take \
-             over: `shep-deploy survey` lists every registered sheep and where it stands"
-        ))
-    })?;
-    let checkout = PathBuf::from(previous_config.cwd.as_deref().ok_or_else(|| {
-        Error::Config(format!(
-            "shep records no working directory for {sheep}, so there is no checkout to deploy \
-             from"
-        ))
-    })?);
-
     // Both of these refuse rather than guess: a checkout with no `origin`
     // gets git's own complaint, and a detached HEAD is refused by name,
     // because there is no branch to track and a target created that way
@@ -209,40 +289,52 @@ pub async fn prepare<D: Daemon>(
         origin_cwd: Some(checkout.clone()),
         origin_script: Some(previous_config.script.clone()),
         checkout,
+        // The whole definition, so removal puts back `env`, `instances`,
+        // the probes and everything else the operator had, not the two
+        // fields above alone.
+        origin: Some(previous_config.clone()),
     };
+    // Checked here, before the fetch, the worktree and the build, rather
+    // than found out by the record write at the very end. Neither value was
+    // typed by the operator: `remote` is what `git remote get-url origin`
+    // answered in the checkout and `checkout` is the cwd shep registered.
+    state.validate(Path::new("deploy.toml")).map_err(|err| {
+        Error::Config(format!(
+            "{sheep} cannot be recorded as it is registered ({err}). `remote` is the \
+                 checkout's `origin`, `branch` is the checkout's HEAD, and `checkout` is the cwd \
+                 shep has for {sheep}; fix whichever is named and run setup again"
+        ))
+    })?;
 
     // Same hold a deploy takes, for the same reason: everything below writes
     // to this tree, and a poll tick can be doing the same at the same moment.
-    // After the directory exists, because that is what the lock file lives in.
-    let _deploying = lock::hold(&tree)?;
+    // After every refusal that needs no tree, so a `setup` that fails on a
+    // detached HEAD or a missing `origin` leaves nothing behind: `hold` makes
+    // the tree's root itself. Carried out in `Prepared` so the cutover runs
+    // under it too.
+    let hold = lock::hold(&tree)?;
 
-    std::fs::create_dir_all(tree.releases()).map_err(|source| Error::Io {
-        path: tree.releases(),
-        source,
-    })?;
+    std::fs::create_dir_all(tree.releases()).map_err(Error::at(tree.releases()))?;
     git::init_bare(&tree.git())?;
-    git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
+    // Off the runtime's thread, like every git call: see `shared::off_thread`.
+    let (git_dir, remote, budget) = (tree.git(), state.remote.clone(), config.git_timeout);
+    shared::off_thread(move || git::fetch(&git_dir, &remote, budget)).await?;
     let sha = git::remote_head(&tree.git(), &state.branch)?;
 
     let release = tree.release(&sha);
-    // Shared with `deploy::attempt` rather than a bare `worktree_add`, and
-    // that is what makes this function's own retry story true. `git worktree
-    // add` refuses a path that already exists ("fatal: `<path>` already
-    // exists") and refuses one it still has registered after the directory
-    // was removed ("missing but already registered worktree"). So every run
-    // that died anywhere from here onward left a release directory that made
-    // the next run fail on git rather than resume, which is the opposite of
-    // what the doc above promises.
-    crate::deploy::checkout_release(&tree, &sha)?;
-    shared::link_cache(&release, &tree.cache_target())?;
-    // Held, not recomputed. This is the only record of which files came from
-    // the operator's own checkout rather than from the repository, and
-    // `flockfile` needs it to know whether an override is theirs.
-    let shared_paths = shared::to_link(&state.checkout)?;
-    shared::link_into(&release, &state.checkout, &shared_paths)?;
-
-    let app = flockfile::app_config(&release, sheep, &shared_paths)?;
-    let spec = flockfile::build_spec(&release, &shared_paths)?;
+    // Shared with `deploy::attempt`, and that is what makes this function's
+    // own retry story true: `stage_release` goes through `checkout_release`,
+    // which reuses a finished checkout and replaces a partial one. `git
+    // worktree add` alone refuses a path that already exists ("fatal:
+    // `<path>` already exists") and refuses one it still has registered
+    // after the directory was removed ("missing but already registered
+    // worktree"), so every run that died anywhere from here onward left a
+    // release directory that made the next run fail on git rather than
+    // resume, which is the opposite of what the doc above promises.
+    let (app, spec) = {
+        let (tree, checkout, sha) = (tree.clone(), state.checkout.clone(), sha.clone());
+        shared::off_thread(move || crate::deploy::stage_release(&tree, &checkout, &sha)).await?
+    };
     build::run(
         sheep,
         &release,
@@ -267,9 +359,13 @@ pub async fn prepare<D: Daemon>(
     // `swap::point_at`'s own atomicity claim rests on its doc rather than
     // on a test.
     swap::point_at(&tree.current(), &release)?;
-    state.write(&tree.state_file())?;
+    // Under the record lock like every other write of the record, though
+    // nothing can race a record that does not exist yet: one rule is easier
+    // to keep true than one rule with an exception.
+    lock::hold_record(&tree).and_then(|_record| state.write(&tree.state_file()))?;
 
     Ok(Prepared {
+        hold,
         tree,
         state,
         sha,
@@ -280,6 +376,20 @@ pub async fn prepare<D: Daemon>(
 
 /// Registers the sheep against `current`, waits for the newcomer to start
 /// and stay up, and deletes the instances it replaced.
+///
+/// # Errors
+/// A cutover that lands with nothing stranded promotes the record's `watch`
+/// from the `manual` [`prepare`] wrote to `auto`, which is what makes the
+/// target the poll loop's. A stranded one does not: instances it could not
+/// delete are still registered, and every later deploy reloads the name and
+/// respawns each of them from its own pre-adoption spec, so a loop polling
+/// it would bring them back on a schedule. Remove the ids the error names,
+/// then `shep deploy <sheep> --watch auto`.
+///
+/// A `verify` the operator edited in the record while the cutover ran is
+/// kept; a `--watch manual` typed while it ran is not, because the record
+/// already said `manual` from [`prepare`] and the two cannot be told
+/// apart. Run it after setup returns.
 ///
 /// # Errors
 /// [`Error::CutOver`] if the newcomer never came up, in which case it has
@@ -310,21 +420,17 @@ pub async fn prepare<D: Daemon>(
 /// release is serving and only the record is missing, which the next
 /// `shep-deploy deploy` writes.
 ///
-/// A cutover that lands with nothing stranded promotes the record's `watch`
-/// from the `manual` [`prepare`] wrote to `auto`, which is what makes the
-/// target the poll loop's. A stranded one does not: instances it could not
-/// delete are still registered, and every later deploy reloads the name and
-/// respawns each of them from its own pre-adoption spec, so a loop polling
-/// it would bring them back on a schedule. Remove the ids the error names,
-/// then `shep deploy <sheep> --watch auto`.
 pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<String, Error> {
     let Prepared {
+        hold,
         tree,
         mut state,
         sha,
         app,
         previous_config,
     } = prepared;
+    // Held to the end of this function, and named so it is not dropped here.
+    let _hold = hold;
     let sheep = tree.sheep().to_owned();
 
     // Captured BEFORE the Start, and this is the only moment it can be:
@@ -350,8 +456,22 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
     // symlink and all, which is the only spelling that follows a swap.
     let mut registering = app;
     registering.cwd = Some(tree.current().display().to_string());
+    // The interpreter the sheep already runs under, when the Flockfile names
+    // none. `shep start` fills an unset `interpreter` from `shep.toml`'s
+    // `[interpreters]` by the script's extension, and a fresh home maps
+    // `js`, `py`, `rb`, `sh` and more out of the box; the shepherd itself
+    // never does, and runs a script with no interpreter directly. This dog
+    // cannot read that map, so a Flockfile that relies on it would have
+    // been registered here with none and the replacement exec'd `server.js`
+    // as a program. The registered value IS the map's answer for this
+    // sheep, so it is carried. An explicit value, `"none"` included,
+    // outranks the map for the CLI and is left alone here for the same
+    // reason. Read out of shep-cli's `apply_interpreters` on 2026-09-04.
+    if registering.interpreter.is_none() {
+        registering.interpreter = previous_config.interpreter.clone();
+    }
 
-    match attempt(daemon, &sheep, registering, &generation).await {
+    match attempt(daemon, &sheep, registering, &generation, &previous).await {
         CutOver::Done => {
             // By id, because Start added the newcomer BESIDE these under
             // the same name and a name selector would take it down too.
@@ -382,17 +502,44 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
             if stranded.is_empty() {
                 state.watch = Watch::Auto;
             }
-            state.write(&tree.state_file())?;
-
-            if stranded.is_empty() {
+            let outcome = if stranded.is_empty() {
                 Ok(sha)
             } else {
                 Err(Error::Stranded {
-                    sheep,
+                    sheep: sheep.clone(),
                     sha,
                     ids: stranded,
                 })
+            };
+            // The ids outrank the write. A record that could not be written
+            // costs one more `shep deploy`; an id that never reached the
+            // operator costs an instance respawned on the old config on every
+            // deploy from now on, so the write's failure is printed rather
+            // than allowed to replace the error that names them.
+            //
+            // `verify` is the operator's, hand-edited in the record, and a
+            // first build can take an hour: an edit made during it is taken
+            // from the disk rather than written over by this process's copy
+            // from `prepare`. `watch` is deliberately NOT taken from the
+            // disk. `prepare` wrote `manual` so the poll loop leaves the
+            // tree alone until it has been served from, and the line above
+            // is the promotion out of that; a `--watch manual` typed during
+            // setup reads the same as the `manual` `prepare` wrote, and is
+            // overwritten. Setup is a command the operator is sitting at;
+            // `--watch manual` after it returns is the way to keep it.
+            let written = lock::hold_record(&tree).and_then(|_record| {
+                if let Ok(on_disk) = State::read(&tree.state_file()) {
+                    state.verify = on_disk.verify;
+                }
+                state.write(&tree.state_file())
+            });
+            if let Err(err) = written {
+                if outcome.is_ok() {
+                    return Err(err);
+                }
+                eprintln!("shep-deploy: {sheep}: could not record the cutover: {err}");
             }
+            outcome
         }
         // Nothing was spawned and nothing was recorded, so there is nothing
         // to clean up and nothing to say beyond what the shepherd said.
@@ -447,6 +594,17 @@ enum CutOver {
     Failed(Error),
 }
 
+/// Whether a newcomer's row says it is dead.
+///
+/// The same answer with or without a pid: a row the shepherd has accepted
+/// and not yet spawned has no pid and says `Starting`, which [`is_alive`]
+/// accepts, and every other status without a pid is a process on its way
+/// out or already gone. One predicate rather than two hand-kept complements
+/// of `ProcStatus`, so a status added upstream is judged one way.
+fn died(info: &ProcessInfo) -> bool {
+    !is_alive(info)
+}
+
 /// What a first cutover most often runs into, said once.
 ///
 /// Appended to every `why` where it could be the cause, and deliberately not
@@ -473,11 +631,17 @@ const SHEPHERD_QUIET: &str = "The shepherd stopped answering while the new insta
 /// only whether a process exists at all.
 ///
 /// A whole `listen_timeout` plus the slack shep allows itself, rather than
-/// `crate::deploy`'s per-instance product: a cutover spawns ONE
-/// instance and drains nothing, where a reload replaces every instance one
-/// at a time and has to wait out each drain.
+/// `crate::deploy`'s per-instance product: a cutover's `Start` spawns its
+/// instances together and drains nothing, where a reload replaces every
+/// instance one at a time and has to wait out each drain.
 fn cutover_budget(app: &AppConfig) -> Duration {
-    app.listen_timeout.as_duration() + RELOAD_DEADLINE_SLACK
+    // Saturating and capped, for the reason `crate::deploy`'s `budget` gives:
+    // `listen_timeout` is the repository's number, not the operator's.
+    verify::bounded(
+        app.listen_timeout
+            .as_duration()
+            .saturating_add(RELOAD_DEADLINE_SLACK),
+    )
 }
 
 /// Registers `app`, waits for a newcomer, and watches it for a dwell.
@@ -522,8 +686,14 @@ async fn attempt<D: Daemon>(
     sheep: &str,
     app: AppConfig,
     before: &Generation,
+    previous: &[u32],
 ) -> CutOver {
     let patience = cutover_budget(&app);
+    // How many the `Start` spawns. A scaled sheep spawns them together, and
+    // freezing the generation on the first to appear verified a subset and
+    // then deleted every original: the half-strength defect
+    // `Generation::has_turned_over` guards against on the deploy path.
+    let wanted = usize::try_from(app.instances.max(1)).unwrap_or(1);
 
     if let Err(source) = daemon.start(vec![app]).await {
         return CutOver::NotStarted(source);
@@ -531,29 +701,60 @@ async fn attempt<D: Daemon>(
     let started_at = Instant::now();
     let deadline = started_at + patience;
 
-    // Phase one: a newcomer exists and has not already failed.
+    // Phase one: every newcomer exists and none has already failed.
+    //
+    // A newcomer is a row whose id the flock did not have before the
+    // `Start`. By id rather than by pid, because an instance that died hard
+    // has no pid and a pid-only reading made it invisible: the loop then
+    // burned the whole budget and reported that nothing appeared, which is
+    // the one message that deliberately withholds the port-collision hint,
+    // for a port collision. An original that crashed and respawned keeps its
+    // id and is not a newcomer, whatever its pid.
     let arrived = loop {
         let flock = match daemon.describe(sheep).await {
             Ok(flock) => flock,
             Err(source) => return CutOver::Failed(source),
         };
 
-        let newcomers: Vec<&ProcessInfo> =
-            flock.iter().filter(|info| before.is_new(info)).collect();
+        let newcomers: Vec<&ProcessInfo> = flock
+            .iter()
+            .filter(|info| !previous.contains(&info.id))
+            .collect();
 
-        if !newcomers.is_empty() && newcomers.iter().all(|info| is_alive(info)) {
-            break Generation::of_infos(&newcomers);
-        }
-        if newcomers.iter().any(|info| !is_alive(info)) {
+        // A row with a pid is judged by `is_alive`. A row without one is
+        // judged only by a status that says it died (`Errored`,
+        // `WaitingRestart`): a row the shepherd has accepted and not yet
+        // spawned has no pid either, and whatever status it carries in that
+        // instant is not a verdict.
+        if newcomers.iter().any(|info| died(info)) {
             return CutOver::NotVerified(format!(
                 "The new instance failed before it finished starting. {PORT_COLLISION}"
             ));
         }
+        // Up, with a process: the dwell below compares pids.
+        let up: Vec<&ProcessInfo> = newcomers
+            .iter()
+            .copied()
+            .filter(|info| before.is_new(info))
+            .collect();
+        if up.len() >= wanted {
+            break Generation::of_infos(&up);
+        }
         if Instant::now() >= deadline {
-            return CutOver::NotVerified(format!(
-                "No new instance appeared within {}s, although the shepherd accepted the start.",
-                started_at.elapsed().as_secs()
-            ));
+            return CutOver::NotVerified(if up.is_empty() {
+                format!(
+                    "No new instance appeared within {}s, although the shepherd accepted the \
+                     start.",
+                    started_at.elapsed().as_secs()
+                )
+            } else {
+                format!(
+                    "Only {} of the {wanted} instances the start asked for appeared within \
+                     {}s. {PORT_COLLISION}",
+                    up.len(),
+                    started_at.elapsed().as_secs()
+                )
+            });
         }
         sleep(POLL).await;
     };
@@ -643,19 +844,53 @@ async fn undo_start<D: Daemon>(
     // rather than a second error about the cleanup.
     let mut removed = drain(daemon, &flock, previous).await;
 
-    if daemon.start(vec![original]).await.is_err() {
-        return Undone {
-            removed,
-            recorded: false,
-        };
-    }
-    let Ok(flock) = daemon.describe(sheep).await else {
+    let patience = cutover_budget(&original);
+    // The rows the repair registered, by the shepherd's own account. Waiting
+    // for "a row that is new" instead let a cutover newcomer that spawned
+    // late stand in for the repair instance, and the wait ended with the
+    // repair's own rows still to come and then left registered.
+    let Ok(repair) = daemon.start(vec![original]).await else {
         return Undone {
             removed,
             recorded: false,
         };
     };
-    removed &= drain(daemon, &flock, previous).await;
+
+    // The repair `Start` spawned an instance, and a `Start` is an acceptance:
+    // the shepherd spawns afterwards. Waited for, the way phase one of
+    // `attempt` waits, because describing at once found nothing, reported
+    // everything as removed, and left a second instance of the app coming up
+    // on the original config to fight the survivor for its port.
+    let deadline = Instant::now() + patience;
+    loop {
+        let Ok(flock) = daemon.describe(sheep).await else {
+            // The roll IS re-recorded: the start was accepted. What is not
+            // known is whether the instance it spawned is gone, and it is
+            // reported as not, which is the answer that sends the operator
+            // to look.
+            return Undone {
+                removed: false,
+                recorded: true,
+            };
+        };
+        // Every row the repair registered, present. Then everything that is
+        // not an original goes: the repair's rows, and any cutover newcomer
+        // that spawned after the first drain looked.
+        let all_present = repair
+            .iter()
+            .all(|id| flock.iter().any(|info| info.id == *id));
+        if all_present {
+            removed &= drain(daemon, &flock, previous).await;
+            break;
+        }
+        if Instant::now() >= deadline {
+            // Whatever did arrive is taken down; what did not is reported.
+            removed = false;
+            let _ = drain(daemon, &flock, previous).await;
+            break;
+        }
+        sleep(POLL).await;
+    }
 
     Undone {
         removed,
@@ -677,6 +912,12 @@ struct Undone {
 
 /// Deletes every row in `flock` whose id is not in `previous`, answering
 /// whether all of them went.
+///
+/// "Not in `previous`" is "not seen before the cutover's `Start`", which is
+/// a wider net than "added by this cutover": an instance an operator started
+/// by hand inside the window goes with it. That window is a few seconds
+/// under a lock the operator's own commands respect, so the wider net is
+/// accepted rather than narrowed by guessing which row was whose.
 async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -> bool {
     let mut all = true;
     for info in flock.iter().filter(|info| !previous.contains(&info.id)) {
@@ -690,17 +931,6 @@ async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -
 #[cfg(test)]
 mod tests {
     use crate::fixtures;
-
-    /// The config every test that is not about a config value runs on.
-    fn test_config() -> crate::config::DogConfig {
-        crate::config::DogConfig {
-            interval: std::time::Duration::from_secs(30),
-            retention: 5,
-            git_timeout: std::time::Duration::from_secs(60),
-            build_timeout: std::time::Duration::from_secs(60),
-            passthrough: Vec::new(),
-        }
-    }
 
     // For `Error::source` on the variant the quiet-shepherd path returns.
     use core::error::Error as _;
@@ -721,34 +951,7 @@ mod tests {
     struct RollOf<'a>(&'a [(&'a str, &'a Path)]);
 
     impl Daemon for RollOf<'_> {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(
-            &self,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn describe(
-            &self,
-            _sheep: &str,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
-            let dir = tempfile::tempdir().expect("tempdir");
             let apps: Vec<String> = self
                 .0
                 .iter()
@@ -759,14 +962,21 @@ mod tests {
                     )
                 })
                 .collect();
-            let path = dir.keep().join("flock.json");
+            // Written inside the first checkout rather than into a tempdir
+            // that has to be kept alive past this call and was therefore
+            // never removed, one per `prepare`. The checkout is a test's own
+            // tempdir and goes with it; an untracked file in it is not
+            // ignored, so nothing links it into a release.
+            let (_, cwd) = self.0.first().expect("a roll names at least one sheep");
+            let path = cwd.join(".flock-roll.json");
             std::fs::write(&path, format!("{{\"apps\":[{}]}}", apps.join(",")))
                 .expect("write roll");
             Ok(path)
         }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, describe, start, delete, reload, restart, set_smit,
+        );
     }
 
     /// A tempdir that is a git checkout, on branch `main`, with an `origin`
@@ -778,10 +988,16 @@ mod tests {
     /// reads, and a checkout is a perfectly fetchable remote for its own
     /// history.
     fn checkout_with_commit() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
+        checkout_declaring("[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\n")
+    }
+
+    /// As [`checkout_with_commit`], with the Flockfile's text given.
+    fn checkout_declaring(flockfile: &str) -> tempfile::TempDir {
+        let dir = fixtures::checkout(&[
+            ("Flockfile.toml", flockfile),
+            ("run.sh", "#!/bin/sh\necho hi\n"),
+        ]);
+        // Itself, so `git::remote_url` has an answer. Nothing fetches from it.
         fixtures::run_git(
             dir.path(),
             &[
@@ -791,14 +1007,6 @@ mod tests {
                 dir.path().to_str().expect("utf-8 tempdir path"),
             ],
         );
-        std::fs::write(
-            dir.path().join("Flockfile.toml"),
-            "[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\n",
-        )
-        .expect("write Flockfile");
-        std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho hi\n").expect("write run.sh");
-        fixtures::run_git(dir.path(), &["add", "."]);
-        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "initial"]);
         dir
     }
 
@@ -809,15 +1017,9 @@ mod tests {
         std::fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
             deployed: sha.map(str::to_owned),
-            failed: None,
-            verify: Verify::default(),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: PathBuf::from("/srv/x"),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -831,11 +1033,16 @@ mod tests {
     async fn opting_in_twice_is_refused_by_name() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        write_target(home.path(), "bpm", Watch::Auto, Some("old"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        );
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
         let shown = err.to_string();
@@ -855,7 +1062,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
 
@@ -877,7 +1084,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
         assert_eq!(prepared.state.branch, "stable");
@@ -903,17 +1110,22 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let first = prepare(&daemon, home.path(), "bpm", &test_config())
+        let first = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
-        std::fs::remove_file(first.tree.state_file()).expect("the record a kill never wrote");
+        let (first_sha, state_file) = (first.sha.clone(), first.tree.state_file());
+        // The run died, so its hold on the tree died with it: `Prepared`
+        // carries the lock, and a second run against a held tree is refused
+        // for the reason `crate::lock` gives, which is not the case here.
+        drop(first);
+        std::fs::remove_file(&state_file).expect("the record a kill never wrote");
 
-        let again = prepare(&daemon, home.path(), "bpm", &test_config())
+        let again = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("a tree with no record must be resumable, as the doc says");
-        assert_eq!(again.sha, first.sha);
+        assert_eq!(again.sha, first_sha);
         assert!(
-            again.tree.state_file().is_file(),
+            state_file.is_file(),
             "the second run must leave the record the first one never wrote"
         );
     }
@@ -930,7 +1142,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
 
@@ -956,7 +1168,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
         assert!(err.to_string().contains("detached"), "{err}");
@@ -1087,9 +1299,23 @@ mod tests {
         attempts: Cell<usize>,
         /// When the cutover's own `Start` was accepted.
         accepted_at: Cell<Option<Instant>>,
+        /// At most this many newcomers appear, whatever the `Start` asked
+        /// for: a shepherd that spawned one of two and no more.
+        newcomers_at_most: Option<u32>,
         /// How many instances the repair `Start`s have spawned.
         repairs: Cell<u32>,
+        /// When the first repair `Start` was accepted; its instance appears
+        /// [`SPAWN_LAG`] after, as a real shepherd's would.
+        repaired_at: Cell<Option<Instant>>,
+        /// How far apart a scaled repair's rows appear, if not together.
+        repair_stagger: Option<Duration>,
+        /// When a newcomer `newcomers_at_most` held back finally appears.
+        late_newcomer_after: Option<Duration>,
     }
+
+    /// How long a shepherd takes to spawn after accepting a `Start`, as the
+    /// double plays it.
+    const SPAWN_LAG: Duration = Duration::from_millis(250);
 
     impl CutOverDouble {
         fn new(originals: &[u32], script: Vec<(Duration, Shape)>, refuses: Option<usize>) -> Self {
@@ -1105,8 +1331,33 @@ mod tests {
                 deletes: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
                 accepted_at: Cell::new(None),
+                newcomers_at_most: None,
                 repairs: Cell::new(0),
+                repaired_at: Cell::new(None),
+                repair_stagger: None,
+                late_newcomer_after: None,
             }
+        }
+
+        /// The same double, with one newcomer the cap held back appearing
+        /// `after` the cutover's `Start` was accepted.
+        fn with_a_late_newcomer_after(mut self, after: Duration) -> Self {
+            self.late_newcomer_after = Some(after);
+            self
+        }
+
+        /// The same double, with a scaled repair's rows appearing one per
+        /// `gap` rather than all on the poll after the spawn lag.
+        fn staggering_repairs_by(mut self, gap: Duration) -> Self {
+            self.repair_stagger = Some(gap);
+            self
+        }
+
+        /// The same double, spawning at most `n` newcomers however many the
+        /// `Start` asked for.
+        fn spawning_at_most(mut self, n: u32) -> Self {
+            self.newcomers_at_most = Some(n);
+            self
         }
 
         /// The same double, with every `describe` failing from `after`
@@ -1162,12 +1413,6 @@ mod tests {
     }
 
     impl Daemon for CutOverDouble {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let mut flock = Vec::new();
             // Before the `Start` the originals are read at zero, which is
@@ -1208,25 +1453,54 @@ mod tests {
                     restarts,
                 } = shape_at(&self.script, elapsed)
             {
-                for offset in 0..self.originals.len() {
-                    let offset = u32::try_from(offset).expect("a handful of instances");
+                // As many as the accepted `Start` asked for, which is what a
+                // shepherd spawns; the originals' count is a different
+                // number and using it hid the multi-instance wait entirely.
+                let asked = self
+                    .starts
+                    .borrow()
+                    .first()
+                    .map_or(1, |app| app.instances.max(1));
+                let spawned = self.newcomers_at_most.map_or(asked, |cap| asked.min(cap));
+                for offset in 0..spawned {
                     let id = NEWCOMER_ID - offset;
                     if !self.is_deleted(id) {
                         flock.push(self.row(id, status, pid + offset, restarts));
                     }
                 }
+                // A newcomer the cap held back, arriving late: a shepherd
+                // that spawned the rest of what it registered only after the
+                // cutover had given up on waiting.
+                if let Some(late) = self.late_newcomer_after
+                    && elapsed >= late
+                    && spawned < asked
+                {
+                    let id = NEWCOMER_ID - spawned;
+                    if !self.is_deleted(id) {
+                        flock.push(self.row(id, ProcStatus::Online, pid + spawned, 0));
+                    }
+                }
             }
 
-            for offset in 0..self.repairs.get() {
-                let id = REPAIR_ID + offset;
-                if !self.is_deleted(id) {
-                    flock.push(self.row(id, ProcStatus::Online, REPAIR_PID + offset, 0));
+            // Not at once. `undo_start` used to describe right after the
+            // repair `Start` and find nothing, and a double that showed the
+            // row instantly hid that.
+            if let Some(at) = self.repaired_at.get() {
+                let since = Instant::now() - at;
+                for offset in 0..self.repairs.get() {
+                    // The offset-th row lands `offset` gaps after the first.
+                    let lands_at =
+                        SPAWN_LAG + self.repair_stagger.unwrap_or(Duration::ZERO) * offset;
+                    let id = REPAIR_ID + offset;
+                    if since >= lands_at && !self.is_deleted(id) {
+                        flock.push(self.row(id, ProcStatus::Online, REPAIR_PID + offset, 0));
+                    }
                 }
             }
 
             Ok(flock)
         }
-        async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+        async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
             let attempt = self.attempts.get();
             self.attempts.set(attempt + 1);
             if self.refuses == Some(attempt) {
@@ -1237,13 +1511,23 @@ mod tests {
                 })));
             }
 
+            // One row per instance asked for, registered now and spawned
+            // later, which is what a shepherd answers a `Start` with.
+            let asked = apps.first().map_or(1, |app| app.instances.max(1));
             self.starts.borrow_mut().extend(apps);
             if attempt == 0 {
                 self.accepted_at.set(Some(Instant::now()));
+                Ok((0..asked).map(|offset| NEWCOMER_ID - offset).collect())
             } else {
-                self.repairs.set(self.repairs.get() + 1);
+                let first = self.repairs.get();
+                self.repairs.set(first + asked);
+                if self.repaired_at.get().is_none() {
+                    self.repaired_at.set(Some(Instant::now()));
+                }
+                Ok((first..first + asked)
+                    .map(|offset| REPAIR_ID + offset)
+                    .collect())
             }
-            Ok(())
         }
         async fn delete(&self, id: u32) -> Result<(), Error> {
             let seen = self.deletes_seen.get();
@@ -1258,18 +1542,10 @@ mod tests {
             self.deletes.borrow_mut().push(id);
             Ok(())
         }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// The tempdirs a fixture has to keep alive. `Prepared` names paths
@@ -1285,11 +1561,20 @@ mod tests {
         script: Vec<(Duration, Shape)>,
         refuses: Option<usize>,
     ) -> (CutOverDouble, Prepared, Dirs) {
+        cutover_fixture_from(checkout_with_commit(), originals, script, refuses).await
+    }
+
+    /// As [`cutover_fixture_of`], from a checkout the test built itself.
+    async fn cutover_fixture_from(
+        checkout: tempfile::TempDir,
+        originals: &[u32],
+        script: Vec<(Duration, Shape)>,
+        refuses: Option<usize>,
+    ) -> (CutOverDouble, Prepared, Dirs) {
         let home = tempfile::tempdir().expect("tempdir");
-        let checkout = checkout_with_commit();
         let entries = [("bpm", checkout.path())];
         let roll = RollOf(&entries);
-        let prepared = prepare(&roll, home.path(), "bpm", &test_config())
+        let prepared = prepare(&roll, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
 
@@ -1529,6 +1814,47 @@ mod tests {
         );
     }
 
+    /// fails if a `verify` the operator edited during the cutover is written
+    /// over by the cutover's own copy from `prepare`. A first build can take
+    /// an hour, and the record is the file they are told to edit.
+    #[tokio::test(start_paused = true)]
+    async fn a_verify_edited_during_the_cutover_survives_its_record_write() {
+        let (daemon, prepared, _dirs) = cutover_fixture().await;
+        let path = prepared.tree.state_file();
+        let mut edited = State::read(&path).expect("the record prepare wrote");
+        assert_eq!(edited.verify, Verify::Probed, "the default before the edit");
+        edited.verify = Verify::Alive;
+        edited.write(&path).expect("the operator's edit");
+
+        cut_over(&daemon, prepared).await.expect("cuts over");
+
+        let after = State::read(&path).expect("reads");
+        assert_eq!(after.verify, Verify::Alive, "the edit survives");
+        assert_eq!(after.watch, Watch::Auto, "and the promotion still lands");
+        assert!(after.deployed.is_some());
+    }
+
+    /// fails if a Flockfile that names no `interpreter` is registered with
+    /// none. `shep start` filled the sheep's from `shep.toml`'s
+    /// `[interpreters]` by extension, the shepherd itself never does, and
+    /// this dog cannot read the map: registered bare, the replacement would
+    /// exec `server.js` as a program. An explicit value, `"none"` included,
+    /// is the Flockfile's own and stays.
+    #[tokio::test(start_paused = true)]
+    async fn the_new_registration_keeps_the_interpreter_the_sheep_ran_under() {
+        let (daemon, mut prepared, _dirs) = cutover_fixture().await;
+        prepared.previous_config.interpreter = Some("node".to_owned());
+        prepared.app.interpreter = None;
+        cut_over(&daemon, prepared).await.expect("cuts over");
+        assert_eq!(daemon.started()[0].interpreter.as_deref(), Some("node"));
+
+        let (daemon, mut prepared, _dirs) = cutover_fixture().await;
+        prepared.previous_config.interpreter = Some("node".to_owned());
+        prepared.app.interpreter = Some("none".to_owned());
+        cut_over(&daemon, prepared).await.expect("cuts over");
+        assert_eq!(daemon.started()[0].interpreter.as_deref(), Some("none"));
+    }
+
     /// fails if the OLD instances are deleted by name rather than by id, or
     /// if the newcomer is deleted instead. A name selector would take the
     /// new instance down with them, because `Start` added it BESIDE the old
@@ -1545,14 +1871,201 @@ mod tests {
         );
     }
 
-    /// fails if a scaled sheep loses only one of the instances it was
-    /// running. `Start` adds one newcomer per configured instance beside
-    /// every existing one, so a cutover that deleted a single id would
-    /// leave the rest serving the pre-adoption checkout indefinitely.
+    /// fails if a sheep running two instances loses only one of them at
+    /// the cutover. Every original is deleted by id once the newcomer is
+    /// verified, so a cutover that deleted a single id would leave the rest
+    /// serving the pre-adoption checkout indefinitely. The Flockfile here
+    /// asks for one instance; the scaled cutover has its own tests.
     #[tokio::test(start_paused = true)]
     async fn every_replaced_instance_is_deleted() {
         let (daemon, prepared, _dirs) = cutover_fixture_with_instances(&[7, 8]).await;
         cut_over(&daemon, prepared).await.expect("cuts over");
+        assert_eq!(daemon.deleted(), vec![7, 8]);
+    }
+
+    /// fails if a pidless newcomer is judged by anything but its status.
+    /// A row the shepherd has accepted and not yet spawned has no pid and
+    /// says `Starting`; one that died hard has no pid and says `Errored`.
+    /// The first is waited for and the second ends the cutover.
+    #[test]
+    fn a_pidless_newcomer_is_dead_only_when_its_status_says_so() {
+        let row = |status| ProcessInfo::builder(99, "bpm", status).build();
+        for alive in [ProcStatus::Starting, ProcStatus::Online] {
+            assert!(
+                !died(&row(alive)),
+                "{alive:?} without a pid is not yet a verdict"
+            );
+        }
+        for dead in [
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+            ProcStatus::Stopped,
+            ProcStatus::Stopping,
+        ] {
+            assert!(died(&row(dead)), "{dead:?} without a pid is dead");
+        }
+        let with_pid = ProcessInfo::builder(99, "bpm", ProcStatus::Stopping)
+            .pid(Some(4242))
+            .build();
+        assert!(
+            died(&with_pid),
+            "with a pid the status decides the same way"
+        );
+    }
+
+    /// fails if the record stops carrying the app as the shepherd had it
+    /// before adoption. Removal restores from this; `cwd` and `script` alone
+    /// left the deployed repository's `env`, instances and probes in place.
+    #[tokio::test]
+    async fn the_record_carries_the_whole_pre_adoption_definition() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout_with_commit();
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
+
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
+            .await
+            .expect("prepares");
+
+        let origin = prepared.state.origin.as_ref().expect("recorded");
+        assert_eq!(origin, &prepared.previous_config);
+        let on_disk = State::read(&prepared.tree.state_file()).expect("reads");
+        assert_eq!(on_disk.origin.as_ref(), Some(&prepared.previous_config));
+    }
+
+    /// fails if a sheep the shepherd already runs from `current` is treated
+    /// as one to take over. That is what a cutover that landed and could not
+    /// write its record leaves, and the old refusal told the operator to
+    /// remove the tree the service runs from. The record is repaired from
+    /// what `current` names and the sheep is refused as the target it is.
+    #[tokio::test]
+    async fn a_sheep_already_running_from_current_has_its_record_repaired() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "bpm");
+        let release = tree.release(fixtures::SHA);
+        std::fs::create_dir_all(&release).expect("a release directory");
+        swap::point_at(&tree.current(), &release).expect("current");
+        write_target(home.path(), "bpm", Watch::Manual, None);
+        let current = tree.current();
+        let entries = [("bpm", current.as_path())];
+        let daemon = RollOf(&entries);
+
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
+            .await
+            .expect_err("already a target");
+
+        let shown = err.to_string();
+        assert!(shown.contains("already a deploy target"), "{shown}");
+        assert!(shown.contains("brought up to date"), "{shown}");
+        assert!(
+            !shown.contains("Remove"),
+            "must never say to remove the tree: {shown}"
+        );
+        assert_eq!(
+            State::read(&tree.state_file())
+                .expect("reads")
+                .deployed
+                .as_deref(),
+            Some(fixtures::SHA),
+            "the record now names what current names"
+        );
+    }
+
+    /// fails if a second spelling of the tree's `current` is not recognised
+    /// as the tree's `current`. The daemon hands back the cwd as it was
+    /// registered, and it can spell `$SHEP_HOME` through a symlink the dog
+    /// does not use. A literal comparison then skipped this branch, found
+    /// the record with no `deployed`, and told the operator to remove the
+    /// tree a running service was serving from.
+    #[tokio::test]
+    async fn a_sheep_running_from_current_spelled_through_a_link_is_still_recognised() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("a second spelling");
+        let tree = Tree::for_sheep(&home, "bpm");
+        let release = tree.release(fixtures::SHA);
+        std::fs::create_dir_all(&release).expect("a release directory");
+        swap::point_at(&tree.current(), &release).expect("current");
+        write_target(&home, "bpm", Watch::Manual, None);
+        let spelled_through_link = link.join("deploy/bpm/current");
+        let entries = [("bpm", spelled_through_link.as_path())];
+        let daemon = RollOf(&entries);
+
+        let err = prepare(&daemon, &home, "bpm", &fixtures::dog_config())
+            .await
+            .expect_err("already a target");
+
+        let shown = err.to_string();
+        assert!(shown.contains("already a deploy target"), "{shown}");
+        assert!(
+            !shown.contains("Remove"),
+            "must never say to remove the tree: {shown}"
+        );
+    }
+
+    /// fails if the same sheep with NO record at all is told anything but
+    /// that the record is missing. Nothing can rebuild the origin fields, so
+    /// the operator writes the file; the tree still must not be removed.
+    #[tokio::test]
+    async fn a_sheep_running_from_current_with_no_record_is_told_to_write_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "bpm");
+        let release = tree.release(fixtures::SHA);
+        std::fs::create_dir_all(&release).expect("a release directory");
+        swap::point_at(&tree.current(), &release).expect("current");
+        let current = tree.current();
+        let entries = [("bpm", current.as_path())];
+        let daemon = RollOf(&entries);
+
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
+            .await
+            .expect_err("already a target");
+
+        let shown = err.to_string();
+        assert!(shown.contains("record is missing"), "{shown}");
+        assert!(!shown.contains("Remove"), "{shown}");
+    }
+
+    /// fails if a scaled sheep's cutover settles for fewer newcomers than
+    /// the `Start` asked for. With `instances = 2` and a shepherd that
+    /// spawned one, the cutover used to freeze its generation on that one,
+    /// verify it, and delete both originals: the sheep came back at half
+    /// strength with the deploy reported landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_scaled_cutover_waits_for_every_instance_the_start_asked_for() {
+        let checkout =
+            checkout_declaring("[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\ninstances = 2\n");
+        let (daemon, prepared, _dirs) =
+            cutover_fixture_from(checkout, &[7, 8], comes_up(), None).await;
+        let daemon = daemon.spawning_at_most(1);
+
+        let err = cut_over(&daemon, prepared)
+            .await
+            .expect_err("one of two is not a cutover");
+
+        let shown = err.to_string();
+        assert!(shown.contains("Only 1 of the 2"), "{shown}");
+        assert!(
+            !daemon.deleted().contains(&7) && !daemon.deleted().contains(&8),
+            "the originals are kept: {:?}",
+            daemon.deleted()
+        );
+    }
+
+    /// fails if a scaled sheep whose newcomers all appear is not cut over.
+    /// The other half of the test above: two asked for, two spawned, both
+    /// originals replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_scaled_cutover_lands_when_every_instance_appears() {
+        let checkout =
+            checkout_declaring("[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\ninstances = 2\n");
+        let (daemon, prepared, _dirs) =
+            cutover_fixture_from(checkout, &[7, 8], comes_up(), None).await;
+
+        cut_over(&daemon, prepared).await.expect("cuts over");
+
         assert_eq!(daemon.deleted(), vec![7, 8]);
     }
 
@@ -1652,6 +2165,53 @@ mod tests {
         );
     }
 
+    /// fails if a scaled original's repair leaves an instance behind. The
+    /// repair `Start` spawns one row per instance the original asks for,
+    /// and they need not appear on the same poll; waiting for the first and
+    /// draining that listing left the rest registered while `removed` said
+    /// true, and every later deploy respawned them on the old config.
+    #[tokio::test(start_paused = true)]
+    async fn a_scaled_repair_is_drained_whole_however_its_rows_arrive() {
+        let (daemon, mut prepared, _dirs) = cutover_fixture_dies_during_dwell().await;
+        let daemon = daemon.staggering_repairs_by(POLL * 4);
+        prepared.previous_config.instances = 3;
+
+        cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        for offset in 0..3 {
+            assert!(
+                daemon.is_deleted(REPAIR_ID + offset),
+                "repair row {offset} left registered: {:?}",
+                daemon.deleted()
+            );
+        }
+    }
+
+    /// fails if a cutover newcomer that spawns late is taken for the repair
+    /// instance. The cutover asked for two, the shepherd spawned one, the
+    /// cutover gave up waiting, and the second appears after the first
+    /// drain and before the repair's own row. Counting "a new row" ended
+    /// the wait there and left the repair row registered; the repair's ids
+    /// are the shepherd's own answer, and both rows have to go.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_cutover_newcomer_is_not_taken_for_the_repair_instance() {
+        let (daemon, mut prepared, _dirs) = cutover_fixture().await;
+        prepared.app.instances = 2;
+        let late = cutover_budget(&prepared.app) + Duration::from_millis(100);
+        let daemon = daemon.spawning_at_most(1).with_a_late_newcomer_after(late);
+
+        cut_over(&daemon, prepared)
+            .await
+            .expect_err("gives up on the missing newcomer");
+
+        assert!(daemon.is_deleted(REPAIR_ID), "{:?}", daemon.deleted());
+        assert!(
+            daemon.is_deleted(NEWCOMER_ID - 1),
+            "the late newcomer goes too: {:?}",
+            daemon.deleted()
+        );
+    }
+
     /// fails if a repair that could not be made is glossed over.
     /// [`Error::CutOver`] used to say the original was serving
     /// "unchanged", which is true of the process and false of the persisted
@@ -1702,13 +2262,18 @@ mod tests {
     async fn a_record_that_cannot_be_read_refuses_rather_than_guessing() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        write_target(home.path(), "bpm", Watch::Auto, Some("old"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        );
         let tree = Tree::for_sheep(home.path(), "bpm");
         std::fs::write(tree.state_file(), "this is not toml = = =").expect("corrupt the record");
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
 
@@ -1744,7 +2309,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
 
@@ -1953,12 +2518,12 @@ mod tests {
     }
 
     /// fails if the ORIGINAL, respawned, is mistaken for the release this
-    /// cutover just started. `Generation::is_new` compares pids and the
-    /// generation is captured before the `Start`, so an original that
-    /// crashes and comes back under a new pid looks exactly like a
-    /// newcomer: phase one adopts it, and the dwell finds the same pid
-    /// still alive. Only the restart count is left to reject it, which is
-    /// why that check is load-bearing rather than belt and braces.
+    /// cutover just started. A newcomer used to be any row whose pid the
+    /// pre-`Start` generation never had, so an original that crashed and
+    /// came back under a new pid looked exactly like one: phase one adopted
+    /// it, and the dwell found the same pid still alive. Newcomers are now
+    /// told by id, which a respawn keeps, and the restart count on the dwell
+    /// is the second wall rather than the only one.
     ///
     /// What is at stake is the whole of this task. Accept the respawned
     /// original and the cutover reports `Done` having verified nothing,
@@ -1972,9 +2537,14 @@ mod tests {
         let err = cut_over(&daemon, prepared).await.expect_err("gives up");
 
         assert!(matches!(err, Error::CutOver { .. }), "{err}");
-        // The restart count, specifically. The pid check cannot fire here:
-        // the row the dwell sees is the one phase one adopted.
-        assert!(err.to_string().contains("already restarted"), "{err}");
+        // By id, now: the original keeps its id across the respawn, so it is
+        // never a newcomer whatever its pid, and what the cutover reports is
+        // that no newcomer appeared at all. The restart check on the dwell
+        // stays as a second wall behind this one.
+        assert!(
+            err.to_string().contains("No new instance appeared"),
+            "{err}"
+        );
         assert!(
             !daemon.deleted().contains(&7),
             "the healthy original is kept: {:?}",

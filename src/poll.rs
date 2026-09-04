@@ -7,11 +7,13 @@
 //!
 //! # What a tick asks the shepherd for
 //!
-//! Nothing, until it has something to deploy. Targets are read from the
-//! filesystem - one directory per target under `<shep_home>/deploy`, each
-//! holding its own record - and a target whose branch has not moved is
-//! answered by `git` alone. The shepherd is asked only by a deploy that is
-//! going ahead.
+//! One `set_smit` per target, every tick, and nothing more until it has
+//! something to deploy. Targets are read from the filesystem - one
+//! directory per target under `<shep_home>/deploy`, each holding its own
+//! record - and a target whose branch has not moved is answered by `git`
+//! alone. The smit is republished each tick because the daemon holds it in
+//! memory only for as long as this dog's connection lasts; see [`tick`].
+//! Past that, the shepherd is asked only by a deploy that is going ahead.
 //!
 //! In particular the roll is never read. [`crate::roll::registered`] is how
 //! `survey` learns what shep has registered, and it goes through
@@ -34,9 +36,14 @@
 //! refusal is there for a second OPERATOR invocation - it never has to hold
 //! the loop off itself.
 
+use std::any::Any;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io::{self, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use tokio::time::sleep;
 
@@ -84,18 +91,40 @@ const fn due(state: &State) -> bool {
 /// cannot be listed at all takes every target with it, and its row is named
 /// for the directory because there is no sheep left to name; silence there
 /// is indistinguishable from a dog with nothing to do.
-async fn tick<D: Daemon>(
-    daemon: &D,
-    shep_home: &Path,
-    config: &DogConfig,
-) -> Vec<(String, Result<Outcome, Error>)> {
-    let names = match paths::targets(shep_home) {
-        Ok(names) => names,
-        Err(err) => return vec![(shep_home.join("deploy").display().to_string(), Err(err))],
+async fn tick<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Tick {
+    let found = match paths::targets(shep_home) {
+        Ok(found) => found,
+        Err(err) => {
+            return Tick {
+                targets: None,
+                results: vec![(shep_home.join("deploy").display().to_string(), Err(err))],
+            };
+        }
     };
 
     let mut results = Vec::new();
-    for name in names {
+    let targets = Some(found.named.len() + found.unnamed.len());
+    // A target the dog cannot name is a row, not a skip: nothing polls it
+    // and nothing restores it, and the operator has to be the one to rename
+    // it.
+    for dir in found.unnamed {
+        // The key is the path's `Debug` form: escaped, so it prints as one
+        // line, and exact, so two such directories never share a mute entry
+        // (`display` is lossy and folds distinct non-UTF-8 names together).
+        // `report` puts the key at the front of the line, so the message
+        // does not name the directory again.
+        results.push((
+            format!("{dir:?}"),
+            Err(Error::Config(
+                "holds a deploy.toml, and its name cannot be a sheep's (not valid UTF-8, or \
+                 carrying a character that would rewrite a log line), so it is neither polled \
+                 nor restored. `shep flock` lists every sheep and `shep describe <sheep>` its \
+                 cwd: check none runs from inside it, then rename the directory"
+                    .to_owned(),
+            )),
+        ));
+    }
+    for name in found.named {
         let tree = Tree::for_sheep(shep_home, &name);
         let mut state = match State::read(&tree.state_file()) {
             Ok(state) => state,
@@ -113,18 +142,86 @@ async fn tick<D: Daemon>(
         // publish-on-change dog would show nothing after a daemon restart
         // until its next deploy, which for a healthy target could be weeks.
         //
-        // A failure is ignored: this is cosmetic, and a daemon that refuses
-        // it is one this dog can still deploy through.
+        // A failure does not stop the deploy: this is cosmetic, and a daemon
+        // that refuses it is one this dog can still deploy through. It is a
+        // row of its own rather than a bare `eprintln!`, so it reaches the
+        // stream the caller chose and, more to the point, the mute: a daemon
+        // that refuses every smit would otherwise say so once per target per
+        // tick, forever.
+        // Keyed with a `/`, which no sheep name can carry, so the row and the
+        // target never share a mute entry.
         if let Err(err) = smit::publish(daemon, &name, &state).await {
-            eprintln!("{name}: could not publish its smit: {err}");
+            results.push((format!("{name}/smit"), Err(err)));
         }
         if !due(&state) {
             continue;
         }
-        let outcome = deploy::unattended(daemon, &tree, &mut state, config).await;
+        // Guarded, because this loop's one promise is that a target's
+        // failure does not stop the others, and a panic is the one failure
+        // `unattended`'s `Result` cannot carry. Nothing in the crate panics
+        // on purpose outside tests; this is for the day something does, in
+        // a loop meant to run for months.
+        let deploy = Box::pin(deploy::unattended(daemon, &tree, &mut state, config));
+        let outcome = match CatchUnwind(deploy).await {
+            Ok(outcome) => outcome,
+            Err(payload) => Err(Error::Panicked {
+                sheep: name.clone(),
+                what: panic_message(payload.as_ref()),
+            }),
+        };
         results.push((name, outcome));
     }
-    results
+    Tick { targets, results }
+}
+
+/// What one tick found and did.
+struct Tick {
+    /// How many targets were on disk, due or not, or `None` when the
+    /// directory could not be listed at all.
+    ///
+    /// Kept apart from the results because a manual target produces no
+    /// result and is still a target: a tick with results and no targets is
+    /// impossible, and a tick with targets and no results is the ordinary
+    /// quiet one. `None` is kept apart from `Some(0)` because "gone" and
+    /// "unreadable" want different rows.
+    targets: Option<usize>,
+    /// One row per target that had something to say, plus a row per smit
+    /// that could not be published.
+    results: Vec<(String, Result<Outcome, Error>)>,
+}
+
+/// A future that turns a panic in the one it wraps into an `Err`, so the
+/// loop around it keeps going.
+///
+/// Written here rather than taken from a crate because it is a dozen lines:
+/// each poll is run under [`catch_unwind`], and a payload that comes out is
+/// the future's answer. The inner future is pinned on the heap by the
+/// caller, which is what makes it `Unpin` and lets it be polled through a
+/// plain closure.
+struct CatchUnwind<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.get_mut().0;
+        match catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    }
+}
+
+/// The message a panic carried, or a note that it carried none.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic with no message".to_owned()
+    }
 }
 
 /// What one target's outcome is worth saying, and which log it belongs in.
@@ -161,6 +258,10 @@ impl Said {
 /// land, which is why it does not belong in the log an operator reads to
 /// see what shipped.
 fn report(sheep: &str, outcome: &Result<Outcome, Error>) -> Option<Said> {
+    // Every key is printed as the line's label, and one kind of key is a
+    // directory name that exists precisely because it carries something a
+    // log line cannot.
+    let sheep = &crate::shared::printable(sheep);
     match outcome {
         Ok(Outcome::UpToDate) => None,
         Ok(Outcome::Deployed { sha }) => Some(Said::Note(format!("{sheep} deployed {sha}"))),
@@ -207,14 +308,23 @@ struct Repeat {
 /// day. A condition that really can clear on its own says something
 /// different the moment it does, which re-arms the target without anything
 /// having to know which conditions those are.
-fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str) -> bool {
+///
+/// Answers how many repeats were swallowed since the line was last said,
+/// so a line said again after [`RESAY`] ticks can carry the count: an
+/// operator reading it an hour later can then tell "still broken" from
+/// "broke again, many times". `None` is silence; `Some(0)` is a line that
+/// is new.
+fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str) -> Option<u32> {
+    let mut swallowed = 0;
     if let Some(seen) = previous.get_mut(sheep)
         && seen.line == line
     {
         seen.muted += 1;
         if seen.muted < RESAY {
-            return false;
+            return None;
         }
+        // The occurrence being said now is not one that was swallowed.
+        swallowed = seen.muted - 1;
     }
 
     previous.insert(
@@ -224,7 +334,7 @@ fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str
             muted: 0,
         },
     );
-    true
+    Some(swallowed)
 }
 
 /// Polls forever, deploying what has moved.
@@ -256,12 +366,14 @@ fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str
 /// rebuild and repairs itself, which is the right shape of failure for a
 /// signal that means "stop now".
 ///
-/// It can also be deferred, which is a separate matter and not this
-/// module's to fix: `git` runs through blocking `std::process::Command` on
-/// a current-thread runtime, so nothing else is polled while a fetch is in
-/// flight. A fetch against a host that is not answering is bounded by
-/// `DogConfig::git_timeout` (five minutes by default), so it fails that one
-/// target like any other error rather than wedging the loop.
+/// It is not deferred by a git call any more. Every git call and the
+/// artifact copy run on tokio's blocking pool (`shared::off_thread`), so a
+/// stop arriving during a five-minute fetch is answered at once: this
+/// future is dropped, `main` gives the pool a second to wind down, and the
+/// fetch's own git process finishes or times out on its own after the dog
+/// has gone. A fetch against a host that is not answering is still bounded
+/// by `DogConfig::git_timeout`, so it fails that one target like any other
+/// error rather than holding the loop.
 pub async fn run<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Result<(), Error> {
     run_with(
         daemon,
@@ -292,8 +404,29 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
     err: &mut E,
 ) -> Result<(), Error> {
     let mut previous: BTreeMap<String, Repeat> = BTreeMap::new();
+    let deploy_dir = shep_home.join("deploy").display().to_string();
     loop {
-        let results = tick(daemon, shep_home, config).await;
+        let Tick {
+            targets,
+            mut results,
+        } = tick(daemon, shep_home, config).await;
+
+        // A deploy directory that is gone answers as an empty list, which is
+        // also what a shepherd with no targets yet answers, so the loop went
+        // silent the moment a directory was unmounted or removed from under
+        // it. Said on every tick with nothing to poll, and left to the mute
+        // to say once and then hourly: that covers a dog restarted after the
+        // directory went, which a "had targets last tick" flag did not. A
+        // listing that failed carries its own row and is not this case.
+        if targets == Some(0) {
+            results.push((
+                deploy_dir.clone(),
+                Err(Error::Config(format!(
+                    "no deploy targets under {deploy_dir}: nothing to poll until one is set up \
+                     with `shep-deploy setup <sheep>`"
+                ))),
+            ));
+        }
 
         // A target that is gone stops muting anything. Otherwise a target
         // deleted and recreated has its first line swallowed by the entry
@@ -308,12 +441,17 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
                 previous.remove(&sheep);
                 continue;
             };
-            if !worth_saying(&mut previous, &sheep, said.text()) {
+            let Some(swallowed) = worth_saying(&mut previous, &sheep, said.text()) else {
                 continue;
-            }
+            };
+            let repeats = if swallowed == 0 {
+                String::new()
+            } else {
+                format!(" (repeated {swallowed} times since it was last said)")
+            };
             let _ = match &said {
-                Said::Note(text) => writeln!(out, "{text}"),
-                Said::Complaint(text) => writeln!(err, "{text}"),
+                Said::Note(text) => writeln!(out, "{text}{repeats}"),
+                Said::Complaint(text) => writeln!(err, "{text}{repeats}"),
             };
         }
 
@@ -326,6 +464,61 @@ mod tests {
     use crate::fixtures;
 
     use super::*;
+
+    /// fails if a target the dog cannot name is skipped, keyed by a lossy
+    /// name, or printed with the character that made it unnameable. The
+    /// key is the path's `Debug` form so two such directories never share a
+    /// mute entry; the line an operator reads has the newline replaced.
+    #[tokio::test]
+    async fn an_unnameable_target_is_a_row_that_cannot_forge_a_line() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("deploy").join("bad\nname");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("deploy.toml"), "").expect("record");
+
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
+
+        assert_eq!(results.len(), 1, "{results:?}");
+        let (key, outcome) = &results[0];
+        assert_eq!(key, &format!("{dir:?}"));
+        let said = report(key, outcome).expect("a complaint");
+        assert!(!said.text().contains('\n'), "{:?}", said.text());
+        assert!(
+            said.text().contains("rename the directory"),
+            "{}",
+            said.text()
+        );
+    }
+
+    /// fails if a panic inside a deploy stops being caught. The loop's one
+    /// promise is that a target's failure does not stop the others, and a
+    /// panic is the failure `Result` cannot carry.
+    #[tokio::test]
+    async fn a_panic_becomes_an_err_rather_than_ending_the_loop() {
+        let caught = CatchUnwind(Box::pin(async {
+            tokio::task::yield_now().await;
+            panic!("the deploy fell over");
+        }))
+        .await;
+        let payload = caught.expect_err("the panic must be caught");
+        assert_eq!(panic_message(payload.as_ref()), "the deploy fell over");
+
+        let fine = CatchUnwind(Box::pin(async { 7 })).await;
+        assert_eq!(fine.ok(), Some(7));
+    }
+
+    /// fails if a panic's message is lost on the way to the row. A `String`
+    /// payload is what `panic!` with a format string gives, a `&str` is what
+    /// a literal gives, and anything else has to say it had no message
+    /// rather than print nothing.
+    #[test]
+    fn a_panic_message_is_read_from_either_payload_shape() {
+        assert_eq!(panic_message(&"literal"), "literal");
+        assert_eq!(panic_message(&String::from("formatted")), "formatted");
+        assert_eq!(panic_message(&42_u8), "a panic with no message");
+    }
 
     use core::time::Duration;
     use std::cell::{Cell, RefCell};
@@ -348,33 +541,16 @@ mod tests {
     fn flockfile(sheep: &str) -> String {
         format!(
             "[[app]]\nname = '{sheep}'\nscript = './run.sh'\n\n\
-             [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n"
+             [app.readiness_probe]\nkind = 'http'\ntarget = 'http://127.0.0.1:1/health'\n"
         )
-    }
-
-    /// The config every test that is not about the interval runs on.
-    const fn config() -> DogConfig {
-        DogConfig {
-            interval: Duration::from_secs(30),
-            retention: 5,
-            git_timeout: std::time::Duration::from_secs(60),
-            build_timeout: std::time::Duration::from_secs(60),
-            passthrough: Vec::new(),
-        }
     }
 
     /// A target's record, for the one function that reads nothing else.
     fn target(watch: Watch) -> State {
         State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: Some("a1b2c3".to_owned()),
-            failed: None,
-            verify: Verify::default(),
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: PathBuf::from("/srv/x"),
+            ..fixtures::state()
         }
     }
 
@@ -395,13 +571,7 @@ mod tests {
     /// The returned [`TempDir`] is the origin, and dropping it deletes the
     /// repository the deploy fetches from, so tests hold it.
     fn write_target_ready(home: &Path, sheep: &str, watch: Watch) -> TempDir {
-        let origin = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
-        fs::write(origin.path().join("Flockfile.toml"), flockfile(sheep)).expect("Flockfile");
-        fixtures::run_git(origin.path(), &["add", "."]);
-        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "first"]);
+        let origin = fixtures::checkout(&[("Flockfile.toml", &flockfile(sheep))]);
 
         let tree = Tree::for_sheep(home, sheep);
         fs::create_dir_all(tree.git()).expect("create the git dir");
@@ -415,14 +585,11 @@ mod tests {
 
         let state = State {
             remote,
-            branch: "main".to_owned(),
             deployed: Some(first),
-            failed: None,
             verify: Verify::Probed,
             watch,
-            origin_cwd: None,
-            origin_script: None,
             checkout: origin.path().to_owned(),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write deploy.toml");
 
@@ -460,12 +627,6 @@ mod tests {
     }
 
     impl Daemon for Ready {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             Ok(vec![
                 ProcessInfo::builder(0, sheep, ProcStatus::Online)
@@ -473,25 +634,17 @@ mod tests {
                     .build(),
             ])
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             self.reloads.set(self.reloads.get() + 1);
             Ok(())
         }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
         async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Ok(())
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, restart, save_roll,
+        );
     }
 
     /// A shepherd that has gone quiet, counting the times it was asked, on
@@ -533,12 +686,6 @@ mod tests {
     }
 
     impl Daemon for Counting {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let asked = self.describes.get() + 1;
             self.describes.set(asked);
@@ -551,24 +698,13 @@ mod tests {
             fixtures::run_git(&self.origin, &["commit", "-q", "-m", "another"]);
             Err(Error::Protocol("the shepherd stopped answering".to_owned()))
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
         async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Ok(())
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, reload, restart, save_roll,
+        );
     }
 
     /// fails if a manual target is polled. This is the switch an operator
@@ -594,7 +730,12 @@ mod tests {
             .expect("reads")
             .deployed;
 
-        assert!(tick(&Ready::new(), home.path(), &config()).await.is_empty());
+        assert!(
+            tick(&Ready::new(), home.path(), &fixtures::dog_config())
+                .await
+                .results
+                .is_empty()
+        );
 
         assert_eq!(
             State::read(&Tree::for_sheep(home.path(), "paused").state_file())
@@ -614,10 +755,12 @@ mod tests {
         // A record naming a release, with no repository under it at all:
         // the fetch is what fails, which is the shape of a remote nobody
         // can reach.
-        write_target(home.path(), "broken", Watch::Auto, Some("old"));
+        write_target(home.path(), "broken", Watch::Auto, Some(fixtures::SHA));
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
 
-        let results = tick(&Ready::new(), home.path(), &config()).await;
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "broken");
@@ -645,7 +788,9 @@ mod tests {
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = Ready::new();
-        let results = tick(&daemon, home.path(), &config()).await;
+        let results = tick(&daemon, home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert_eq!(results.len(), 1);
         assert!(
@@ -662,7 +807,12 @@ mod tests {
     #[tokio::test]
     async fn a_dog_with_no_targets_ticks_quietly() {
         let home = tempfile::tempdir().expect("tempdir");
-        assert!(tick(&Ready::new(), home.path(), &config()).await.is_empty());
+        assert!(
+            tick(&Ready::new(), home.path(), &fixtures::dog_config())
+                .await
+                .results
+                .is_empty()
+        );
     }
 
     /// fails if a deploy directory that cannot be listed is passed over in
@@ -670,6 +820,10 @@ mod tests {
     /// everything - and idling quietly is what a dog with nothing to do
     /// looks like too. One row, named for the directory rather than for a
     /// sheep, because there is no sheep to name.
+    ///
+    /// Relies on mode bits, which root ignores: run as root (a container,
+    /// say) the listing succeeds and this test fails for a reason that has
+    /// nothing to do with the loop. CI runs unprivileged.
     #[tokio::test]
     async fn a_deploy_directory_that_cannot_be_listed_is_reported() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -678,7 +832,9 @@ mod tests {
         // Listable again on drop or not, this test never reads it back.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let results = tick(&Ready::new(), home.path(), &config()).await;
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         let listable = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         assert_eq!(results.len(), 1);
@@ -699,7 +855,9 @@ mod tests {
         fs::create_dir_all(tree.root()).expect("create the tree");
         fs::write(tree.state_file(), "this is not toml").expect("write deploy.toml");
 
-        let results = tick(&Ready::new(), home.path(), &config()).await;
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "garbled");
@@ -730,10 +888,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(150),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
             ),
         )
@@ -760,10 +915,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(600),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
             ),
         )
@@ -779,27 +931,11 @@ mod tests {
     fn a_line_that_repeats_is_said_once() {
         let mut previous = BTreeMap::new();
 
-        assert!(worth_saying(
-            &mut previous,
-            "web",
-            "web: the remote is gone"
-        ));
-        assert!(!worth_saying(
-            &mut previous,
-            "web",
-            "web: the remote is gone"
-        ));
-        assert!(!worth_saying(
-            &mut previous,
-            "web",
-            "web: the remote is gone"
-        ));
+        assert!(worth_saying(&mut previous, "web", "web: the remote is gone").is_some());
+        assert!(worth_saying(&mut previous, "web", "web: the remote is gone").is_none());
+        assert!(worth_saying(&mut previous, "web", "web: the remote is gone").is_none());
         // A different target is a different line.
-        assert!(worth_saying(
-            &mut previous,
-            "koji",
-            "koji: the remote is gone"
-        ));
+        assert!(worth_saying(&mut previous, "koji", "koji: the remote is gone").is_some());
     }
 
     /// fails if the mute is keyed on anything narrower than the line. The
@@ -818,8 +954,8 @@ mod tests {
         ];
 
         for line in lines {
-            assert!(worth_saying(&mut previous, "web", line), "{line}");
-            assert!(!worth_saying(&mut previous, "web", line), "{line}");
+            assert!(worth_saying(&mut previous, "web", line).is_some(), "{line}");
+            assert!(worth_saying(&mut previous, "web", line).is_none(), "{line}");
         }
     }
 
@@ -831,10 +967,30 @@ mod tests {
         let mut previous = BTreeMap::new();
         let broken = "web: the remote is gone";
 
-        assert!(worth_saying(&mut previous, "web", broken));
-        assert!(!worth_saying(&mut previous, "web", broken));
-        assert!(worth_saying(&mut previous, "web", "web deployed abc1234"));
-        assert!(worth_saying(&mut previous, "web", broken));
+        assert!(worth_saying(&mut previous, "web", broken).is_some());
+        assert!(worth_saying(&mut previous, "web", broken).is_none());
+        assert!(worth_saying(&mut previous, "web", "web deployed abc1234").is_some());
+        assert!(worth_saying(&mut previous, "web", broken).is_some());
+    }
+
+    /// fails if the count a re-said line carries is off by one. The
+    /// occurrence that lifts the mute is the one being printed, so it is
+    /// not among the swallowed; `RESAY` occurrences after the first say,
+    /// `RESAY - 1` were swallowed.
+    #[test]
+    fn a_line_said_again_counts_only_what_was_swallowed() {
+        let mut previous = BTreeMap::new();
+        let line = "web: the remote is gone";
+
+        assert_eq!(worth_saying(&mut previous, "web", line), Some(0), "new");
+        for _ in 1..RESAY {
+            assert_eq!(worth_saying(&mut previous, "web", line), None);
+        }
+        assert_eq!(
+            worth_saying(&mut previous, "web", line),
+            Some(RESAY - 1),
+            "the one being said is not swallowed"
+        );
     }
 
     /// fails if a muted line is muted forever. A dog runs for months, and a
@@ -846,9 +1002,9 @@ mod tests {
         let mut previous = BTreeMap::new();
         let line = "web: the remote is gone";
 
-        assert!(worth_saying(&mut previous, "web", line));
+        assert!(worth_saying(&mut previous, "web", line).is_some());
         let said = (0..RESAY * 2)
-            .filter(|_| worth_saying(&mut previous, "web", line))
+            .filter(|_| worth_saying(&mut previous, "web", line).is_some())
             .count();
 
         assert_eq!(said, 2, "once every RESAY ticks, not once ever");
@@ -903,16 +1059,14 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
 
         let _ = tokio::time::timeout(
-            Duration::from_secs(1),
+            // Paused time: long enough for a verify dwell, over in an instant.
+            Duration::from_secs(120),
             run_with(
                 &Ready::new(),
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(600),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
                 &mut out,
                 &mut err,
@@ -934,7 +1088,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failure_is_written_once_however_many_ticks_repeat_it() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "broken", Watch::Auto, Some("old"));
+        write_target(home.path(), "broken", Watch::Auto, Some(fixtures::SHA));
         let (mut out, mut err) = (Vec::new(), Vec::new());
 
         // Three ticks' worth, as the interval test above.
@@ -945,10 +1099,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(150),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
                 &mut out,
                 &mut err,
@@ -995,7 +1146,7 @@ mod tests {
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             self.ready.describe(sheep).await
         }
-        async fn start(&self, apps: Vec<AppConfig>) -> Result<(), Error> {
+        async fn start(&self, apps: Vec<AppConfig>) -> Result<Vec<u32>, Error> {
             self.ready.start(apps).await
         }
         async fn delete(&self, id: u32) -> Result<(), Error> {
@@ -1024,12 +1175,6 @@ mod tests {
     struct RefusingSmits;
 
     impl Daemon for RefusingSmits {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             Ok(vec![
                 ProcessInfo::builder(0, sheep, ProcStatus::Online)
@@ -1037,20 +1182,8 @@ mod tests {
                     .build(),
             ])
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             Ok(())
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
         }
         async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Err(Error::Request(RequestError::Rpc(RpcError {
@@ -1059,6 +1192,10 @@ mod tests {
                 daemon_version: None,
             })))
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, restart, save_roll,
+        );
     }
 
     /// fails if the smit stops being republished every tick. The daemon
@@ -1069,12 +1206,22 @@ mod tests {
     #[tokio::test]
     async fn every_tick_republishes_every_targets_smit() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "bpm", Watch::Auto, Some("a1b2c3d4e5f6"));
-        write_target(home.path(), "ctm", Watch::Manual, Some("f6e5d4c3b2a1"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+        );
+        write_target(
+            home.path(),
+            "ctm",
+            Watch::Manual,
+            Some("f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"),
+        );
         let daemon = SmitRecording::default();
 
-        tick(&daemon, home.path(), &config()).await;
-        tick(&daemon, home.path(), &config()).await;
+        tick(&daemon, home.path(), &fixtures::dog_config()).await;
+        tick(&daemon, home.path(), &fixtures::dog_config()).await;
 
         assert_eq!(
             daemon.smits(),
@@ -1094,9 +1241,14 @@ mod tests {
     #[tokio::test]
     async fn a_manual_target_still_gets_a_smit() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "ctm", Watch::Manual, Some("f6e5d4c3b2a1"));
+        write_target(
+            home.path(),
+            "ctm",
+            Watch::Manual,
+            Some("f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"),
+        );
         let daemon = SmitRecording::default();
-        tick(&daemon, home.path(), &config()).await;
+        tick(&daemon, home.path(), &fixtures::dog_config()).await;
         assert_eq!(daemon.smits().len(), 1);
     }
 
@@ -1112,8 +1264,22 @@ mod tests {
         // with the smit refusal this test exists to pin - see every other
         // `write_target_ready` caller in this file for the pattern.
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
-        let results = tick(&RefusingSmits, home.path(), &config()).await;
-        assert!(results[0].1.is_ok(), "the deploy still ran");
+        let results = tick(&RefusingSmits, home.path(), &fixtures::dog_config())
+            .await
+            .results;
+        let row = |name: &str| {
+            results
+                .iter()
+                .find(|(sheep, _)| sheep == name)
+                .unwrap_or_else(|| panic!("no row for {name}: {results:?}"))
+        };
+        assert!(row("fine").1.is_ok(), "the deploy still ran");
+        // And the refusal is a row of its own, so it reaches the mute rather
+        // than being printed once per target per tick forever.
+        assert!(
+            row("fine/smit").1.is_err(),
+            "the refusal is reported as its own row"
+        );
     }
 
     /// fails if a target whose branch name is longer than a smit allows
@@ -1124,14 +1290,21 @@ mod tests {
     #[tokio::test]
     async fn a_too_long_branch_name_does_not_stop_the_tick() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "long", Watch::Auto, Some("a1b2c3d4e5f6"));
+        write_target(
+            home.path(),
+            "long",
+            Watch::Auto,
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+        );
         let tree = Tree::for_sheep(home.path(), "long");
         let mut state = State::read(&tree.state_file()).expect("reads");
         state.branch = "x".repeat(100);
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = SmitRecording::default();
-        let results = tick(&daemon, home.path(), &config()).await;
+        let results = tick(&daemon, home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert!(
             !daemon.smits().is_empty(),

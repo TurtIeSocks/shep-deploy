@@ -62,7 +62,7 @@ what three attempts at describing one got wrong.
 
 **The cleared environment bounds what a build inherits from this process.** A
 build gets `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, whatever `passthrough` names
-in `[dog.deploy]` in `shep.toml`, and the release's own `[dog.deploy.build]`
+in `[deploy]` in `dogs.toml`, and the release's own `[dog.deploy.build]`
 env. Nothing else. Dropping uid does not unsee environment variables, because
 they are copied into the child before the drop happens, so a dog started with
 a registry token in its environment would otherwise hand it to every build.
@@ -80,6 +80,32 @@ the key, on purpose, because an operator who writes it has said what they mean.
 What it costs is the whole of the paragraph above, so it is worth being sure
 the build command is one you would hand your agent to.
 
+**Five more fields make the shepherd act at its own uid, and a committed
+Flockfile is refused for setting any of them.** Read out of shep-daemon on
+2026-09-04. A `readiness_probe` or `liveness_probe` of kind `exec` is run by
+the daemon through `sh -c` on the probe's interval, forever, with no uid drop
+and no regard for `user`: committed, it is a shell at the daemon's uid every
+ten seconds, and root's under the arrangement this crate assumes.
+`out_file` and `err_file` are opened, created and appended to by the daemon's
+log pump and truncated by `shep flush`, at the daemon's uid, with a symlink
+check on the final component and nothing on where the path points. An `http`
+or `tcp` probe is a connection the daemon makes from its own network
+position, so a committed target has to be on loopback. `watch` has the daemon
+walk and watch the working directory recursively as itself, following
+symlinks, so a committed link out of the release reaches whatever it points
+at. All of them stay available in `Flockfile.override.toml`, which is the
+operator's.
+
+`interpreter`, `script`, `args` and `cwd` are not on that list because they
+are the app's own command line. The daemon sets the child's gid and uid
+before it changes directory and before it execs, so a committed interpreter
+runs as `user` exactly as the script would, and a bare name is looked up on
+the daemon's own `PATH` by a process that has already dropped. What remains
+is small: the daemon stats the program at its own uid before spawning, to
+refuse a batch whose program is provably absent, so a committed absolute
+path learns whether that path exists on the host, one bit, through the
+refusal, and nothing else.
+
 **Nothing bounds what a build reads out of its own release.** Gitignored files
 are symlinked into every release by design, which is what makes a `.env` work
 at runtime. A build command can therefore read every secret the app itself can
@@ -96,6 +122,11 @@ individual routes out of it, and why it is deferred.
 No credential handling of any kind. Git auth is inherited from the user the dog
 runs as, so a private repository behaves as it does in that user's own shell,
 and no token passes through any URL or argument this crate builds.
+
+One file of this crate's own holds secrets. `deploy.toml` records the app as
+the shepherd had it before adoption, `env` included, so that removal can put
+it back whole. It is written owner-only, the same mode shep uses for its own
+roll, which holds the same values.
 
 ## Reporting
 

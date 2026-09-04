@@ -28,30 +28,31 @@
 //!
 //! # Two deploys of one sheep
 //!
-//! There is no lock. What there is instead is one cheap guard: `current` is
-//! read when a deploy starts and read again immediately before the swap,
-//! and a deploy whose `current` moved in between refuses rather than
-//! swapping on top of whatever moved it. The failure it exists for is
-//! specific and silent - a second deploy that finished a *newer* release
-//! while this one was still building would otherwise be reverted by this
-//! one's swap, verified and healthy, with nothing anywhere reporting a
-//! problem. The guard is not a lock and does not pretend to be: two deploys
-//! can still interleave inside the swap itself. It removes the case that
-//! loses a good release, which is the one worth removing before the poll
-//! loop exists to make concurrency ordinary.
+//! Two things, in this order. [`go`] takes an exclusive `flock` on the
+//! tree before anything else and holds it to the end, so two PROCESSES
+//! cannot both be inside a deploy of one sheep: the second is refused in one
+//! sentence rather than colliding somewhere inside git. See [`crate::lock`]
+//! for what that collision did before the lock existed. [`set_watch`] does
+//! NOT take it, on purpose; it and every whole-record write a deploy makes
+//! take the record lock instead, and its own doc says how a `--watch` typed
+//! mid-tick and the tick's record write stay out of each other's way.
 //!
-//! # A stale `current.tmp` is left alone, deliberately
+//! Behind the lock there is still one cheap guard: `current` is read when a
+//! deploy starts and read again immediately before the swap, and a deploy
+//! whose `current` moved in between refuses rather than swapping on top of
+//! whatever moved it. The lock makes that unreachable through this module,
+//! and it stays for anything that moves `current` without taking the lock,
+//! an operator's own hand, say. The failure it exists for is specific and
+//! silent: a *newer* release, verified and healthy, reverted by an older
+//! deploy's swap with nothing anywhere reporting a problem.
 //!
-//! [`crate::swap::point_at`] refuses rather than cleaning up a temporary
-//! symlink left by an interrupted swap, and this module does not clean one
-//! either. The window between creating that link and renaming it is two
-//! syscalls wide, so a `current.tmp` on disk is far more likely to mean
-//! another deploy of this sheep is running *right now* than that one died
-//! inside those two syscalls. Removing it would break the live deploy for
-//! the sake of a case that almost never happens. The refusal costs little:
-//! it lands at the swap, which is before anything has been disturbed, so
-//! the running app keeps serving and the operator's fix is one `rm` once
-//! they have checked no deploy is in flight.
+//! # A stale `current.tmp`
+//!
+//! [`crate::swap::point_at`] replaces a temporary symlink left by an
+//! interrupted swap, because the lock above means one on disk cannot belong
+//! to a deploy that is running now. Anything at that name that is NOT a
+//! symlink was not left by this dog, and is refused with the path to move
+//! aside.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,6 +63,7 @@ use tokio::time::{Instant, sleep};
 use shep_client::RequestError;
 use shep_client::shep_core::config::AppConfig;
 
+use crate::build::BuildSpec;
 use crate::config::DogConfig;
 use crate::daemon::Daemon;
 use crate::error::Error;
@@ -160,14 +162,46 @@ pub(crate) const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 /// by the same field, and an app that needs a minute to compile its client
 /// says so by setting `listen_timeout`, which this reads.
 fn budget(app: &AppConfig, instances: u32) -> Duration {
-    let per_instance = app.listen_timeout.as_duration()
-        + app.graceful_timeout.as_duration()
-        + RELOAD_DEADLINE_SLACK;
+    // Saturating throughout, and then held under `verify::MAX_WAIT`. Both
+    // timeouts come out of the release's own Flockfile, which the deployed
+    // repository writes, and `UpDuration` accepts any value up to `u64::MAX`
+    // milliseconds: a plain `+` here panicked, and a sum that did not would
+    // have had this dog watching one reload for longer than the host will
+    // exist, holding the tree's lock and the poll loop with it.
+    let per_instance = app
+        .listen_timeout
+        .as_duration()
+        .saturating_add(app.graceful_timeout.as_duration())
+        .saturating_add(RELOAD_DEADLINE_SLACK);
 
     // A flock with nothing running still gets one instance's worth. Such a
     // reload replaces nothing and can never turn over, so what this buys is
     // a clean failure at a sensible moment rather than an instant one.
-    per_instance.saturating_mul(instances.max(1))
+    verify::bounded(per_instance.saturating_mul(instances.max(1)))
+}
+
+/// How long a verified flock is watched after its turnover.
+///
+/// [`verify::DWELL`] for most apps. Longer for a probed app that sets
+/// `reuse_port`: shep reloads such an app with the two instances overlapping
+/// and re-runs the readiness probe AFTER the old instance has drained, with
+/// the app's own `listen_timeout` as the deadline, because the old instance
+/// may have been the one that answered the first probe. A replacement that
+/// fails that second probe is demoted to `Starting` and left there, and that
+/// can land anywhere inside the deadline, so a ten-second dwell would record
+/// a release deployed and have shep demote it a minute later. Read out of
+/// shep-daemon's `finish_swap` and `spawn_verify_task` on 2026-09-04.
+fn dwell_for(app: &AppConfig) -> Duration {
+    if app.reuse_port && app.readiness_probe.is_some() {
+        verify::bounded(
+            app.listen_timeout
+                .as_duration()
+                .saturating_add(RELOAD_DEADLINE_SLACK),
+        )
+        .max(verify::DWELL)
+    } else {
+        verify::DWELL
+    }
 }
 
 /// Deploys the head of `state.branch` to the tree's sheep, rolling back if
@@ -186,13 +220,16 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// below runs again over it regardless.
 ///
 /// # Errors
-/// [`Error::NotCutOver`], before anything at all happens, if the target's
-/// record names no released sha - see the refusal in the body for why that
-/// deploy would report a success it did not achieve, and the variant's own
-/// doc for why the poll loop needs to recognise it.
+/// [`Error::AlreadyDeploying`] if another process holds the tree, and
+/// [`Error::Io`] if the lock file cannot be created - both from
+/// [`lock::hold`], which is the first thing that runs. Then
+/// [`Error::NotCutOver`] if the target's record names no released sha - see
+/// the refusal in the body for why that deploy would report a success it
+/// did not achieve, and the variant's own doc for why the poll loop needs to
+/// recognise it.
 ///
 /// Anything the steps before the swap return - see [`crate::git::fetch`],
-/// [`crate::shared::to_link`], [`crate::flockfile::app_config`] and
+/// [`crate::shared::to_link`], [`crate::flockfile::read`] and
 /// [`crate::build::run`] - in which case nothing has been disturbed and the
 /// old release is still serving. [`Error::Raced`] if `current` moved while
 /// this deploy was preparing, which is refused rather than swapped over.
@@ -228,14 +265,15 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// the same reason it wraps a failed `restore`: `current` is left naming a
 /// release nothing is running.
 ///
-/// One error here does NOT mean the deploy failed. [`Error::Io`] from
-/// writing `deploy.toml`, which happens only after a successful verify, is
-/// returned instead of [`Outcome::Deployed`] even though the new release is
-/// live and verified. Nothing is rolled back, deliberately: there is nothing
-/// to undo and undoing would take a working release out of service. Only the
-/// record lags, so the next deploy of the same sha repeats the work and
-/// writes it again. A caller that treats every error as "the old release is
-/// still serving" is wrong about this one.
+/// One failure past the swap is reported and NOT returned: `deploy.toml`
+/// refusing to be written after a successful verify. The new release is
+/// live and verified, there is nothing to undo and undoing would take a
+/// working release out of service, so the outcome is still
+/// [`Outcome::Deployed`] and the failure is printed. What lags is the
+/// record, and only on disk: `state.deployed` has advanced in this process,
+/// so the poll loop's next tick reads the target as up to date, while a
+/// restarted dog reads the old sha off disk and deploys the same one again.
+/// One rebuild, and it repairs itself.
 ///
 /// `keep` is the retention count: [`crate::retention`] reclaims every
 /// release beyond the newest `keep`, sparing whatever `current` names
@@ -333,7 +371,11 @@ async fn go<D: Daemon>(
 
     let started_at = swap::resolve(&tree.current())?;
 
-    git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
+    // Off the runtime's thread: see `shared::off_thread` for what a fetch on
+    // it used to stall. `run_git_within` bounds the wait; this keeps the
+    // dog answering during it.
+    let (git_dir, remote, budget) = (tree.git(), state.remote.clone(), config.git_timeout);
+    shared::off_thread(move || git::fetch(&git_dir, &remote, budget)).await?;
     let head = head_of(tree, &state.branch)?;
     if state.deployed.as_deref() == Some(head.as_str()) {
         return Ok(Outcome::UpToDate);
@@ -350,8 +392,42 @@ async fn go<D: Daemon>(
     }
 
     let outcome = attempt(daemon, tree, state, &head, started_at, config).await;
-    record(tree, state, &head, &outcome, config.retention);
+    record(tree, state, &head, &outcome, config.retention).await;
     outcome
+}
+
+/// Everything between a sha and its build: the worktree, the cache link,
+/// the operator's shared files, and the two Flockfiles read once.
+///
+/// One function because two callers, [`attempt`] and
+/// [`crate::optin::prepare`], had the same seven lines, and because all of
+/// it is blocking work (git, symlinks, file reads) that both run through
+/// [`shared::off_thread`]. Answers the app to register and the build to
+/// run.
+///
+/// # Errors
+/// Whatever [`checkout_release`], [`shared::link_cache`],
+/// [`shared::to_link`], [`shared::link_into`] and [`flockfile::read`]
+/// return, plus the app-selection and schema failures of
+/// [`flockfile::Merged::app_config`] and [`flockfile::Merged::build_spec`].
+pub(crate) fn stage_release(
+    tree: &Tree,
+    checkout: &Path,
+    sha: &str,
+) -> Result<(AppConfig, BuildSpec), Error> {
+    let release = tree.release(sha);
+    checkout_release(tree, sha)?;
+    shared::link_cache(&release, &tree.cache_target())?;
+    // Held, not recomputed. This is the only record of which files came from
+    // the operator's own checkout rather than from the repository, and
+    // `flockfile` needs it to know whether an override is theirs.
+    let shared_paths = shared::to_link(checkout)?;
+    shared::link_into(&release, checkout, &shared_paths)?;
+
+    let flockfiles = flockfile::read(&release, &shared_paths)?;
+    let app = flockfiles.app_config(tree.sheep())?;
+    let spec = flockfiles.build_spec()?;
+    Ok((app, spec))
 }
 
 /// Checks `sha` out at `release`, unless a FINISHED checkout is already there.
@@ -375,6 +451,14 @@ async fn go<D: Daemon>(
 /// So the marker is written here, after `git worktree add` returns, and only
 /// a release carrying it is reused.
 ///
+/// What it covers is a killed process, not a lost power supply. Nothing
+/// syncs the checkout before the marker is written, so a crash of the host
+/// can leave the marker durable and part of the checkout not; the next
+/// deploy of that sha would then reuse it. Closing that needs a sync of
+/// every file the worktree wrote, which is git's job rather than this
+/// crate's, and a host that loses power mid-deploy has larger problems than
+/// one release.
+///
 /// # Errors
 /// [`Error::Io`] if a stale directory cannot be removed or the marker cannot
 /// be written. Whatever [`git::worktree_prune`] and [`git::worktree_add`]
@@ -392,10 +476,7 @@ pub(crate) fn checkout_release(tree: &Tree, sha: &str) -> Result<(), Error> {
     }
 
     if release.exists() {
-        fs::remove_dir_all(&release).map_err(|source| Error::Io {
-            path: release.clone(),
-            source,
-        })?;
+        fs::remove_dir_all(&release).map_err(Error::at(&release))?;
         // Removing the directory is not enough on its own: git still has the
         // path registered and refuses the next add with "missing but already
         // registered worktree". Verified 2026-08-28.
@@ -405,15 +486,9 @@ pub(crate) fn checkout_release(tree: &Tree, sha: &str) -> Result<(), Error> {
     git::worktree_add(&git_dir, &release, sha)?;
 
     if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
+        fs::create_dir_all(parent).map_err(Error::at(parent))?;
     }
-    fs::write(&marker, b"").map_err(|source| Error::Io {
-        path: marker,
-        source,
-    })
+    fs::write(&marker, b"").map_err(Error::at(marker))
 }
 
 /// Everything from the release directory to the verdict, for one sha that
@@ -432,17 +507,11 @@ async fn attempt<D: Daemon>(
 ) -> Result<Outcome, Error> {
     let sheep = tree.sheep();
     let release = tree.release(head);
-    checkout_release(tree, head)?;
-    shared::link_cache(&release, &tree.cache_target())?;
-    // Held, not recomputed. This is the only record of which files came from
-    // the operator's own checkout rather than from the repository, and
-    // `flockfile` needs it to know whether an override is theirs.
-    let shared_paths = shared::to_link(&state.checkout)?;
-    shared::link_into(&release, &state.checkout, &shared_paths)?;
-
-    let app = flockfile::app_config(&release, sheep, &shared_paths)?;
+    let (app, spec) = {
+        let (tree, checkout, head) = (tree.clone(), state.checkout.clone(), head.to_owned());
+        shared::off_thread(move || stage_release(&tree, &checkout, &head)).await?
+    };
     refuse_ungated_verification(sheep, &app, state.verify)?;
-    let spec = flockfile::build_spec(&release, &shared_paths)?;
     build::run(
         sheep,
         &release,
@@ -481,13 +550,18 @@ async fn attempt<D: Daemon>(
         // that `land` does not own, and it is deliberate rather than a
         // leak. It runs only after a verify has SUCCEEDED, so the new
         // release is up and serving: there is nothing to undo, and undoing
-        // it would take a healthy release out of service. What its failure
-        // costs is a record that lags, which the next poll resolves by
-        // deploying the same sha again - wasteful, and safe. That is why it
-        // is a `?` here rather than a `Landed` variant.
+        // it would take a healthy release out of service. Its failure is
+        // printed and the outcome stays `Deployed`, because that is what
+        // happened. Returning the failure instead had `record` write the
+        // sha into `failed` next to the same sha in `deployed`: a record
+        // that said the release was serving and held at once.
         Landed::Verified => {
             state.deployed = Some(head.to_owned());
-            state.write(&tree.state_file())?;
+            // The operator's fields from disk, not this deploy's copy of
+            // them: see `write_record`.
+            if let Err(err) = write_record(tree, state) {
+                eprintln!("shep-deploy: {sheep}: deployed {head}, but could not record it: {err}");
+            }
             Ok(Outcome::Deployed {
                 sha: head.to_owned(),
             })
@@ -495,7 +569,7 @@ async fn attempt<D: Daemon>(
         // Nothing was ever started on the new release, so there is nothing
         // to reload onto the old one - only a symlink to put back.
         Landed::NotStarted(source) => {
-            undo_swap(tree, previous.as_deref(), &source)?;
+            undo_swap(tree, state, previous.as_deref(), head, &source)?;
             Err(source)
         }
         Landed::NotVerified { why, patience } => {
@@ -561,7 +635,7 @@ async fn attempt<D: Daemon>(
 /// decided and true - what a lost write costs is one more attempt at the
 /// same sha - and the prune failure has always been reported this way; see
 /// [`crate::retention`]'s own doc.
-fn record(
+async fn record(
     tree: &Tree,
     state: &mut State,
     head: &str,
@@ -570,28 +644,108 @@ fn record(
 ) {
     let sheep = tree.sheep();
     let landed = matches!(outcome, Ok(Outcome::Deployed { .. }));
+    // `Raced` is held like any other ending. It was nearly exempted on
+    // 2026-09-04 as "transient", and it is not: the tree lock means no rival
+    // deploy can move `current` under this one any more, so what is left
+    // moving it is an operator's hand or the release's own build command,
+    // and a build that repoints `current` on every run would otherwise be
+    // rebuilt every tick forever, the exact loop `failed` exists to stop.
     let failed = (!landed).then(|| head.to_owned());
 
     if state.failed != failed {
         // Re-read before writing, because this process may not be the only
-        // one deploying this sheep. `state` here is whatever THIS process
+        // one writing this record. `state` here is whatever THIS process
         // read at its own start, and `State::write` replaces the whole
         // record, so writing it blind is last-writer-wins over a record
         // somebody else may have advanced since.
-        match landed_elsewhere(tree, head, failed.as_deref()) {
-            Some(fresher) => *state = fresher,
-            None => {
-                state.failed = failed;
-                if let Err(err) = state.write(&tree.state_file()) {
-                    eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
-                }
+        //
+        // Under the record lock from the re-read to the write, so what was
+        // re-read is what is written over.
+        match lock::hold_record(tree) {
+            Err(err) => {
+                eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
             }
+            Ok(_record) => match landed_elsewhere(tree, head, failed.as_deref()) {
+                Some(fresher) => *state = fresher,
+                None => {
+                    state.failed = failed;
+                    adopt_operator_fields(tree, state);
+                    if let Err(err) = state.write(&tree.state_file()) {
+                        eprintln!(
+                            "shep-deploy: {sheep}: could not record what {head} came to: {err}"
+                        );
+                    }
+                }
+            },
         }
     }
 
-    if let Err(err) = retention::prune(tree, keep) {
+    // Both the record in memory and the one on disk. They differ after the
+    // one write this module swallows, a verified deploy whose record could
+    // not be written: memory names the new sha and disk still names the old
+    // one, and the old one is what the next run's rollback looks for.
+    let on_disk = State::read(&tree.state_file())
+        .ok()
+        .and_then(|recorded| recorded.deployed);
+    let spared: Vec<&str> = state
+        .deployed
+        .as_deref()
+        .into_iter()
+        .chain(on_disk.as_deref())
+        .collect();
+    // `git worktree remove` per doomed release, off the runtime's thread
+    // like every other git call.
+    let pruned = {
+        let (tree, spared): (Tree, Vec<String>) = (
+            tree.clone(),
+            spared.iter().map(|sha| (*sha).to_owned()).collect(),
+        );
+        shared::off_thread(move || {
+            let spared: Vec<&str> = spared.iter().map(String::as_str).collect();
+            retention::prune(&tree, keep, &spared)
+        })
+        .await
+    };
+    if let Err(err) = pruned {
         eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
     }
+}
+
+/// Takes `watch` and `verify` from the record on disk into `state`, so a
+/// deploy's own write of the record does not put back a setting the
+/// operator changed while it ran.
+///
+/// Those two fields are the operator's: `set_watch` writes one and a hand
+/// edit writes the other, and both are documented as things to change in
+/// the middle of an incident. A deploy holds this `State` from its first
+/// read to its last write, which can be a build's worth of time, and writing
+/// it whole put the operator's `manual` back to `auto` at the end of the
+/// very deploy they were trying to stop the next one of. Called before
+/// every whole-record write a deploy makes: the verified arm's, the
+/// rollback's, and `record`'s. A record that cannot be read leaves `state`
+/// as it is: there is nothing to adopt.
+fn adopt_operator_fields(tree: &Tree, state: &mut State) {
+    if let Ok(on_disk) = State::read(&tree.state_file()) {
+        state.watch = on_disk.watch;
+        state.verify = on_disk.verify;
+    }
+}
+
+/// Writes `state` whole, under the record lock, with the operator's fields
+/// taken from disk first.
+///
+/// The lock is what makes the adopt-then-write one step: without it a
+/// `set_watch` could land between the read `adopt_operator_fields` makes
+/// and the rename this makes, and be renamed over. Every whole-record
+/// write a deploy makes goes through here.
+///
+/// # Errors
+/// [`Error::Io`] if the record lock cannot be taken, and whatever
+/// [`State::write`] returns.
+fn write_record(tree: &Tree, state: &mut State) -> Result<(), Error> {
+    let _record = lock::hold_record(tree)?;
+    adopt_operator_fields(tree, state);
+    state.write(&tree.state_file())
 }
 
 /// The on-disk record, when it already says `head` is deployed and this
@@ -620,9 +774,11 @@ fn record(
 ///
 /// Kept anyway, because the lock is per tree and taken by `go`, and this guard
 /// is not. Anything writing the record WITHOUT going through `go` still races:
-/// `set_watch` does, and so would any later writer reaching for `State::write`
-/// directly. One read that refuses to overwrite a fresher record is cheap
-/// enough to keep for those.
+/// `set_watch` does, by design, so that `--watch manual` lands during a deploy
+/// rather than waiting an hour for its lock; see [`adopt_operator_fields`] for
+/// the other half of that arrangement, and `lock::hold_record` for the lock
+/// both sides now hold across their read and write. One read that refuses to
+/// overwrite a fresher record is cheap enough to keep under it.
 fn landed_elsewhere(tree: &Tree, head: &str, failing: Option<&str>) -> Option<State> {
     failing?;
     let on_disk = State::read(&tree.state_file()).ok()?;
@@ -705,7 +861,7 @@ async fn land<D: Daemon>(daemon: &D, sheep: &str, app: &AppConfig, mode: Verify)
     // the reload rather than from a request before it.
     let reloaded_at = Instant::now();
 
-    match verify::wait(daemon, sheep, mode, &before, patience).await {
+    match verify::wait(daemon, sheep, mode, &before, patience, dwell_for(app)).await {
         Ok(true) => Landed::Verified,
         // What actually elapsed, not the budget. An `Alive` verdict takes
         // its turnover wait PLUS the dwell, so quoting the budget
@@ -774,9 +930,14 @@ fn never_reached_the_shepherd(err: &Error) -> bool {
 /// describe a machine that is not split - the variant reserved for what this
 /// crate cannot repair, spent on something it just did.
 ///
-/// `previous` of `None` is a target's first deploy: `current` names the new
-/// release and there is nothing earlier to name instead, so it is left
-/// where it is.
+/// Which release to put back is [`rollback_target`]'s decision, the same
+/// one a full rollback makes: `previous` first, then the record. `previous`
+/// is `None` only when `current` was absent at the start of the deploy,
+/// which no path in this crate produces once a cutover has landed, so it
+/// means an operator removed the link by hand. The record still names the
+/// release that was serving, and that is what goes back. Leaving `current`
+/// on the unverified release instead, as this once did, was a swap nothing
+/// had approved reported as an ordinary failure.
 ///
 /// # Residual, and it is the same one the module doc names for
 /// `current.tmp`
@@ -792,17 +953,30 @@ fn never_reached_the_shepherd(err: &Error) -> bool {
 ///
 /// # Errors
 /// [`Error::RollbackFailed`] carrying `why` if `current` cannot be put back,
-/// which is the one case here that does leave something for an operator:
-/// `current` naming a release nothing is running.
-fn undo_swap(tree: &Tree, previous: Option<&Path>, why: &Error) -> Result<(), Error> {
-    let Some(previous) = previous else {
-        return Ok(());
-    };
-
-    swap::point_at(&tree.current(), previous).map_err(|source| Error::RollbackFailed {
+/// or if there is nothing on disk to put it back to. Both leave the same
+/// thing for an operator: `current` naming a release nothing is running.
+fn undo_swap(
+    tree: &Tree,
+    state: &State,
+    previous: Option<&Path>,
+    attempted: &str,
+    why: &Error,
+) -> Result<(), Error> {
+    let wrap = |source| Error::RollbackFailed {
         why: why.to_string(),
         source: Box::new(source),
-    })
+    };
+
+    let Some(target) = rollback_target(tree, state, previous, attempted) else {
+        return Err(wrap(Error::Config(format!(
+            "current names {attempted}, which nothing verified, and neither the link it \
+             replaced nor deploy.toml names an earlier release that is still on disk. Point {} \
+             at a release by hand before deploying again",
+            tree.current().display()
+        ))));
+    };
+
+    swap::point_at(&tree.current(), &target).map_err(wrap)
 }
 
 /// Sets `watch` on the target and records it, without deploying.
@@ -820,12 +994,35 @@ fn undo_swap(tree: &Tree, previous: Option<&Path>, why: &Error) -> Result<(), Er
 /// the setting that asks for that deploy unattended, once an interval,
 /// forever.
 ///
+/// # Why this does NOT take the deploy lock
+///
+/// `manual` is what somebody sets in the middle of an incident, and a
+/// deploy holds the tree's lock from its fetch through its build, which the
+/// default `build_timeout` allows an hour for. A `--watch manual` refused as
+/// `AlreadyDeploying` for that hour is the opposite of what the setting is
+/// for. So this writes without the tree lock, under the record lock instead
+/// (`lock::hold_record`), which every whole-record write a deploy makes
+/// also takes: the read here and the write here are one step nothing can
+/// land between, and the deploy's own writes take `watch` and `verify`
+/// from the disk rather than from their stale copy, see
+/// `adopt_operator_fields`, so the setting survives them. Before the record
+/// lock there was a window the width of one read and one write, in which a
+/// deploy's rename could drop this one or this one drop a `deployed` the
+/// deploy had just recorded.
+///
 /// # Errors
 /// [`Error::Config`] if `watch` is `auto` and the target's record names no
-/// released sha. [`Error::Io`] if `deploy.toml` cannot be written - see
-/// [`State::write`]. `state` is left alone when the refusal fires, and
-/// updated in memory whether or not the write succeeds.
-pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Error> {
+/// released sha. [`Error::Io`] or [`Error::Config`] if `deploy.toml` cannot
+/// be read or written - see [`State::read`] and [`State::write`].
+///
+/// Answers the `watch` the record carried before, and the record as it is
+/// after: the read is this function's, so a caller has nothing older to
+/// print from.
+pub fn set_watch(tree: &Tree, watch: Watch) -> Result<(Watch, State), Error> {
+    let _record = lock::hold_record(tree)?;
+    let mut state = State::read(&tree.state_file())?;
+    let was = state.watch;
+
     if watch == Watch::Auto && state.deployed.is_none() {
         return Err(Error::Config(format!(
             "{} has a deploy tree but was never cut over to it, so there is nothing for the \
@@ -838,8 +1035,10 @@ pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Err
             tree.sheep()
         )));
     }
+
     state.watch = watch;
-    state.write(&tree.state_file())
+    state.write(&tree.state_file())?;
+    Ok((was, state))
 }
 
 /// The sha `branch` points at in the tree's bare clone, with the one
@@ -920,8 +1119,8 @@ fn refuse_ungated_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Re
              there is nothing for a deploy to wait on: shep reports a sheep with no readiness \
              gate Online as soon as it has not died, which would verify every release, including \
              a broken one. Add a [readiness_probe] to its Flockfile, or set wait_ready if the app \
-             announces itself on the channel, or set verify = \"alive\" in deploy.toml to accept \
-             the weaker check deliberately."
+             announces itself on the channel, or change the verify line in deploy.toml to \
+             \"alive\" to accept the weaker check deliberately."
         )));
     }
     Ok(())
@@ -1028,8 +1227,15 @@ fn rollback_target(
     previous: Option<&Path>,
     attempted: &str,
 ) -> Option<PathBuf> {
-    let usable =
-        |release: PathBuf| (sha_of(&release) != attempted && release.exists()).then_some(release);
+    // A candidate has to be a release: a full sha, other than the one that
+    // just failed, with a directory on disk. `previous` is the raw text of a
+    // link an operator can repoint by hand, and a `current -> /srv/anything`
+    // used to make `restore` write `deployed = "anything"`, which
+    // `State::read` then refused on every later run of every command.
+    let usable = |release: PathBuf| {
+        let sha = sha_of(&release);
+        (crate::state::is_sha(&sha) && sha != attempted && release.exists()).then_some(release)
+    };
 
     if let Some(release) = previous.map(Path::to_path_buf).and_then(usable) {
         return Some(release);
@@ -1091,7 +1297,7 @@ async fn restore<D: Daemon>(
 
     if state.deployed.as_deref() != Some(to.as_str()) {
         state.deployed = Some(to.clone());
-        state.write(&tree.state_file())?;
+        write_record(tree, state)?;
     }
 
     match reload_until(daemon, sheep, patience).await {
@@ -1168,7 +1374,7 @@ mod tests {
     use shep_client::shep_core::protocol::RpcErrorCode;
     use shep_client::shep_core::protocol::wire::WireError;
 
-    /// [`test_config`] with a retention the caller cares about.
+    /// [`fixtures::dog_config`] with a retention the caller cares about.
     ///
     /// Separate because the retention tests are the only ones for which the
     /// number means anything, and burying it in the shared default would
@@ -1176,18 +1382,7 @@ mod tests {
     fn test_config_keeping(retention: usize) -> crate::config::DogConfig {
         crate::config::DogConfig {
             retention,
-            ..test_config()
-        }
-    }
-
-    /// The config every test that is not about a config value runs on.
-    fn test_config() -> crate::config::DogConfig {
-        crate::config::DogConfig {
-            interval: std::time::Duration::from_secs(30),
-            retention: 5,
-            git_timeout: std::time::Duration::from_secs(60),
-            build_timeout: std::time::Duration::from_secs(60),
-            passthrough: Vec::new(),
+            ..fixtures::dog_config()
         }
     }
 
@@ -1214,7 +1409,7 @@ mod tests {
     /// no test here runs a real shepherd - so `true` is honest rather than
     /// lazy: what these tests need is an app that HAS a probe.
     const FLOCKFILE: &str = "[[app]]\nname = 'web'\nscript = './run.sh'\n\n\
-                             [app.readiness_probe]\nkind = 'exec'\ntarget = 'true'\n";
+                             [app.readiness_probe]\nkind = 'http'\ntarget = 'http://127.0.0.1:1/health'\n";
 
     /// A deploy target with a bare clone, an origin repo, and one release
     /// already live.
@@ -1228,10 +1423,6 @@ mod tests {
         state: State,
     }
 
-    /// An origin repo with a Flockfile declaring one app named `web`, and
-    /// a bare clone fetched from it - but no release built and no
-    /// `current` at all, which is a target the moment before its first
-    /// deploy.
     /// A sha whose release directory is not on disk.
     ///
     /// What a record naming a release retention has already reclaimed looks
@@ -1241,16 +1432,13 @@ mod tests {
     /// longer can.
     const RECLAIMED: &str = "0000000000000000000000000000000000000000";
 
+    /// An origin repo with a Flockfile declaring one app named `web`, and
+    /// a bare clone fetched from it - but no release built and no
+    /// `current` at all, which is a target the moment before its first
+    /// deploy.
     fn fixture_before_any_release() -> Fixture {
         let home = tempfile::tempdir().expect("tempdir");
-        let origin = tempfile::tempdir().expect("tempdir");
-
-        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
-        fs::write(origin.path().join("Flockfile.toml"), FLOCKFILE).expect("write Flockfile");
-        fixtures::run_git(origin.path(), &["add", "."]);
-        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "first"]);
+        let origin = fixtures::checkout(&[("Flockfile.toml", FLOCKFILE)]);
 
         let tree = Tree::for_sheep(home.path(), "web");
         fs::create_dir_all(tree.git()).expect("create git dir");
@@ -1261,16 +1449,12 @@ mod tests {
 
         let state = State {
             remote,
-            branch: "main".to_owned(),
-            deployed: None,
-            failed: None,
             verify: crate::state::Verify::Probed,
             // What `crate::optin::prepare` writes: a tree nothing has
             // been served from yet is not the poll loop's.
             watch: crate::state::Watch::Manual,
-            origin_cwd: None,
-            origin_script: None,
             checkout: origin.path().to_owned(),
+            ..fixtures::state()
         };
 
         // A real target always has one on disk, because that is where its
@@ -1351,9 +1535,15 @@ mod tests {
         /// is the step that used to sit outside the rollback boundary.
         describe_fails_from: Option<u32>,
         /// Created just before answering the first `describe`, standing in
-        /// for another process leaving a stale `current.tmp` behind at the
-        /// worst possible moment - after the swap, before the rollback.
+        /// for something that is not this dog's leaving a file at the
+        /// `current.tmp` path at the worst possible moment - after the swap,
+        /// before the rollback. A regular file, because a stale symlink there
+        /// is this dog's own leftover and the swap replaces it.
         plant: Option<PathBuf>,
+        /// A record to set `watch = manual` in when the first reload
+        /// arrives, standing in for an operator running `--watch manual`
+        /// while the deploy is past its build and inside its reload.
+        flip_watch: Option<PathBuf>,
         /// How many reloads after the first to refuse, standing in for the
         /// shepherd's own refusal to start a reload while one is in flight.
         /// The first is never refused, because that is the deploy's own and
@@ -1403,6 +1593,7 @@ mod tests {
                 replaces: true,
                 describe_fails_from: None,
                 plant: None,
+                flip_watch: None,
                 refusals: Cell::new(0),
                 refusal_code: RpcErrorCode::Internal,
                 refuse_from_the_first: Cell::new(false),
@@ -1466,8 +1657,18 @@ mod tests {
             shepherd
         }
 
-        /// As [`Self::never_ready`], but leaves a stale `current.tmp` at
-        /// `plant` on the way past.
+        /// As [`Self::ready`], but sets `watch = manual` in the record at
+        /// `record` when the reload arrives, as an operator would mid-deploy.
+        fn flipping_watch(record: PathBuf) -> Self {
+            Self {
+                flip_watch: Some(record),
+                ..Self::ready()
+            }
+        }
+
+        /// As [`Self::never_ready`], but leaves a file in the way at `plant`
+        /// (the `current.tmp` path) on the way past, so the rollback's swap
+        /// back cannot land.
         fn planting(plant: PathBuf) -> Self {
             Self {
                 plant: Some(plant),
@@ -1581,19 +1782,16 @@ mod tests {
     }
 
     impl Daemon for Shepherd {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             // `exists()` follows the link, and this one dangles on purpose,
             // so ask about the link itself or every poll plants it again.
             if let Some(plant) = &self.plant
                 && plant.symlink_metadata().is_err()
             {
-                std::os::unix::fs::symlink("somewhere", plant).expect("plant a stale tmp link");
+                // A regular file, not a symlink: a stale tmp LINK is this
+                // dog's own leftover and `swap::point_at` replaces it, so
+                // only something that is not a link still refuses the swap.
+                std::fs::write(plant, b"in the way").expect("plant something at the tmp path");
             }
             self.describes.set(self.describes.get() + 1);
             if self
@@ -1610,13 +1808,16 @@ mod tests {
                 })
                 .collect())
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn reload(&self, sheep: &str) -> Result<(), Error> {
+            if let Some(record) = &self.flip_watch
+                && self.attempts.get() == 0
+            {
+                let mut state = State::read(record).expect("the record to flip");
+                state.watch = Watch::Manual;
+                state
+                    .write(record)
+                    .expect("flip watch to manual mid-deploy");
+            }
             self.attempts.set(self.attempts.get() + 1);
             let refusals = self.refusals.get();
             if (self.reloads.get() > 0 || self.refuse_from_the_first.get()) && refusals > 0 {
@@ -1646,15 +1847,10 @@ mod tests {
             }
             Ok(())
         }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if a deploy that never comes up leaves the new release live.
@@ -1670,7 +1866,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -1692,7 +1888,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -1703,15 +1899,20 @@ mod tests {
     /// deployed. `state.deployed` is what the next poll compares against,
     /// so a deploy that succeeds without advancing it would redeploy the
     /// same sha on every tick forever.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_release_that_comes_up_is_deployed_and_recorded() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::ready();
 
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("completes");
+        let outcome = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("completes");
 
         // Swapping the symlink is not deploying. Without this the whole
         // reload can be deleted and the test still passes.
@@ -1749,9 +1950,14 @@ mod tests {
         let daemon = Shepherd::ready();
         let held = crate::lock::hold(&fixture.tree).expect("the other process");
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("must refuse while the tree is held");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("must refuse while the tree is held");
 
         assert!(
             matches!(&err, Error::AlreadyDeploying { sheep } if sheep == "web"),
@@ -1779,7 +1985,7 @@ mod tests {
     /// The damage is not just a wrong line in a file. `go` refuses to retry a
     /// sha that `state.failed` names, so a record saying the running release
     /// failed freezes auto-deploy for that target until somebody notices.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_straggler_cannot_fail_a_sha_another_process_deployed() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
@@ -1789,7 +1995,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("the winner lands");
@@ -1799,8 +2005,9 @@ mod tests {
             &mut straggler,
             &second,
             &Err(Error::Protocol("lost the checkout race".to_owned())),
-            test_config().retention,
-        );
+            fixtures::dog_config().retention,
+        )
+        .await;
 
         let written = State::read(&fixture.tree.state_file()).expect("still readable");
         assert_eq!(
@@ -1827,7 +2034,7 @@ mod tests {
     /// The marker lives under the tree's own root now, keyed by sha, where
     /// only this dog writes. A repository can still commit a file by that name
     /// and it means nothing.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_completion_marker_committed_by_the_repository_is_not_trusted() {
         let mut fixture = fixture_with_previous_release();
         // The name the marker used to have, which is the point: it is not
@@ -1859,7 +2066,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -1888,7 +2095,7 @@ mod tests {
     /// Checking out here needs its own fetch: the bare clone does not have
     /// `second` until `deploy` fetches, and this has to place the directory
     /// BEFORE deploy runs.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_release_whose_checkout_did_not_finish_is_checked_out_again() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
@@ -1907,7 +2114,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -1940,7 +2147,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("rolls back");
@@ -1969,14 +2176,24 @@ mod tests {
         let second = commit_on_origin(&fixture, "second.txt");
 
         let daemon = Shepherd::never_ready();
-        unattended(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("rolls back");
+        unattended(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("rolls back");
         let reloads = daemon.reload_count();
 
-        let err = unattended(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("holds");
+        let err = unattended(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("holds");
 
         assert!(matches!(err, Error::Held { .. }), "{err:?}");
         let shown = err.to_string();
@@ -2003,15 +2220,20 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("rolls back");
 
         let daemon = Shepherd::ready();
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("tries again");
+        let outcome = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("tries again");
 
         assert!(matches!(outcome, Outcome::Deployed { .. }), "{outcome:?}");
         assert_eq!(daemon.reload_count(), 1);
@@ -2028,7 +2250,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("rolls back");
@@ -2038,7 +2260,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("deploys the new commit");
@@ -2109,7 +2331,7 @@ mod tests {
             &Shepherd::keeps_the_old_instance(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -2175,6 +2397,39 @@ mod tests {
         assert_eq!(budget(&app, 0), budget(&app, 1));
     }
 
+    /// fails if the dwell stops following the app. A probed `reuse_port`
+    /// app is re-probed by shep after the old instance drains, with its own
+    /// `listen_timeout` as the deadline, and a demotion can land anywhere
+    /// inside it; every other app gets the plain dwell.
+    #[test]
+    fn the_dwell_is_sized_to_the_apps_post_drain_probe() {
+        let mut app: AppConfig = toml::from_str(
+            "name = 'web'\nscript = './run.sh'\nlisten_timeout = '60s'\n\
+             [readiness_probe]\nkind = 'http'\ntarget = 'http://127.0.0.1:1/'",
+        )
+        .expect("parses");
+        assert_eq!(dwell_for(&app), verify::DWELL, "no reuse_port: plain dwell");
+
+        app.reuse_port = true;
+        assert_eq!(
+            dwell_for(&app),
+            Duration::from_secs(65),
+            "listen_timeout plus the shepherd's own slack"
+        );
+
+        // Never shorter than the plain dwell, however quick the probe.
+        app.listen_timeout = UpDuration::from_millis(1_000);
+        assert_eq!(dwell_for(&app), verify::DWELL);
+
+        // And never past what `verify` is willing to wait at all.
+        app.listen_timeout = UpDuration::from_millis(u64::MAX);
+        assert_eq!(dwell_for(&app), verify::bounded(Duration::MAX));
+
+        // A `reuse_port` app with no probe is not re-probed.
+        app.readiness_probe = None;
+        assert_eq!(dwell_for(&app), verify::DWELL);
+    }
+
     /// fails if the reload window is sized from the Flockfile's instance
     /// count rather than the flock's. `AppConfig::instances` is what the
     /// file ASKS for; `shep stock <sheep> <n>` changes what is running
@@ -2194,9 +2449,14 @@ mod tests {
         // two instances' budget and outside one's.
         let daemon = Shepherd::ready_after(200).running(2);
 
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("completes");
+        let outcome = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("completes");
 
         assert_eq!(outcome, Outcome::Deployed { sha: second });
     }
@@ -2213,9 +2473,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
 
         let daemon = Shepherd::busy_for(3);
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("completes");
+        let outcome = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("completes");
 
         assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
         // The deploy's own reload, three refusals, then the one that took.
@@ -2243,7 +2508,7 @@ mod tests {
             &Shepherd::busy_for(u32::MAX),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("the rollback cannot reload");
@@ -2295,7 +2560,7 @@ mod tests {
             &Shepherd::flapping(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -2321,9 +2586,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::unregistered();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("the rollback cannot reload");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("the rollback cannot reload");
 
         assert!(!matches!(err, Error::Split { .. }), "{err:?}");
         assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
@@ -2350,9 +2620,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::ready();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("no probe to wait on");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("no probe to wait on");
 
         let shown = err.to_string();
         assert!(shown.contains("readiness_probe"), "{shown}");
@@ -2385,7 +2660,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -2412,7 +2687,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -2439,7 +2714,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("the build fails");
@@ -2466,7 +2741,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("no such branch");
@@ -2498,9 +2773,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::unreachable();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("the shepherd cannot be asked anything");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("the shepherd cannot be asked anything");
 
         assert!(matches!(err, Error::Protocol(_)), "{err:?}");
         assert_eq!(daemon.attempt_count(), 0, "no reload may be sent");
@@ -2510,6 +2790,288 @@ mod tests {
             "current must not be left on a release nothing verified"
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a `current` already naming the attempted release, with no
+    /// earlier link to put back, is left there after a failure before the
+    /// reload. That is the shape a deploy killed between its swap and its
+    /// record write leaves, and `undo_swap` used to return `Ok` for it with
+    /// `current` on a release nothing verified. The record still names the
+    /// good release, and that is what goes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_before_the_reload_puts_current_back_from_the_record() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        let attempted = commit_on_origin(&fixture, "second.txt");
+        // As a killed deploy leaves it: `current` already on the attempted
+        // release, the record still on the previous one.
+        swap::point_at(&fixture.tree.current(), &fixture.tree.release(&attempted))
+            .expect("point current at the attempted release");
+
+        let err = deploy(
+            &Shepherd::unreachable(),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("the shepherd cannot be asked anything");
+
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous)),
+            "current goes back to the release the record names"
+        );
+    }
+
+    /// fails if a `--watch` and a deploy's record write can drop each
+    /// other's update. Staged exactly: the record lock held as a deploy
+    /// holds it, `set_watch` waiting on another thread, a fresher
+    /// `deployed` written meanwhile, and after the release the record has
+    /// to carry both the fresh sha and the operator's `manual`. Before the
+    /// record lock, `set_watch`'s snapshot renamed over the fresh one.
+    #[test]
+    fn a_watch_set_while_a_deploy_writes_the_record_loses_nothing() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        fs::create_dir_all(tree.root()).expect("tree");
+        let mut state = State {
+            deployed: Some(fixtures::SHA.to_owned()),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("the record before");
+
+        let held = lock::hold_record(&tree).expect("the deploy's hold");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let operator = {
+            let home = home.path().to_owned();
+            std::thread::spawn(move || {
+                let result = set_watch(&Tree::for_sheep(&home, "web"), Watch::Manual);
+                tx.send(()).expect("report");
+                result
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "set_watch must wait for the record lock"
+        );
+
+        // The deploy's write, under its hold.
+        state.deployed = Some(fixtures::OTHER_SHA.to_owned());
+        state.write(&tree.state_file()).expect("the deploy's write");
+        drop(held);
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("set_watch lands");
+        operator.join().expect("thread").expect("sets");
+        let after = State::read(&tree.state_file()).expect("reads");
+        assert_eq!(after.deployed.as_deref(), Some(fixtures::OTHER_SHA));
+        assert_eq!(after.watch, Watch::Manual);
+    }
+
+    /// fails if a race stops being held. With the tree lock, `current`
+    /// moving under a deploy means an operator's hand or the release's own
+    /// build command did it, and a build that repoints `current` on every
+    /// run would be rebuilt every tick forever if its sha were not held.
+    #[tokio::test]
+    async fn a_raced_deploy_is_held_like_any_other_failure() {
+        let fixture = fixture_with_previous_release();
+        let mut state = fixture.state.clone();
+        let raced: Result<Outcome, Error> = Err(Error::Raced {
+            sheep: "web".to_owned(),
+            started: "a".to_owned(),
+            found: "b".to_owned(),
+        });
+
+        record(&fixture.tree, &mut state, fixtures::OTHER_SHA, &raced, 5).await;
+
+        assert_eq!(state.failed.as_deref(), Some(fixtures::OTHER_SHA));
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("reads")
+                .failed
+                .as_deref(),
+            Some(fixtures::OTHER_SHA)
+        );
+    }
+
+    /// fails if a `current` an operator repointed at something that is not a
+    /// release is taken as the rollback target. `previous` is the raw text
+    /// of the link, and a rollback onto `<tree>/anything` wrote
+    /// `deployed = "anything"` into the record, which `State::read` then
+    /// refused on every later command of every kind. The record's own release
+    /// is what a rollback returns to instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_current_that_names_no_release_is_not_a_rollback_target() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+        let elsewhere = fixture.tree.root().join("not-a-release");
+        fs::create_dir_all(&elsewhere).expect("a directory that is not a release");
+        swap::point_at(&fixture.tree.current(), &elsewhere).expect("repoint current by hand");
+
+        let outcome = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("rolled back onto the recorded release");
+
+        assert!(
+            matches!(&outcome, Outcome::RolledBack { to, .. } if *to == previous),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        State::read(&fixture.tree.state_file()).expect("the record is still readable");
+    }
+
+    /// fails if a deploy that LANDS puts back a `watch` the operator changed
+    /// while it ran. The deploy holds its `State` from its first read to
+    /// its last write, and the verified arm's write of it whole put a
+    /// mid-deploy `--watch manual` back to `auto`: the exact deploy the
+    /// operator was trying to make the last one for a while.
+    #[tokio::test(start_paused = true)]
+    async fn a_landed_deploy_keeps_the_watch_the_operator_set_meanwhile() {
+        let mut fixture = fixture_with_previous_release();
+        fixture.state.watch = Watch::Auto;
+        fixture
+            .state
+            .write(&fixture.tree.state_file())
+            .expect("watched");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(
+            &Shepherd::flipping_watch(fixture.tree.state_file()),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("lands");
+
+        assert!(matches!(outcome, Outcome::Deployed { .. }), "{outcome:?}");
+        let written = State::read(&fixture.tree.state_file()).expect("reads");
+        assert_eq!(
+            written.watch,
+            Watch::Manual,
+            "the operator's setting survives"
+        );
+        assert_eq!(
+            written.deployed.as_deref(),
+            Some(second.as_str()),
+            "and the deploy is recorded by the same write"
+        );
+    }
+
+    /// fails if `record`'s own write, the one a FAILED deploy makes, puts
+    /// back a `watch` the operator changed while it ran. The landed case
+    /// has its own test above; this drives `record` directly.
+    #[tokio::test]
+    async fn a_failed_deploys_record_write_keeps_the_watch_the_operator_set_meanwhile() {
+        let fixture = fixture_with_previous_release();
+        // The copy a deploy holds from its first read: watched.
+        let mut in_flight = fixture.state.clone();
+        in_flight.watch = Watch::Auto;
+
+        // The operator, mid-deploy.
+        let mut on_disk = fixture.state.clone();
+        on_disk.watch = Watch::Manual;
+        on_disk
+            .write(&fixture.tree.state_file())
+            .expect("--watch manual");
+
+        let failed: Result<Outcome, Error> = Err(Error::Build { status: Some(1) });
+        record(
+            &fixture.tree,
+            &mut in_flight,
+            fixtures::OTHER_SHA,
+            &failed,
+            5,
+        )
+        .await;
+
+        let written = State::read(&fixture.tree.state_file()).expect("reads");
+        assert_eq!(
+            written.watch,
+            Watch::Manual,
+            "the operator's setting survives"
+        );
+        assert_eq!(
+            written.failed.as_deref(),
+            Some(fixtures::OTHER_SHA),
+            "and the deploy's own fact is recorded"
+        );
+    }
+
+    /// fails if the release the record on DISK names can be reclaimed after
+    /// a verified deploy whose record could not be written. Memory names the
+    /// new sha then, disk still names the old one, and the old one is what
+    /// the next run rolls back to.
+    #[tokio::test]
+    async fn the_release_the_disk_record_names_is_spared_after_a_lost_write() {
+        let mut fixture = fixture_with_previous_release();
+        let old = fixture.state.deployed.clone().expect("a previous release");
+        // Three newer releases, all fresher than `old`, so that with
+        // `keep = 2` the old one is a candidate unless something spares it.
+        let mut newest = String::new();
+        for n in 0..3 {
+            newest = commit_on_origin(&fixture, &format!("release-{n}.txt"));
+            crate::git::fetch(
+                &fixture.tree.git(),
+                fixture.origin.path().to_str().expect("utf-8"),
+                fixtures::TEST_BUDGET,
+            )
+            .expect("fetch");
+            install_release(&fixture, &newest);
+        }
+        // Memory has moved on; disk has not.
+        fixture.state.deployed = Some(newest.clone());
+
+        let landed: Result<Outcome, Error> = Ok(Outcome::Deployed { sha: newest });
+        record(&fixture.tree, &mut fixture.state, "unused", &landed, 2).await;
+
+        assert!(
+            fixture.tree.release(&old).is_dir(),
+            "the release the disk record names must survive"
+        );
+    }
+
+    /// fails if a record that cannot be written after a verified deploy
+    /// turns the deploy into a failure. The release is up and serving, so
+    /// the outcome is `Deployed`; returning the write's error instead had
+    /// `record` write the sha into `failed` beside the same sha in
+    /// `deployed`. A directory at the record's path is what makes the
+    /// rename fail here.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_cannot_be_written_still_reports_deployed() {
+        let mut fixture = fixture_with_previous_release();
+        let head = commit_on_origin(&fixture, "second.txt");
+        let record = fixture.tree.state_file();
+        fs::remove_file(&record).expect("drop the record");
+        fs::create_dir(&record).expect("a directory where the record goes");
+
+        let outcome = deploy(
+            &Shepherd::ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("the deploy landed whatever the record did");
+
+        assert_eq!(outcome, Outcome::Deployed { sha: head.clone() });
+        assert_eq!(fixture.state.deployed.as_deref(), Some(head.as_str()));
+        assert_eq!(fixture.state.failed, None, "a landed sha is never held");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&head))
+        );
     }
 
     /// fails if a reload whose REPLY was lost is treated as one that never
@@ -2531,9 +3093,14 @@ mod tests {
         // The deploy's own reply is lost; the rollback's gets through.
         let daemon = Shepherd::losing_replies(1);
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("no reply came back");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("no reply came back");
 
         // Rolled back, not shrugged off: the deploy failed, and the error
         // says what is live again with the timeout still underneath it.
@@ -2572,7 +3139,7 @@ mod tests {
             &Shepherd::losing_replies(u32::MAX),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("no reload is ever confirmed");
@@ -2645,9 +3212,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::too_busy_to_start();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("the shepherd would not take the reload");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("the shepherd would not take the reload");
 
         assert!(!matches!(err, Error::Split { .. }), "{err:?}");
         assert!(err.to_string().contains("already being reloaded"), "{err}");
@@ -2673,9 +3245,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::never_ready();
 
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("completes");
+        let outcome = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("completes");
 
         assert!(matches!(outcome, Outcome::RolledBack { .. }));
         assert_eq!(
@@ -2703,9 +3280,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::describe_fails();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("describe fails");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("describe fails");
 
         // The deploy still failed, so this is still an error - but it
         // names the rollback, and the shepherd's own complaint is still
@@ -2762,9 +3344,14 @@ mod tests {
         assert_eq!(fixture.state.deployed.as_deref(), Some(live.as_str()));
 
         let daemon = Shepherd::never_ready();
-        let outcome = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect("completes");
+        let outcome = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("completes");
 
         assert_eq!(
             outcome,
@@ -2817,7 +3404,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("nothing usable to roll back to");
@@ -2859,7 +3446,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("nothing left to roll back to");
@@ -2895,7 +3482,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("refuses");
@@ -2937,7 +3524,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("nothing to roll back to");
@@ -2999,7 +3586,7 @@ mod tests {
             &Shepherd::never_ready(),
             &same_tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect_err("there is no other release to go back to");
@@ -3026,7 +3613,7 @@ mod tests {
             &Shepherd::never_ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("completes");
@@ -3056,10 +3643,10 @@ mod tests {
             &Shepherd::planting(stale),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
-        .expect_err("the swap back collides with the stale tmp link");
+        .expect_err("the swap back collides with the file in the way");
 
         assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
         let shown = err.to_string();
@@ -3099,9 +3686,14 @@ mod tests {
         commit_on_origin(&fixture, "second.txt");
         let daemon = Shepherd::never_ready();
 
-        let err = deploy(&daemon, &fixture.tree, &mut fixture.state, &test_config())
-            .await
-            .expect_err("current moved under it");
+        let err = deploy(
+            &daemon,
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("current moved under it");
 
         assert!(matches!(err, Error::Raced { .. }), "{err:?}");
         assert_eq!(daemon.reload_count(), 0, "no reload may be sent at all");
@@ -3123,13 +3715,14 @@ mod tests {
     /// unchanged.
     #[tokio::test]
     async fn setting_the_watch_mode_does_not_deploy() {
-        let mut fixture = fixture_with_previous_release();
+        let fixture = fixture_with_previous_release();
         let previous = fixture.state.deployed.clone().expect("a previous release");
         let second = commit_on_origin(&fixture, "second.txt");
 
-        set_watch(&fixture.tree, &mut fixture.state, Watch::Manual).expect("sets");
+        let (was, after) = set_watch(&fixture.tree, Watch::Manual).expect("sets");
 
-        assert_eq!(fixture.state.watch, Watch::Manual);
+        assert_eq!(was, fixture.state.watch, "what the record carried before");
+        assert_eq!(after.watch, Watch::Manual);
         assert_eq!(
             State::read(&fixture.tree.state_file())
                 .expect("deploy.toml was written")
@@ -3144,7 +3737,7 @@ mod tests {
             swap::resolve(&fixture.tree.current()).unwrap(),
             Some(fixture.tree.release(&previous))
         );
-        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+        assert_eq!(after.deployed.as_deref(), Some(previous.as_str()));
     }
 
     /// fails if a tree the cutover never landed on can be put under the
@@ -3155,23 +3748,22 @@ mod tests {
     /// because it is the direction out.
     #[tokio::test]
     async fn a_tree_the_cutover_never_landed_on_cannot_be_watched() {
-        let mut fixture = fixture_before_any_release();
+        let fixture = fixture_before_any_release();
 
-        let err = set_watch(&fixture.tree, &mut fixture.state, Watch::Auto).expect_err("refuses");
+        let err = set_watch(&fixture.tree, Watch::Auto).expect_err("refuses");
 
         let shown = err.to_string();
         assert!(shown.contains("never cut over"), "{shown}");
         assert!(shown.contains("shep-deploy setup web"), "{shown}");
-        assert_eq!(fixture.state.watch, Watch::Manual, "unchanged in memory");
         assert_eq!(
             State::read(&fixture.tree.state_file())
                 .expect("deploy.toml still reads")
                 .watch,
             Watch::Manual,
-            "and unchanged on disk"
+            "unchanged on disk"
         );
 
-        set_watch(&fixture.tree, &mut fixture.state, Watch::Manual).expect("manual is allowed");
+        set_watch(&fixture.tree, Watch::Manual).expect("manual is allowed");
     }
 
     /// fails if a prune failure fails the deploy that triggered it. The
@@ -3185,7 +3777,7 @@ mod tests {
     /// --force` on the directory that is still sitting there answers
     /// "is not a working tree" - the same failure an operator's own `rm -rf`
     /// on a release directory would leave behind.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_prune_failure_does_not_fail_the_deploy() {
         let mut fixture = fixture_with_previous_release();
         let first = fixture.state.deployed.clone().expect("a previous release");
@@ -3194,7 +3786,7 @@ mod tests {
             &Shepherd::ready(),
             &fixture.tree,
             &mut fixture.state,
-            &test_config(),
+            &fixtures::dog_config(),
         )
         .await
         .expect("second release verifies");

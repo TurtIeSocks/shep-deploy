@@ -24,6 +24,7 @@ jobs:
   release-plz-pr:
     name: Update release PR
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Never react to release-plz's own merge landing on main. The auto-merge
     # step below uses the PAT, and unlike a GITHUB_TOKEN push that DOES
     # retrigger this workflow, which closes a cycle: open release PR,

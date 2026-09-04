@@ -18,21 +18,25 @@
 //! upstream already runs arbitrary code the moment this dog runs `bun
 //! install`'s postinstall or `make build`, and pinning `script` in an
 //! override does not stop that - it only stops a *later* pull from moving
-//! the pointer. `user` and `group` are different in kind, not degree. A
-//! build cannot escalate to another unix user on its own; the daemon
-//! choosing which user a sheep's process runs as is the one privilege a
-//! Flockfile can grant that the build itself never could. So a *committed*
-//! Flockfile is refused outright the moment it sets either field on any app
-//! it declares - see [`refuse_repo_privilege`] - and the check runs against
-//! the committed document alone, before the override is even read, so an
-//! override cannot make the refusal disappear by also touching the same
-//! key. The override itself is under no such restriction: it is the
-//! operator's own file, and pinning `user`/`group` there is exactly the
-//! "pin it so upstream can never change it" mechanism every other field
-//! already gets.
+//! the pointer. What a build cannot reach on its own is the SHEPHERD's uid,
+//! and a handful of Flockfile fields make the shepherd act at it: `user`
+//! and `group` choose the uid an app runs as, an `exec` probe is a command
+//! the shepherd runs itself, `out_file` and `err_file` are paths the
+//! shepherd opens and truncates itself, and an `http` or `tcp` probe is a
+//! connection the shepherd makes itself. So a *committed* Flockfile is
+//! refused outright the moment it sets any of those on any app it declares
+//! (a loopback probe target excepted) - see [`refuse_repo_privilege`] - and
+//! the check runs against the committed document alone, before the
+//! override is even read, so an override cannot make the refusal disappear
+//! by also touching the same key. The override itself is under no such
+//! restriction: it is the operator's own file, and pinning `user` or a log
+//! path there is exactly the "pin it so upstream can never change it"
+//! mechanism every other field already gets.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use shep_client::shep_core::prelude::AppConfig;
@@ -40,6 +44,115 @@ use toml::{Table, Value};
 
 use crate::build::BuildSpec;
 use crate::error::Error;
+use crate::shared::{FromCheckout, is_eloop, o_nofollow, printable};
+
+/// The most a Flockfile may be, in bytes.
+///
+/// A mebibyte, which is a thousand times any real one. Both files are read
+/// whole and merged in memory, and both come from the deployed repository,
+/// so without a bound a commit could hand this dog a file large enough to
+/// hold the poll loop, and the tree's lock, for as long as it liked.
+const MAX_FLOCKFILE_BYTES: u64 = 1024 * 1024;
+
+/// The two Flockfiles of one release, read once and merged.
+///
+/// [`Merged::app_config`] and [`Merged::build_spec`] used to be free functions
+/// that each read and merged both files again; a deploy calls both, so every
+/// release was parsed twice. Reading
+/// through this type parses once and answers both questions from the same
+/// document, which is also the only way the two answers cannot disagree.
+#[derive(Debug)]
+pub struct Merged {
+    /// The committed document with the override merged over it.
+    doc: Value,
+    /// The release both were read from, for messages.
+    release: PathBuf,
+}
+
+/// Reads and merges `release`'s Flockfiles, refusing first if the committed
+/// one sets anything the shepherd acts on at its own uid.
+///
+/// # Errors
+/// [`Error::Io`], naming the failing path, if `Flockfile.toml` cannot be
+/// read or `Flockfile.override.toml` exists but cannot be read.
+/// [`Error::Config`] if either file is not valid TOML, is a symlink the
+/// repository committed, or is past [`MAX_FLOCKFILE_BYTES`]; if the
+/// committed file names one app twice; or if it sets, on any app, `user`,
+/// `group`, `out_file`, `err_file`, `watch`, an `exec` probe, a probe whose
+/// target is off loopback, or a probe spelled as anything but a table. See
+/// [`refuse_repo_privilege`] for why each is on the list.
+pub fn read(release: &Path, shared: &FromCheckout) -> Result<Merged, Error> {
+    Ok(Merged {
+        doc: merged_document(release, shared)?,
+        release: release.to_owned(),
+    })
+}
+
+impl Merged {
+    /// The [`AppConfig`] for `sheep`: the merged entry named `sheep`,
+    /// deserialised.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if no app named `sheep` exists after merging, or if
+    /// that app's table does not match [`AppConfig`]'s schema.
+    pub fn app_config(&self, sheep: &str) -> Result<AppConfig, Error> {
+        let app = select_app(&self.doc, sheep)?;
+        app.try_into().map_err(|source: toml::de::Error| {
+            Error::Config(format!(
+                "app {sheep:?} does not match shep's app schema: {}",
+                printable(source.message())
+            ))
+        })
+    }
+
+    /// The `[dog.deploy.build]` block, or the default (no command, which
+    /// [`crate::build::run`] treats as a no-op) if neither file declares
+    /// one.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if the block does not match [`BuildSpec`]'s schema -
+    /// an unknown key, or a value of the wrong type - or if either file still
+    /// carries a top-level `[build]`.
+    pub fn build_spec(&self) -> Result<BuildSpec, Error> {
+        let doc = self.doc.as_table();
+
+        // Refused rather than ignored, because ignoring it builds nothing and
+        // says nothing: a release whose build never ran, swapped in and
+        // reported as deployed. The old spelling is in this crate's own
+        // published README, so whoever meets this message is following
+        // instructions that were right at the time. Both files are named
+        // because the key can be in either: the override merges over the
+        // committed file before this looks.
+        if doc.is_some_and(|doc| doc.contains_key("build")) {
+            return Err(Error::Config(format!(
+                "{}: `[build]` moved to `[dog.deploy.build]`, in Flockfile.toml or \
+                 Flockfile.override.toml, whichever carries it. shep refuses a Flockfile with \
+                 a top-level `build` key, so the old spelling could not be registered with \
+                 `shep start` at all; `[dog]` is the table shep keeps for a dog's own config. \
+                 Rename the block.",
+                self.release.display()
+            )));
+        }
+
+        let Some(build) = doc
+            .and_then(|doc| doc.get("dog"))
+            .and_then(Value::as_table)
+            .and_then(|dogs| dogs.get("deploy"))
+            .and_then(Value::as_table)
+            .and_then(|deploy| deploy.get("build"))
+        else {
+            return Ok(BuildSpec::default());
+        };
+
+        build.clone().try_into().map_err(|source: toml::de::Error| {
+            Error::Config(format!(
+                "{}: `[dog.deploy.build]` does not match the build schema: {}",
+                self.release.display(),
+                printable(source.message())
+            ))
+        })
+    }
+}
 
 /// The [`AppConfig`] for `sheep`, built from `release`'s own Flockfile.
 ///
@@ -57,15 +170,12 @@ use crate::error::Error;
 /// file sets `user` or `group` on any app, if no app named `sheep` exists
 /// after merging, or if that app's table does not match [`AppConfig`]'s
 /// schema.
+///
+/// The deploy and the cutover read through [`read`] and ask both questions
+/// of one document; this one-question form is what the tests drive.
+#[cfg(test)]
 pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<AppConfig, Error> {
-    let merged = merged_document(release, shared)?;
-
-    let app = select_app(&merged, sheep)?;
-    app.try_into().map_err(|source: toml::de::Error| {
-        Error::Config(format!(
-            "app {sheep:?} does not match shep's app schema: {source}"
-        ))
-    })
+    read(release, &FromCheckout::of(shared.to_vec()))?.app_config(sheep)
 }
 
 /// The release's `[dog.deploy.build]` block, or the default (no command, which
@@ -97,57 +207,29 @@ pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<App
 /// [`Error::Config`] if the block does not match [`BuildSpec`]'s schema - an
 /// unknown key, or a value of the wrong type - or if the Flockfile still
 /// carries a top-level `[build]`.
+///
+/// As [`app_config`]: the one-question form, for the tests.
+#[cfg(test)]
 pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error> {
-    let merged = merged_document(release, shared)?;
-    let doc = merged.as_table();
-
-    // Refused rather than ignored, because ignoring it builds nothing and says
-    // nothing: a release whose build never ran, swapped in and reported as
-    // deployed. The old spelling is in this crate's own published README, so
-    // whoever meets this message is following instructions that were right at
-    // the time.
-    if doc.is_some_and(|doc| doc.contains_key("build")) {
-        return Err(Error::Config(format!(
-            "{}: `[build]` moved to `[dog.deploy.build]`. shep refuses a Flockfile with a \
-             top-level `build` key, so the old spelling could not be registered with \
-             `shep start` at all; `[dog]` is the table shep keeps for a dog's own \
-             config. Rename the block.",
-            release.display()
-        )));
-    }
-
-    let Some(build) = doc
-        .and_then(|doc| doc.get("dog"))
-        .and_then(Value::as_table)
-        .and_then(|dogs| dogs.get("deploy"))
-        .and_then(Value::as_table)
-        .and_then(|deploy| deploy.get("build"))
-    else {
-        return Ok(BuildSpec::default());
-    };
-
-    build.clone().try_into().map_err(|source: toml::de::Error| {
-        Error::Config(format!(
-            "{}: `[dog.deploy.build]` does not match the build schema: {source}",
-            release.display()
-        ))
-    })
+    read(release, &FromCheckout::of(shared.to_vec()))?.build_spec()
 }
 
 /// The committed Flockfile with the operator's override merged over it,
-/// refusing first if the committed file sets `user` or `group`.
+/// refusing first if the committed file sets anything the shepherd acts on
+/// at its own uid (see [`refuse_repo_privilege`]).
 ///
 /// Both public readers go through here, so the refusal applies whichever
 /// one was called and neither can see a document the other could not.
 ///
 /// # Errors
-/// As [`app_config`], minus the app-selection failures.
-fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
-    let committed = read_required(&release.join("Flockfile.toml"))?;
+/// As [`read`].
+fn merged_document(release: &Path, shared: &FromCheckout) -> Result<Value, Error> {
+    // The committed file is never followed through a symlink: it is the
+    // repository's, and the repository does not get to choose which file on
+    // this host the dog reads. See `read_flockfile`.
+    let committed = read_required(&release.join("Flockfile.toml"), Follow::Never)?;
     refuse_repo_privilege(&committed)?;
-
-    let override_path = release.join(OVERRIDE);
-    let override_doc = read_optional(&override_path)?;
+    refuse_duplicate_apps(&committed)?;
 
     // The override is exempt from the privilege refusal only because it is the
     // OPERATOR's file, and that has to be established rather than assumed. A
@@ -157,58 +239,57 @@ fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
     //
     // Asked of `shared`, the list of paths the caller just linked in from the
     // operator's checkout, because that is the only record of where a file
-    // came from. See `is_operators` for the two filesystem-based versions of
-    // this check that came before, and why neither could work.
-    if !is_operators(shared) {
+    // came from. Only `shared::to_link` can build that list, which is what
+    // makes the answer evidence rather than a claim; its doc records the
+    // filesystem-based versions of this check that came before, and why
+    // none of them could work.
+    //
+    // Decided BEFORE the read, because it also decides whether the read may
+    // follow a symlink: the operator's override IS one, into their checkout,
+    // and a committed one must not be.
+    let operators = shared.includes_override();
+    let override_path = release.join(OVERRIDE);
+    let override_doc = read_optional(
+        &override_path,
+        if operators {
+            Follow::Operators
+        } else {
+            Follow::Never
+        },
+    )?;
+    if !operators {
         refuse_repo_privilege(&override_doc)?;
     }
 
     Ok(deep_merge(committed, override_doc))
 }
 
-/// Whether the override in this release is the operator's own file.
-///
-/// Answered from the list of paths the caller just shared, not from the
-/// filesystem. Three versions of this check asked the filesystem and all three
-/// were wrong, the last one subtly enough to be worth recording.
-///
-/// It required the override to resolve OUTSIDE the release, on the grounds
-/// that the operator's arrives as a symlink into their checkout. A repository
-/// can satisfy that in two commits. Release A ships an ordinary tracked file
-/// holding `user = "root"` under some innocuous name, and goes live, which by
-/// this crate's own invariant means `current` points at it. Release B then
-/// commits `Flockfile.override.toml` as a symlink to
-/// `../../current/.deploy-payload.toml`. That resolves into release A, which
-/// is outside release B, so the check passed and the refusal was skipped.
-/// Demonstrated 2026-08-28.
-///
-/// The lesson is not that the rule needed another clause. It is that
-/// provenance cannot be recovered from a path once the path exists: whoever
-/// can write the tree can write the evidence. `crate::shared::link_into` is
-/// the only thing that knows which files came from the operator's checkout,
-/// because it is what put them there, so the answer travels from its caller
-/// instead of being reconstructed here.
-fn is_operators(shared: &[PathBuf]) -> bool {
-    shared.iter().any(|p| p == Path::new(OVERRIDE))
-}
-
-/// The override's name, in the one place both the check and the read use it.
+/// The override's name, in the one place the check and the read use it.
 ///
 /// `crate::shared::to_link` needs it too, to keep a repo-committed
-/// `.shepignore` from filtering the operator's own file out of the list this
-/// module then treats as proof of provenance.
+/// `.shepignore` from filtering the operator's own file out of the list
+/// `FromCheckout::includes_override` then answers from.
 pub(crate) const OVERRIDE: &str = "Flockfile.override.toml";
+
+/// Whether a Flockfile read may follow a symlink.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// The file is the operator's, linked in from their checkout, so the
+    /// link is the whole point.
+    Operators,
+    /// The file is the repository's, and a link is refused: see
+    /// [`read_flockfile`].
+    Never,
+}
 
 /// Reads and parses a Flockfile that must exist.
 ///
 /// # Errors
 /// [`Error::Io`] if `path` cannot be read at all. [`Error::Config`] if its
-/// contents are not valid TOML.
-fn read_required(path: &Path) -> Result<Value, Error> {
-    let text = fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_owned(),
-        source,
-    })?;
+/// contents are not valid TOML, if it is a symlink and `follow` says not to
+/// follow one, or if it is past [`MAX_FLOCKFILE_BYTES`].
+fn read_required(path: &Path, follow: Follow) -> Result<Value, Error> {
+    let text = read_flockfile(path, follow)?;
     parse(path, &text)
 }
 
@@ -218,61 +299,306 @@ fn read_required(path: &Path) -> Result<Value, Error> {
 /// `.shepignore`. `Flockfile.override.toml` is optional by design.
 ///
 /// # Errors
-/// [`Error::Io`] if `path` exists but cannot be read. [`Error::Config`] if
-/// its contents are not valid TOML.
-fn read_optional(path: &Path) -> Result<Value, Error> {
-    match fs::read_to_string(path) {
+/// As [`read_required`], except that an absent file is an empty document.
+fn read_optional(path: &Path, follow: Follow) -> Result<Value, Error> {
+    match read_flockfile(path, follow) {
         Ok(text) => parse(path, &text),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Value::Table(Table::new())),
-        Err(source) => Err(Error::Io {
-            path: path.to_owned(),
-            source,
-        }),
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(Value::Table(Table::new()))
+        }
+        Err(err) => Err(err),
     }
 }
 
-/// Parses `text` as a generic TOML document, naming `path` in the error if
-/// it does not parse.
-fn parse(path: &Path, text: &str) -> Result<Value, Error> {
-    toml::from_str(text).map_err(|source| Error::Config(format!("{}: {source}", path.display())))
+/// Reads one Flockfile whole, bounded, and without following a symlink
+/// unless the file is the operator's.
+///
+/// The symlink refusal is a security boundary rather than tidiness. This
+/// read runs in the dog's own process at its own uid, which under the
+/// arrangement shep's docs recommend is root, and it runs BEFORE any build
+/// drops to `user`. `git worktree add` materialises a committed symlink
+/// exactly as committed, so `Flockfile.toml -> /root/.ssh/id_rsa` in the
+/// tracked branch had this read the key, fail to parse it, and print its
+/// first line into the log through the parser's own error. `user` is the
+/// one bound this crate names as covering what a build can READ, and a
+/// commit walked around it without running a build at all. Found in review
+/// on 2026-09-03.
+///
+/// `O_NOFOLLOW` makes the kernel refuse the open when the last component is
+/// a link. A component above it is not this function's concern: those are
+/// the release directory and the tree, which only this dog writes.
+///
+/// # Errors
+/// [`Error::Config`] naming `path` if it is a symlink this read may not
+/// follow, or if it is larger than [`MAX_FLOCKFILE_BYTES`]. [`Error::Io`]
+/// naming `path` for anything else, `NotFound` included.
+fn read_flockfile(path: &Path, follow: Follow) -> Result<String, Error> {
+    let at = |source| Error::Io {
+        path: path.to_owned(),
+        source,
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    if follow == Follow::Never {
+        options.custom_flags(o_nofollow());
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if is_eloop(&source) => {
+            return Err(Error::Config(format!(
+                "{} is a symlink, and a Flockfile the repository commits has to be a regular \
+                 file: this dog reads it at its own uid before any build drops privilege, so a \
+                 link could point it at any file on the host. Commit the file itself.",
+                path.display()
+            )));
+        }
+        Err(source) => return Err(at(source)),
+    };
+
+    let len = file.metadata().map_err(at)?.len();
+    if len > MAX_FLOCKFILE_BYTES {
+        return Err(Error::Config(format!(
+            "{} is {len} bytes, past the {MAX_FLOCKFILE_BYTES}-byte limit for a Flockfile. A \
+             real one is a few hundred bytes; this dog reads and merges both files in memory \
+             on every deploy.",
+            path.display()
+        )));
+    }
+
+    let mut text = String::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.read_to_string(&mut text).map_err(at)?;
+    Ok(text)
 }
 
-/// The one real boundary this module enforces: refuses if any app declared
-/// in `committed` sets `user` or `group` at all, regardless of what value it
-/// names.
+/// Parses `text` as a generic TOML document, naming `path` and the line in
+/// the error if it does not parse.
+///
+/// The parser's own `Display` quotes the offending line back, which is
+/// right for a file the reader wrote and wrong for one the repository did:
+/// the read above refuses a symlink so that no file on the host can reach
+/// this parser, and this keeps the text out of the log in case one ever
+/// does. The message and the line number are what an operator needs; the
+/// line's text is in the file.
+fn parse(path: &Path, text: &str) -> Result<Value, Error> {
+    toml::from_str(text).map_err(|source| {
+        // Counted over bytes, because a span's start is a byte offset and
+        // slicing a `str` at a byte that is not a character boundary panics,
+        // on text the repository wrote.
+        let line = source.span().map(|span| {
+            let upto = span.start.min(text.len());
+            text.as_bytes()[..upto]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                + 1
+        });
+        // `printable`, because serde's own message carries the offending
+        // key by name, and a TOML key can be any quoted string.
+        let message = printable(source.message());
+        Error::Config(match line {
+            Some(line) => format!("{}: {message}, at line {line}", path.display()),
+            None => format!("{}: {message}", path.display()),
+        })
+    })
+}
+
+/// The boundary this module enforces: refuses a committed Flockfile that
+/// sets any field the DAEMON acts on at its own uid, on any app it declares.
+///
+/// `user` and `group` were the whole list until 2026-09-04, on the theory
+/// that privilege was the one thing a build could not reach on its own. A
+/// read of shep-daemon found three more fields the daemon itself acts on,
+/// without ever dropping privilege, so a committed value reaches the
+/// shepherd's uid, which shep's own docs recommend be root:
+///
+/// - A `readiness_probe` or `liveness_probe` of kind `exec` is run by the
+///   daemon through `sh -c`, on the probe's interval (ten seconds by
+///   default), forever, with no uid drop at all. It ignores `user` even
+///   when the app sets one. A committed one is a root shell on a timer.
+/// - `out_file` and `err_file` are opened, created and appended to by the
+///   daemon's own log pump, and `shep flush` truncates them, at the
+///   daemon's uid. shep guards the final path component against a symlink
+///   and refuses a loosely owned ancestry, and nothing else: a committed
+///   `out_file = "/etc/cron.d/shep"` is appended to with whatever the app
+///   prints, and emptied on `shep flush`.
+/// - An `http` or `tcp` probe is connected to from the daemon's own network
+///   position. Only the verdict leaks, so it is a blind primitive rather
+///   than a read, and a committed target on loopback is the ordinary shape
+///   of a health check; one anywhere else is refused.
+/// - `watch` has the daemon watch the app's working directory recursively,
+///   as itself, following symlinks (notify's default). A committed link out
+///   of the release has a root shepherd walk and watch whatever it points
+///   at, up to the whole host, and restart the app on any change there.
 ///
 /// Takes the *committed* document specifically, never the merged one. If
 /// this ran against the merged document instead, a legitimate use of the
-/// mechanism - an operator pinning `user` in their own override - would
-/// look identical to the thing being refused, since the merged document
-/// would carry the key either way. Checking the committed document alone,
-/// before the override is even read, keeps the two apart: the committed
-/// file can never carry the key, full stop, and the override remains free
-/// to set it precisely because it is the operator's own file and never came
-/// from the repo.
+/// mechanism - an operator pinning `user` or a log path in their own
+/// override - would look identical to the thing being refused, since the
+/// merged document would carry the key either way. Checking the committed
+/// document alone, before the override is even read, keeps the two apart:
+/// the committed file can never carry these, full stop, and the override
+/// remains free to set them precisely because it is the operator's own file
+/// and never came from the repo.
+///
+/// What this does NOT do is refuse a committed Flockfile that OMITS `user`.
+/// That app runs at the daemon's uid, and so does its build; `build::run`
+/// warns about it and does not refuse, which is Rin's call: whether an app
+/// runs without a `user` is shep's and the operator's, not a deploy dog's.
 ///
 /// # Errors
-/// [`Error::Config`] naming the field and the app, if any app in `committed`
-/// sets `user` or `group`.
+/// [`Error::Config`] naming the field and the app, for the first app in
+/// `committed` that sets one of them.
 fn refuse_repo_privilege(committed: &Value) -> Result<(), Error> {
     for app in apps(committed) {
         let Some(table) = app.as_table() else {
             continue;
         };
+        let name = table
+            .get("name")
+            .and_then(Value::as_str)
+            .map(printable)
+            .unwrap_or_else(|| "<unnamed>".to_owned());
+        let refuse = |field: &str, why: &str| {
+            Error::Config(format!(
+                "Flockfile.toml sets `{field}` on app {name:?}: {why}. A committed Flockfile \
+                 can never set it, on any app, because the shepherd acts on it at its own uid \
+                 and a build cannot reach that on its own. Pin `{field}` in \
+                 Flockfile.override.toml instead - it is gitignored and never comes from the \
+                 repo."
+            ))
+        };
+
         for field in ["user", "group"] {
             if table.contains_key(field) {
-                let name = table
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unnamed>");
-                return Err(Error::Config(format!(
-                    "Flockfile.toml sets `{field}` on app {name:?} - a committed Flockfile can \
-                     never set user or group, on any app, because privilege is the one thing a \
-                     compromised build cannot escalate to on its own. Pin `{field}` in \
-                     Flockfile.override.toml instead - it is gitignored and never comes from the \
-                     repo."
-                )));
+                return Err(refuse(
+                    field,
+                    "privilege is the one thing a compromised build cannot escalate to",
+                ));
             }
+        }
+        for field in ["out_file", "err_file"] {
+            if table.contains_key(field) {
+                return Err(refuse(
+                    field,
+                    "the shepherd opens, appends to and on `shep flush` truncates that path \
+                     itself, at its own uid, with no check on where it points",
+                ));
+            }
+        }
+        if table.contains_key("watch") {
+            return Err(refuse(
+                "watch",
+                "the shepherd watches the app's whole working directory itself, at its own \
+                 uid, following symlinks, so a committed link out of the release has it walk \
+                 and watch whatever the link points at",
+            ));
+        }
+        for field in ["readiness_probe", "liveness_probe"] {
+            // Presence first, shape second. serde deserialises a struct from a
+            // sequence as well as a table, so `readiness_probe = ["exec", "cmd"]`
+            // is a valid probe to shep, and a walk that only looked at tables
+            // let it through untouched. Measured 2026-09-04.
+            let Some(value) = table.get(field) else {
+                continue;
+            };
+            let Some(probe) = value.as_table() else {
+                return Err(refuse(
+                    field,
+                    "a probe the committed file spells as anything but a table is one this \
+                     check cannot read, and shep would accept it",
+                ));
+            };
+            let (Some(kind), Some(target)) = (
+                probe.get("kind").and_then(Value::as_str),
+                probe.get("target").and_then(Value::as_str),
+            ) else {
+                return Err(refuse(
+                    field,
+                    "a probe whose `kind` or `target` is not a string is one this check \
+                     cannot read",
+                ));
+            };
+            if kind == "exec" {
+                return Err(refuse(
+                    field,
+                    "an exec probe is run by the shepherd through `sh -c` on the probe's \
+                     interval, forever, at the shepherd's own uid and ignoring `user`",
+                ));
+            }
+            if !probes_loopback(kind, target) {
+                return Err(refuse(
+                    field,
+                    "the shepherd connects to the probe's target from its own network \
+                     position, so a committed target has to be on loopback: `127.0.0.1`, \
+                     `::1` or `localhost`",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an `http` or `tcp` probe `target` names this host.
+///
+/// `http` targets are URLs and `tcp` targets are `host:port`; either way
+/// the host is what matters, and the daemon is the one connecting to it.
+/// Loopback by name or number, IPv4 or IPv6, with or without a port or a
+/// path. Anything the parser does not recognise is not loopback: the
+/// refusal costs an operator one line in their override, and a miss here
+/// costs a blind connection from the shepherd to wherever the commit said.
+fn probes_loopback(kind: &str, target: &str) -> bool {
+    let host_and_rest = match kind {
+        "http" => target
+            .split_once("://")
+            .map_or(target, |(_, rest)| rest)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(""),
+        "tcp" => target,
+        _ => return false,
+    };
+    // Strip credentials, then a port. An IPv6 literal is bracketed.
+    let host = host_and_rest.rsplit('@').next().unwrap_or("");
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                h
+            } else {
+                host
+            }
+        })
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host.starts_with("127.")
+            && host.split('.').count() == 4
+            && host.split('.').all(|octet| octet.parse::<u8>().is_ok())
+}
+
+/// Refuses a committed Flockfile that declares one app name twice.
+///
+/// Two entries named `web` are two answers to "which one is the sheep", and
+/// every reader here has to pick the same one. `select_app` takes the first;
+/// `merge_apps` used to index by name with the last winning, so the
+/// operator's override, `user` pin included, was merged onto an entry
+/// nobody then read. Refusing the shape is simpler than making every reader
+/// agree, and shep itself would not accept the file either.
+///
+/// # Errors
+/// [`Error::Config`] naming the app, if any name appears more than once.
+fn refuse_duplicate_apps(committed: &Value) -> Result<(), Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for app in apps(committed) {
+        if let Some(name) = app_name(app)
+            && !seen.insert(name)
+        {
+            return Err(Error::Config(format!(
+                "Flockfile.toml declares an app named {:?} more than once; one entry per name",
+                printable(name)
+            )));
         }
     }
     Ok(())
@@ -344,18 +670,35 @@ fn merge_apps(base: Value, over: Value) -> Value {
         _ => Vec::new(),
     };
 
+    // Indexed once rather than scanned per override entry. Both arrays come
+    // from the repository, and a scan per entry made the merge quadratic in
+    // files nothing else bounds the length of.
+    //
+    // First wins on a repeated name, the way `select_app` reads the array.
+    // `collect` into a map keeps the LAST, which put an override onto an
+    // entry nothing then read; `refuse_duplicate_apps` stops the shape at the
+    // door, and this keeps the two readers agreeing even so.
+    let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, app) in base_apps.iter().enumerate() {
+        if let Some(name) = app_name(app) {
+            by_name.entry(name.to_owned()).or_insert(index);
+        }
+    }
+
     for over_app in over_apps {
-        let name = app_name(&over_app).map(str::to_owned);
-        let existing = name
-            .as_deref()
-            .and_then(|name| base_apps.iter().position(|app| app_name(app) == Some(name)));
+        let existing = app_name(&over_app).and_then(|name| by_name.get(name).copied());
 
         match existing {
             Some(index) => {
-                let base_app = base_apps.remove(index);
-                base_apps.insert(index, deep_merge(base_app, over_app));
+                let base_app = std::mem::replace(&mut base_apps[index], Value::Table(Table::new()));
+                base_apps[index] = deep_merge(base_app, over_app);
             }
-            None => base_apps.push(over_app),
+            None => {
+                if let Some(name) = app_name(&over_app) {
+                    by_name.entry(name.to_owned()).or_insert(base_apps.len());
+                }
+                base_apps.push(over_app);
+            }
         }
     }
 
@@ -381,6 +724,303 @@ fn select_app(merged: &Value, sheep: &str) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a committed Flockfile that is a symlink is read at all.
+    ///
+    /// `git worktree add` materialises a committed symlink exactly as
+    /// committed, and this read runs at the dog's own uid before any build
+    /// drops privilege. `Flockfile.toml -> <any file root can read>` then had
+    /// the parser fail on that file and quote its first line into the log.
+    /// The assertion is on the secret NOT being in the message: an error
+    /// alone is what the vulnerable version returned too, after reading it.
+    #[test]
+    fn a_committed_flockfile_that_is_a_symlink_is_refused_unread() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let secret = rel.path().join("outside.txt");
+        std::fs::write(&secret, "-----BEGIN SECRET-----\nnot toml\n").expect("secret");
+        std::os::unix::fs::symlink(&secret, rel.path().join("Flockfile.toml")).expect("link");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("a link must be refused");
+
+        let shown = err.to_string();
+        assert!(matches!(err, Error::Config(_)), "{shown}");
+        assert!(shown.contains("symlink"), "must say why: {shown}");
+        assert!(
+            !shown.contains("SECRET"),
+            "must not quote the file: {shown}"
+        );
+    }
+
+    /// fails if a committed Flockfile can hand the shepherd a command to run
+    /// as itself. An `exec` probe is run by the daemon through `sh -c`, on
+    /// its interval, with no uid drop and no regard for `user`: a root shell
+    /// every ten seconds. Read out of shep-daemon on 2026-09-04.
+    #[test]
+    fn a_committed_exec_probe_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n[app.readiness_probe]\nkind = \
+             \"exec\"\ntarget = \"curl -fs http://127.0.0.1/health\"\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("an exec probe");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("readiness_probe") && shown.contains("sh -c"),
+            "{shown}"
+        );
+    }
+
+    /// fails if a probe spelled as a sequence walks past the check. serde
+    /// builds a struct from `["exec", "cmd"]` as readily as from a table,
+    /// and a walk that only read tables let exactly that through, with the
+    /// `exec` refusal and the loopback rule both defeated. Measured
+    /// 2026-09-04: `app_config` returned a `ProbeConfig { kind: Exec, .. }`.
+    #[test]
+    fn a_committed_probe_spelled_as_a_sequence_is_refused() {
+        for probe in [
+            "readiness_probe = [\"exec\", \"id > /tmp/pwn\"]",
+            "readiness_probe = [\"http\", \"http://metadata.internal/\"]",
+            "liveness_probe = \"exec\"",
+        ] {
+            let rel = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                rel.path().join("Flockfile.toml"),
+                format!("[[app]]\nname = \"web\"\nscript = \"./run\"\n{probe}\n"),
+            )
+            .expect("committed");
+
+            let err = app_config(rel.path(), "web", &[]).expect_err(probe);
+            assert!(err.to_string().contains("_probe"), "{probe}: {err}");
+        }
+    }
+
+    /// fails if a committed `watch` reaches the shepherd. It watches the
+    /// working directory as itself, following symlinks, so a committed link
+    /// out of the release has it walk whatever the link points at.
+    #[test]
+    fn a_committed_watch_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\nwatch = true\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("watch");
+        assert!(err.to_string().contains("`watch`"), "{err}");
+    }
+
+    /// fails if a committed Flockfile can point the shepherd's log pump at a
+    /// path of its choosing. The daemon opens and appends to `out_file` at
+    /// its own uid and `shep flush` truncates it, with no check on where it
+    /// points.
+    #[test]
+    fn a_committed_log_path_is_refused() {
+        for field in ["out_file", "err_file"] {
+            let rel = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                rel.path().join("Flockfile.toml"),
+                format!(
+                    "[[app]]\nname = \"web\"\nscript = \"./run\"\n{field} = \"/etc/cron.d/x\"\n"
+                ),
+            )
+            .expect("committed");
+
+            let err = app_config(rel.path(), "web", &[]).expect_err(field);
+            let shown = err.to_string();
+            assert!(
+                shown.contains(field) && shown.contains("truncates"),
+                "{shown}"
+            );
+        }
+    }
+
+    /// fails if a committed probe can send the shepherd's connection
+    /// anywhere but this host, or if a loopback one is refused. A health
+    /// check of the app itself is on loopback; the cloud metadata address is the
+    /// cloud metadata service, reached from the daemon's network position.
+    #[test]
+    fn a_committed_network_probe_must_target_loopback() {
+        let refused = [
+            ("http", "http://metadata.internal/latest/meta-data"),
+            ("http", "http://internal.example:8080/"),
+            ("tcp", "192.0.2.5:5432"),
+            ("tcp", "db:5432"),
+            ("http", "http://127.0.0.1.evil.example/"),
+            ("http", "http://localhost@evil.example/"),
+        ];
+        for (kind, target) in refused {
+            assert!(
+                !probes_loopback(kind, target),
+                "{kind} {target} must be refused"
+            );
+        }
+        let allowed = [
+            ("http", "http://127.0.0.1:3000/health"),
+            ("http", "http://localhost/health?deep=1"),
+            ("http", "https://[::1]:8443/"),
+            ("http", "http://user:pw@127.0.0.1/"),
+            ("tcp", "127.0.0.1:5432"),
+            ("tcp", "localhost:6379"),
+            ("tcp", "[::1]:80"),
+        ];
+        for (kind, target) in allowed {
+            assert!(
+                probes_loopback(kind, target),
+                "{kind} {target} must be allowed"
+            );
+        }
+
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n[app.readiness_probe]\nkind = \
+             \"http\"\ntarget = \"http://metadata.internal/\"\n",
+        )
+        .expect("committed");
+        let err = app_config(rel.path(), "web", &[]).expect_err("off-host target");
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    /// fails if the operator's own override loses any of the fields the
+    /// committed file is refused. The override is the operator's, and
+    /// these are exactly the things they pin there.
+    #[test]
+    fn the_operators_override_may_set_every_refused_field() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::fs::write(
+            checkout.path().join(OVERRIDE),
+            "[[app]]\nname = \"web\"\nuser = \"svc\"\nout_file = \"/var/log/web.log\"\n\
+             [app.readiness_probe]\nkind = \"exec\"\ntarget = \"./healthy\"\n",
+        )
+        .expect("the operator's override");
+        std::os::unix::fs::symlink(checkout.path().join(OVERRIDE), rel.path().join(OVERRIDE))
+            .expect("linked in");
+
+        let app = app_config(rel.path(), "web", &[PathBuf::from(OVERRIDE)])
+            .expect("the operator may set all of them");
+        assert_eq!(app.user.as_deref(), Some("svc"));
+        assert_eq!(app.out_file.as_deref(), Some("/var/log/web.log"));
+        assert!(app.readiness_probe.is_some());
+    }
+
+    /// fails if a committed Flockfile naming one app twice is accepted.
+    ///
+    /// Found in round two of the review: the indexed merge kept the LAST
+    /// entry for a repeated name while `select_app` read the first, so the
+    /// operator's override, `user` pin included, landed on an entry nobody
+    /// read and the sheep started at the dog's own uid. Refused by name now,
+    /// and the index keeps the first regardless.
+    #[test]
+    fn a_committed_flockfile_naming_an_app_twice_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./a\"\n[[app]]\nname = \"web\"\nscript = \"./b\"\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("two apps named web");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("web") && shown.contains("more than once"),
+            "{shown}"
+        );
+    }
+
+    /// fails if a message quotes a repository-chosen key with its control
+    /// characters intact. serde names an unknown field in its message, and
+    /// a TOML key can be any quoted string, so a committed
+    /// `"\u001b[2J" = 1` used to write a terminal escape into the log.
+    #[test]
+    fn a_parser_message_never_carries_a_control_character() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./a\"\n[dog.deploy.build]\n\"a\\u001bb\" = 1\n",
+        )
+        .expect("committed");
+
+        let err = build_spec(rel.path(), &[]).expect_err("an unknown build key");
+        let shown = err.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(
+            shown.contains("a?b"),
+            "the key is still recognisable: {shown}"
+        );
+    }
+
+    /// fails if the operator's own override stops resolving through the
+    /// symlink `shared::link_into` made for it. Refusing every link would
+    /// have broken the one legitimate case, which is the whole mechanism.
+    #[test]
+    fn the_operators_override_is_still_followed() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::fs::write(
+            checkout.path().join(OVERRIDE),
+            "[[app]]\nname = \"web\"\nuser = \"svc\"\n",
+        )
+        .expect("the operator's override");
+        std::os::unix::fs::symlink(checkout.path().join(OVERRIDE), rel.path().join(OVERRIDE))
+            .expect("linked in, as link_into does");
+
+        let app = app_config(rel.path(), "web", &[PathBuf::from(OVERRIDE)])
+            .expect("the operator's link resolves");
+        assert_eq!(app.user.as_deref(), Some("svc"));
+    }
+
+    /// fails if a parse error quotes the offending line. The read refuses a
+    /// symlink so no file on the host can reach the parser, and this is the
+    /// second wall: even a file that does reach it is described by line
+    /// number, not by content.
+    #[test]
+    fn a_parse_error_names_the_line_and_not_its_text() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\n-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("not toml");
+
+        let shown = err.to_string();
+        assert!(shown.contains("line 3"), "must name the line: {shown}");
+        assert!(!shown.contains("OPENSSH"), "must not quote it: {shown}");
+    }
+
+    /// fails if a Flockfile of any size is read whole. Both files come from
+    /// the repository and are merged in memory on every deploy, with the
+    /// tree's lock held.
+    #[test]
+    fn a_flockfile_past_the_size_limit_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let mut big = String::from("[[app]]\nname = \"web\"\nscript = \"./run\"\n");
+        big.push_str(&"# padding\n".repeat(120_000));
+        assert!(
+            big.len() as u64 > MAX_FLOCKFILE_BYTES,
+            "the fixture must exceed the limit"
+        );
+        std::fs::write(rel.path().join("Flockfile.toml"), big).expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("too big");
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
+
     /// fails if a committed override can grant a unix user.
     ///
     /// The override is exempt from `refuse_repo_privilege` because it is the
@@ -418,7 +1058,7 @@ mod tests {
 
     /// fails if a repository can buy the exemption with a symlink out.
     ///
-    /// The escape the previous version of `is_operators` allowed, in two
+    /// The escape the previous version of the provenance check allowed, in two
     /// commits and needing nothing from the operator. Release A ships an
     /// ordinary tracked file holding `user = "root"` and goes live, so
     /// `current` points at it. Release B commits `Flockfile.override.toml` as
@@ -428,6 +1068,10 @@ mod tests {
     ///
     /// It is the reason provenance now comes from the share list rather than
     /// from the filesystem: whoever can write the tree can write the evidence.
+    /// Since 2026-09-03 the link is refused before its target is read at all,
+    /// because a committed override is read without following symlinks; the
+    /// privilege refusal behind it is pinned by
+    /// `a_committed_override_cannot_grant_a_user`.
     #[test]
     fn a_committed_symlink_out_of_the_release_buys_no_exemption() {
         let tree = tempfile::tempdir().expect("tempdir");
@@ -457,9 +1101,14 @@ mod tests {
         // Nothing was shared, so nothing is the operator's.
         let err =
             app_config(&b, "web", &[]).expect_err("a committed symlink must not buy the exemption");
+        let shown = format!("{err}");
         assert!(
-            format!("{err}").contains("user"),
-            "the refusal must name the field: {err}"
+            shown.contains("symlink"),
+            "the link is refused before it is followed: {shown}"
+        );
+        assert!(
+            !shown.contains("root"),
+            "and nothing of the payload is read: {shown}"
         );
     }
 
@@ -549,7 +1198,7 @@ mod tests {
     /// The override deliberately does NOT name `user`. It did, set to
     /// `nobody`, on the theory that a laundered merge would be the shape
     /// worth catching. That made the test vacuous: `shared` is empty here, so
-    /// `is_operators` is false, so `merged_document` runs
+    /// `includes_override` is false, so `merged_document` runs
     /// `refuse_repo_privilege` against the override document too, and THAT
     /// check produced the error being asserted on. Deleting the
     /// committed-document check left the test passing. Found in round 8 of

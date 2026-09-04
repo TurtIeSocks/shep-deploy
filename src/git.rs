@@ -81,10 +81,7 @@ fn path_str(path: &Path) -> Result<&str, Error> {
 /// [`Error::Io`], naming `git_dir`, if it cannot be created or is not
 /// valid UTF-8. [`Error::Git`] if `git init` refuses.
 pub fn init_bare(git_dir: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(git_dir).map_err(|source| Error::Io {
-        path: git_dir.to_owned(),
-        source,
-    })?;
+    std::fs::create_dir_all(git_dir).map_err(Error::at(git_dir))?;
     run_git(git_dir, &["init", "-q", "--bare"]).map(|_| ())
 }
 
@@ -174,13 +171,36 @@ pub fn current_branch(checkout: &Path) -> Result<String, Error> {
 /// an operator needs to be told that, not left to infer it from a target
 /// that silently never updates again.
 ///
+/// `--` before `remote`, so it is only ever read as a URL. Without it a
+/// `remote` beginning with `-` is an option, and `--upload-pack=<command>` is
+/// one git honours: it runs the command. `remote` comes out of `deploy.toml`,
+/// which an operator edits by hand, and out of their checkout's own `origin`,
+/// so nothing hostile is expected there; the separator costs nothing and
+/// closes the door anyway. Measured 2026-09-03: `git fetch -- <url> <refspec>`
+/// behaves exactly as the form without it.
+///
 /// # Errors
 /// [`Error::Git`] if `remote` cannot be reached or refuses the fetch.
 /// [`Error::Io`] if `git` itself cannot be launched.
 pub fn fetch(git_dir: &Path, remote: &str, budget: Duration) -> Result<(), Error> {
     run_git_within(
         git_dir,
-        &["fetch", "--prune", remote, "+refs/heads/*:refs/heads/*"],
+        &[
+            // `ext::<command>` is a git transport that runs the command. git
+            // refuses it by default, and this pins that whatever the host's
+            // own git config says (a `GIT_ALLOW_PROTOCOL` in this process's
+            // environment is consulted ahead of config and is the
+            // operator's to set), so a `remote` can only ever be a place to
+            // fetch from. Measured 2026-09-03: refused with and without
+            // this on a stock git; the line is for the host that is not.
+            "-c",
+            "protocol.ext.allow=never",
+            "fetch",
+            "--prune",
+            "--",
+            remote,
+            "+refs/heads/*:refs/heads/*",
+        ],
         budget,
     )
     .map(|_| ())
@@ -208,7 +228,11 @@ pub fn remote_head(git_dir: &Path, branch: &str) -> Result<String, Error> {
 ///
 /// `sha` is a commit, not a branch, so the new worktree is always detached -
 /// nothing here ever checks out a branch that might already be checked out
-/// elsewhere, which `git worktree add` would refuse.
+/// elsewhere, which `git worktree add` would refuse. `--detach` says so
+/// explicitly rather than relying on `sha` never being a branch name: a
+/// hand-edited record naming `main` would otherwise check the branch out,
+/// succeed once, and refuse every release after it with `'main' is already
+/// used by worktree`. Measured 2026-09-03.
 ///
 /// # Errors
 /// [`Error::Git`] if `sha` does not resolve in `git_dir`, or `at` already
@@ -216,7 +240,7 @@ pub fn remote_head(git_dir: &Path, branch: &str) -> Result<String, Error> {
 /// not valid UTF-8.
 pub fn worktree_add(git_dir: &Path, at: &Path, sha: &str) -> Result<(), Error> {
     let at = path_str(at)?;
-    run_git(git_dir, &["worktree", "add", at, sha]).map(|_| ())
+    run_git(git_dir, &["worktree", "add", "--detach", "--", at, sha]).map(|_| ())
 }
 
 /// Removes the worktree at `at`, forcibly.
@@ -234,7 +258,7 @@ pub fn worktree_add(git_dir: &Path, at: &Path, sha: &str) -> Result<(), Error> {
 /// `git` itself cannot be launched, or if `at` is not valid UTF-8.
 pub fn worktree_remove(git_dir: &Path, at: &Path) -> Result<(), Error> {
     let at = path_str(at)?;
-    run_git(git_dir, &["worktree", "remove", "--force", at]).map(|_| ())
+    run_git(git_dir, &["worktree", "remove", "--force", "--", at]).map(|_| ())
 }
 
 /// Cleans up `git_dir`'s worktree bookkeeping for any worktree whose
@@ -264,22 +288,16 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    /// A throwaway non-bare repo with `commits` commits on its initial
-    /// branch, named `main` explicitly - `init.defaultBranch` is a user
-    /// setting this test cannot assume, so every fixture pins the name
-    /// itself rather than trusting whatever a host happens to default to.
+    /// A throwaway non-bare repo with `commits` commits on `main`, one file
+    /// per commit. The branch name is pinned by
+    /// [`fixtures::empty_checkout`] rather than left to a host's
+    /// `init.defaultBranch`, which several tests here read back by name.
     fn fixture_repo_with_commits(commits: u32) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
-
+        let dir = fixtures::empty_checkout();
         for n in 0..commits {
-            fs::write(dir.path().join(format!("file-{n}.txt")), "x").expect("write fixture file");
-            fixtures::run_git(dir.path(), &["add", "."]);
-            fixtures::run_git(dir.path(), &["commit", "-q", "-m", &format!("commit {n}")]);
+            let name = format!("file-{n}.txt");
+            fixtures::commit(dir.path(), &[(&name, "x")], &format!("commit {n}"));
         }
-
         dir
     }
 
@@ -431,6 +449,72 @@ mod tests {
         let err =
             remote_head(git_dir.path(), "feature").expect_err("a deleted branch must not resolve");
         assert!(matches!(err, Error::Git { .. }));
+    }
+
+    /// fails if a `remote` beginning with `-` is read as an option.
+    ///
+    /// `--upload-pack=<command>` is one git runs. Measured 2026-09-03 before
+    /// the `--` separator was added: `git fetch --prune "--upload-pack=echo
+    /// INJECTED >&2; false" <refspec>` printed INJECTED. The marker file is
+    /// the whole assertion: an `Err` alone is what the vulnerable version
+    /// returned too, after running the command.
+    #[test]
+    fn a_remote_beginning_with_a_dash_is_a_url_not_an_option() {
+        let git_dir = bare_git_dir();
+        let marker = git_dir.path().join("injected");
+        let remote = format!("--upload-pack=touch {}", marker.display());
+
+        let err =
+            fetch(git_dir.path(), &remote, fixtures::TEST_BUDGET).expect_err("no such repository");
+
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+        assert!(
+            !marker.exists(),
+            "the remote must never be run as a command"
+        );
+    }
+
+    /// fails if the `ext::` transport can run a command. It is refused by
+    /// a stock git already; this pins the refusal against a host whose
+    /// config allows it. The marker file is the assertion, as above.
+    #[test]
+    fn the_ext_transport_never_runs_a_command() {
+        let git_dir = bare_git_dir();
+        // The host that allows it, which is what the `-c` is for: without
+        // this the test passes on git's own default and pins nothing.
+        fixtures::run_git(git_dir.path(), &["config", "protocol.ext.allow", "always"]);
+        let marker = git_dir.path().join("ext-ran");
+        let remote = format!("ext::sh -c 'touch {}'", marker.display());
+
+        let err = fetch(git_dir.path(), &remote, fixtures::TEST_BUDGET).expect_err("refused");
+
+        // The transport named in git's own refusal is the positive signal;
+        // a missing marker alone is also what a mis-parsed command gives.
+        assert!(
+            matches!(&err, Error::Git { stderr, .. } if stderr.contains("ext")),
+            "{err}"
+        );
+        assert!(!marker.exists(), "the transport must never be run");
+    }
+
+    /// fails if a worktree stops being added detached.
+    ///
+    /// `sha` is always a commit in practice, but a hand-edited record can name
+    /// a branch, and `git worktree add <path> main` checks the branch out. The
+    /// first one succeeds; every one after it fails with `'main' is already
+    /// used by worktree`, and the deploy that meets it has no idea why.
+    /// `--detach` makes the second add succeed too.
+    #[test]
+    fn a_worktree_is_added_detached_even_when_given_a_branch_name() {
+        let repo = fixture_repo_with_commits(1);
+        let first = repo.path().join("wt-first");
+        let second = repo.path().join("wt-second");
+
+        worktree_add(repo.path(), &first, "main").expect("first add");
+        worktree_add(repo.path(), &second, "main").expect("a second add of the same branch");
+
+        worktree_remove(repo.path(), &first).expect("cleans up");
+        worktree_remove(repo.path(), &second).expect("cleans up");
     }
 
     /// fails if `remote_head` stops refusing a branch `git_dir` has never

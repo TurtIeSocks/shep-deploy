@@ -69,10 +69,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use std::os::unix::process::CommandExt as _;
+
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::error::Error;
+use crate::shared::{is_eloop, o_nofollow, printable};
 
 /// The environment variables a build keeps from this process, by name.
 ///
@@ -81,7 +84,7 @@ use crate::error::Error;
 /// keep a build's own output readable, and `TZ` keeps a timestamp in a
 /// generated artifact from moving with the machine's default. Everything
 /// else an operator wants is opted into by name through `passthrough` in
-/// `[dog.deploy]`, so it appears in `shep.toml` where it can be read rather
+/// `[deploy]`, so it appears in `dogs.toml` where it can be read rather
 /// than being inherited invisibly.
 ///
 /// Notably absent and absent on purpose: `SSH_AUTH_SOCK`. A forwarded agent
@@ -97,7 +100,7 @@ const BASE_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ"];
 /// actually left its output.
 ///
 /// This is the `[dog.deploy.build]` block of a release's own Flockfile, parsed by
-/// [`crate::flockfile::build_spec`]:
+/// [`crate::flockfile::Merged::build_spec`]:
 ///
 /// ```toml
 /// [dog.deploy.build]
@@ -117,10 +120,11 @@ pub struct BuildSpec {
     /// The build command, run through `sh -c` inside the release. `None`
     /// is a no-op, not an error - see [`run`] for why.
     pub command: Option<String>,
-    /// Environment layered over the build's own on top of whatever it
-    /// inherits from the process running this dog. `CARGO_TARGET_DIR` is
-    /// the one entry this crate's design gives special meaning to - see
-    /// [`artifact_source`].
+    /// Environment for the build, layered over [`BASE_ENV`] and the
+    /// operator's `passthrough`. The build inherits nothing else from the
+    /// process running this dog: see [`run`]. `CARGO_TARGET_DIR` is the one
+    /// entry this crate's design gives special meaning to - see
+    /// [`artifact_source`], and it has to be absolute.
     pub env: BTreeMap<String, String>,
     /// Paths, relative to the release, to copy back in after a successful
     /// build. See the module doc for why this exists at all.
@@ -166,11 +170,17 @@ where
 
     let artifacts = Vec::<PathBuf>::deserialize(deserializer)?;
     for artifact in &artifacts {
+        if artifact.as_os_str().is_empty() {
+            return Err(D::Error::custom(
+                "build.artifacts has an empty entry, which names nothing; remove it or name a \
+                 path relative to the release",
+            ));
+        }
         if artifact.is_absolute() {
             return Err(D::Error::custom(format!(
                 "build.artifacts entry `{}` is an absolute path; artifacts are \
                  copied into the release and must be relative to it",
-                artifact.display()
+                printable(artifact.display())
             )));
         }
         if artifact
@@ -180,7 +190,7 @@ where
             return Err(D::Error::custom(format!(
                 "build.artifacts entry `{}` contains `..`, which would name a \
                  path outside the release",
-                artifact.display()
+                printable(artifact.display())
             )));
         }
     }
@@ -233,15 +243,13 @@ async fn resolve_id(release: &Path, user: &str, flag: &str, kind: &str) -> Resul
         .arg(user)
         .output()
         .await
-        .map_err(|source| Error::Io {
-            path: release.to_owned(),
-            source,
-        })?;
+        .map_err(Error::at(release))?;
 
     if !output.status.success() {
         return Err(Error::Config(format!(
-            "as_user {user:?} does not resolve to a {kind} on this host (`id {flag} {user}` \
-             failed)"
+            "the app's `user = {user:?}` does not resolve to a {kind} on this host (`id {flag} \
+             {user}` failed); create that account, or pin a different one in \
+             Flockfile.override.toml"
         )));
     }
 
@@ -286,6 +294,12 @@ async fn effective_uid() -> Option<u32> {
 /// `-D warnings` refuses. That is weaker than a test and it is the reason
 /// this is one function rather than two lines inline.
 async fn root_warning(sheep: &str, as_user: Option<&str>) -> Option<String> {
+    // A build that drops to a user has nothing to warn about, so the `id`
+    // spawn is skipped rather than made and then thrown away, which it was
+    // on every deploy of every correctly configured app.
+    if as_user.is_some() {
+        return None;
+    }
     root_build_warning(sheep, effective_uid().await?, as_user)
 }
 
@@ -360,27 +374,6 @@ fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Pa
     release.join(artifact)
 }
 
-/// `O_NOFOLLOW`, without a libc dependency or an unsafe block.
-///
-/// The value is fixed by each platform's ABI and cannot change without
-/// breaking every compiled program on it. Same "ask the host rather than
-/// reimplement its answer" spirit as `build`'s use of `id`, except here the
-/// host's answer is a constant.
-const fn libc_o_nofollow() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        0o400_000
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        0x0100
-    }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        compile_error!("O_NOFOLLOW's value is not known for this target")
-    }
-}
-
 /// The deepest ancestor of `path` that exists, fully resolved.
 ///
 /// `canonicalize` fails on a path that does not exist yet, and an artifact's
@@ -438,7 +431,7 @@ fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
 /// path as the release's filesystem rather than the cache's.
 fn copy_artifact(
     release: &Path,
-    cache: &Path,
+    roots: &[PathBuf; 2],
     env: &BTreeMap<String, String>,
     artifact: &Path,
 ) -> Result<(), Error> {
@@ -455,7 +448,7 @@ fn copy_artifact(
     {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` would name a path outside the release",
-            artifact.display()
+            printable(artifact.display())
         )));
     }
 
@@ -466,30 +459,14 @@ fn copy_artifact(
     // are spelled. The lexical refusal above catches `..` and an absolute
     // path; it cannot catch a committed symlink, and it says nothing at all
     // about the source, which `CARGO_TARGET_DIR` points wherever the
-    // repository's own Flockfile says.
-    //
-    // `cache` is passed in rather than read from `release/target`, which is
-    // exactly the entry an attacker controls: `link_cache` leaves a release's
-    // own `target` alone when it ships one.
-    //
-    // Two escapes measured 2026-08-28, both writing or reading at the dog's
-    // uid because this runs in the parent, after the build's own drop:
-    // `target -> /tmp/outside` wrote through the committed link, and
-    // `CARGO_TARGET_DIR = /any/path` with `artifacts = ["target/id_rsa"]`
-    // read an arbitrary file into the release, where a static-serving app
-    // then hands it out over HTTP.
-    let roots = [
-        release
-            .canonicalize()
-            .unwrap_or_else(|_| release.to_owned()),
-        cache.canonicalize().unwrap_or_else(|_| cache.to_owned()),
-    ];
+    // repository's own Flockfile says. See `artifact_roots` for what the
+    // two roots are and the escapes they were measured against.
     for (end, path) in [("destination", &to), ("source", &from)] {
-        if !lands_within(&roots, path) {
+        if !lands_within(roots, path) {
             return Err(Error::Config(format!(
                 "build.artifacts entry `{}` resolves its {end} to `{}`, which is \
                  outside the release and its build cache",
-                artifact.display(),
+                printable(artifact.display()),
                 resolve_deepest(path)
                     .unwrap_or_else(|| path.clone())
                     .display()
@@ -513,17 +490,14 @@ fn copy_artifact(
             return Err(Error::Config(format!(
                 "build.artifacts names `{}`, which the build did not leave there; \
                  either the command did not produce it or the entry is wrong",
-                artifact.display()
+                printable(artifact.display())
             )));
         }
         return Ok(());
     }
 
     if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
+        fs::create_dir_all(parent).map_err(Error::at(parent))?;
     }
 
     // Opened BEFORE the last containment check, and the check then runs
@@ -539,21 +513,15 @@ fn copy_artifact(
     // handle cannot be redirected once open, so if the file it refers to is
     // the same file the resolved-and-contained path names, the read is of
     // something that passed the check.
-    let mut source = fs::File::open(&from).map_err(|err| Error::Io {
-        path: from.clone(),
-        source: err,
-    })?;
-    let opened = source.metadata().map_err(|err| Error::Io {
-        path: from.clone(),
-        source: err,
-    })?;
+    let mut source = fs::File::open(&from).map_err(Error::at(&from))?;
+    let opened = source.metadata().map_err(Error::at(&from))?;
     let resolved = resolve_deepest(&from)
         .and_then(|real| fs::metadata(real).ok())
         .filter(|named| named.dev() == opened.dev() && named.ino() == opened.ino());
-    if resolved.is_none() || !lands_within(&roots, &from) {
+    if resolved.is_none() || !lands_within(roots, &from) {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
-            artifact.display()
+            printable(artifact.display())
         )));
     }
 
@@ -602,27 +570,78 @@ fn copy_artifact(
     // the whole chain. Refusing every symlinked component instead was tried
     // and is wrong: `shared::link_cache` makes `release/target` a link at the
     // dog's own cache, so that refusal broke the ordinary cargo arrangement.
-    if !lands_within(&roots, &to) {
+    if !lands_within(roots, &to) {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
-            artifact.display()
+            printable(artifact.display())
         )));
     }
 
+    // Unlinked first, then created fresh with `create_new`, and the two
+    // together are the fix for a hard link. The checks above resolve names
+    // and compare inodes, and a hard link has neither a name to resolve nor
+    // an inode of its own: `release/dist/app.js` linked by the build to a
+    // file elsewhere on the same filesystem passes every one of them, and
+    // opening it for writing then truncates and rewrites the far file at the
+    // dog's uid. `remove_file` takes the link away without touching what it
+    // pointed at, and `create_new` refuses to open anything that appeared in
+    // between.
+    //
+    // Only a regular file is unlinked. A directory, a symlink or anything
+    // else at the destination is not an artifact the build left, and
+    // unlinking it would take the release's own `target -> cache` link with
+    // it when `artifacts` names `target` itself, so those are refused. The
+    // window between this look, the unlink and the open is the one
+    // `docs/specs/deferred.md` records; what a job swapping a parent for a
+    // link inside it can cost is a file unlinked as well as one written.
+    match fs::symlink_metadata(&to) {
+        Ok(there) if !there.file_type().is_file() => {
+            return Err(Error::Config(format!(
+                "build.artifacts entry `{}` names a destination that is not a regular file; \
+                 refusing to replace it",
+                printable(artifact.display())
+            )));
+        }
+        Ok(_) => match fs::remove_file(&to) {
+            Ok(()) => {}
+            // Gone between the look and the unlink: the window the comment
+            // above names, and nothing to remove is not a failure.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::at(&to)(err)),
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(Error::Io {
+                path: to.clone(),
+                source: err,
+            });
+        }
+    }
     let mut sink = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc_o_nofollow())
+        .create_new(true)
+        .custom_flags(o_nofollow())
         .open(&to)
-        .map_err(|err| Error::Io {
-            path: to.clone(),
-            source: err,
+        .map_err(|err| {
+            // Something reappeared at the name between the unlink and the
+            // open. A backgrounded build job is the only thing that could,
+            // and the copy is refused rather than written through it. Said
+            // as a refusal, because the raw `File exists` or `Too many
+            // levels of symbolic links` reads as a broken host.
+            if err.kind() == io::ErrorKind::AlreadyExists || is_eloop(&err) {
+                Error::Config(format!(
+                    "build.artifacts entry `{}` had its destination replaced underneath the \
+                     copy; refusing to write through it",
+                    printable(artifact.display())
+                ))
+            } else {
+                Error::Io {
+                    path: to.clone(),
+                    source: err,
+                }
+            }
         })?;
-    io::copy(&mut source, &mut sink).map_err(|err| Error::Io {
-        path: from.clone(),
-        source: err,
-    })?;
+    io::copy(&mut source, &mut sink).map_err(Error::at(&from))?;
 
     // `fs::copy` carried the source's mode and this does not: a file created
     // by `OpenOptions` gets `0o666 & !umask`, so 0755 arrives as 0644 and the
@@ -650,10 +669,7 @@ fn copy_artifact(
     // not.
     let mode = opened.permissions().mode() & 0o777;
     sink.set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|err| Error::Io {
-            path: to,
-            source: err,
-        })?;
+        .map_err(Error::at(to))?;
 
     Ok(())
 }
@@ -668,8 +684,10 @@ fn copy_artifact(
 /// reading rather than a misconfiguration.
 ///
 /// The command runs through `sh -c`, with `release` as its working
-/// directory and `spec.env` layered on top of whatever this process itself
-/// inherited. Its stdout and stderr are inherited rather than captured, so
+/// directory and an environment built from scratch: [`BASE_ENV`], then
+/// whatever the operator's `passthrough` names, then `spec.env`, and
+/// nothing this process itself inherited beyond those. Its stdout and
+/// stderr are inherited rather than captured, so
 /// an operator watching a deploy sees the build's real output as it
 /// happens instead of a blob replayed after the fact.
 ///
@@ -742,7 +760,7 @@ fn copy_artifact(
 /// [`Error::Build`] if the command launches and
 /// exits non-zero, or is killed by a signal, naming the exit status when there
 /// is one. [`Error::BuildTimedOut`] if it runs past `budget`, which is
-/// `build_timeout` from `[dog.deploy]`.
+/// `build_timeout` from the dog's `[deploy]` section.
 pub async fn run(
     sheep: &str,
     release: &Path,
@@ -763,6 +781,21 @@ pub async fn run(
         eprintln!("{warning}");
     }
 
+    // Refused before the build runs, not when its artifacts are copied: a
+    // relative `CARGO_TARGET_DIR` is resolved against wherever this dog
+    // happens to be running, so cargo would build somewhere no artifact
+    // path could name and the refusal at copy time printed a bare relative
+    // path the operator could not find on disk.
+    if let Some(target_dir) = spec.env.get("CARGO_TARGET_DIR")
+        && !Path::new(target_dir).is_absolute()
+    {
+        return Err(Error::Config(format!(
+            "[dog.deploy.build] env sets CARGO_TARGET_DIR = {target_dir:?}, which is not an \
+             absolute path; a relative one is resolved against whatever directory this dog \
+             is running in, not against the release. Name the directory in full"
+        )));
+    }
+
     let mut child = Command::new("sh");
     child.arg("-c").arg(command);
     child.current_dir(release);
@@ -777,16 +810,29 @@ pub async fn run(
     //
     // What survives is named in three places and nowhere else: BASE_ENV, the
     // operator's `passthrough` list, and the release's own `[dog.deploy.build] env`.
+    //
+    // `var_os` rather than `var`, because `var` reports a value that is not
+    // UTF-8 as absent and a `PATH` with one such component then vanished,
+    // leaving the build on `sh`'s built-in default path.
     child.env_clear();
-    for (key, value) in BASE_ENV
-        .iter()
-        .filter_map(|k| Some((*k, env::var(k).ok()?)))
-    {
-        child.env(key, value);
+    for key in BASE_ENV {
+        if let Some(value) = env::var_os(key) {
+            child.env(key, value);
+        }
     }
     for key in passthrough {
-        if let Ok(value) = env::var(key) {
-            child.env(key, value);
+        match env::var_os(key) {
+            Some(value) => {
+                child.env(key, value);
+            }
+            // Said, because `passthrough` is the only door for a registry
+            // token and a typo in it used to be a build that silently did
+            // not get the token. The config is checked at parse time; whether
+            // the variable is SET is only known here.
+            None => eprintln!(
+                "shep-deploy: {sheep}: passthrough names {key}, which is not set in this dog's \
+                 environment, so the build does not get it"
+            ),
         }
     }
     child.envs(&spec.env);
@@ -801,16 +847,48 @@ pub async fn run(
     // it started rather than the shell itself, so killing only the shell would
     // leave the real process running while the deploy reports a failure. Same
     // shape and same reason as `crate::shared::run_git_within`.
-    child.process_group(0);
-
-    let mut child = child.spawn().map_err(|source| Error::Io {
+    //
+    // The group's leader is not the build but a holder: a shell that reads
+    // one line from a pipe this dog keeps the write end of, so it sits
+    // there until the group is killed. A process group's id is its leader's
+    // pid, and the system does not reuse a pid while a group with that id
+    // exists. The build is reaped before the group is signalled below,
+    // and a reaped leader's pid is free to be handed to whatever forks
+    // next; with the build as leader, `killpg` after the wait could in
+    // principle reach an unrelated process that had taken the pid and
+    // started a group of its own, as root. With the holder as leader the
+    // id is reserved for as long as the holder lives, and the holder lives
+    // until this function kills it.
+    let mut holder = std::process::Command::new("sh");
+    holder
+        .args(["-c", "read _"])
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    if let Some(path) = env::var_os("PATH") {
+        holder.env("PATH", path);
+    }
+    let mut holder = holder.spawn().map_err(Error::at(release))?;
+    let group = holder.id();
+    let group_id = i32::try_from(group).map_err(|_| Error::Io {
         path: release.to_owned(),
-        source,
+        source: std::io::Error::other("the group holder's pid does not fit a pid_t"),
     })?;
+    child.process_group(group_id);
 
-    // Captured before the wait, because `Child::id` answers `None` once the
-    // child has been reaped and the group is named after the leader's pid.
-    let group = child.id();
+    let mut child = match child.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            crate::shared::kill_group(group);
+            let _ = holder.wait();
+            return Err(Error::Io {
+                path: release.to_owned(),
+                source,
+            });
+        }
+    };
 
     // Bounded, because an unbounded wait here does not stop one target, it
     // stops the dog. `crate::poll::tick` deploys targets one at a time, so a
@@ -825,12 +903,10 @@ pub async fn run(
     // idle, so the budget expires at once whatever it is set to. See
     // `crate::deploy`'s `a_current_that_moved_during_the_build_is_not_swapped_over`.
     let status = match timeout(budget, child.wait()).await {
-        Ok(waited) => waited.map_err(|source| Error::Io {
-            path: release.to_owned(),
-            source,
-        })?,
+        Ok(waited) => waited,
         Err(_) => {
-            abandon(&mut child).await;
+            abandon(&mut child, group).await;
+            let _ = holder.wait();
             return Err(Error::BuildTimedOut { after: budget });
         }
     };
@@ -850,9 +926,12 @@ pub async fn run(
     // A process that genuinely means to persist calls `setsid` and leaves the
     // group, so a compiler daemon survives this and a stray `&` does not. That
     // is the right split: one asked to outlive its parent, the other just did.
-    if let Some(pid) = group {
-        crate::shared::kill_group(pid);
-    }
+    //
+    // Safe after the wait because the group is the holder's, not the build's:
+    // see where it is spawned. The holder goes with the group, and is reaped.
+    crate::shared::kill_group(group);
+    let _ = holder.wait();
+    let status = status.map_err(Error::at(release))?;
 
     if !status.success() {
         return Err(Error::Build {
@@ -860,14 +939,47 @@ pub async fn run(
         });
     }
 
-    for artifact in &spec.artifacts {
-        copy_artifact(release, cache, &spec.env, artifact)?;
-    }
-
-    Ok(())
+    // Resolved once for every artifact rather than once per artifact:
+    // `canonicalize` walks the whole chain and the two roots do not change.
+    // The copies run off the runtime's thread: a release binary can be
+    // hundreds of megabytes, and copying it on the one thread stalled the
+    // signal handler and the client's reconnect for the duration. See
+    // `shared::off_thread`.
+    let roots = artifact_roots(release, cache);
+    let (release, env, artifacts) = (release.to_owned(), spec.env.clone(), spec.artifacts.clone());
+    crate::shared::off_thread(move || {
+        for artifact in &artifacts {
+            copy_artifact(&release, &roots, &env, artifact)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
-/// Kills an abandoned build's whole process group.
+/// The two places an artifact may really land, resolved: the release and
+/// the dog's own build cache for this sheep.
+///
+/// `cache` is passed in rather than read from `release/target`, which is
+/// exactly the entry an attacker controls: `link_cache` leaves a release's
+/// own `target` alone when it ships one.
+///
+/// Two escapes measured 2026-08-28, both writing or reading at the dog's uid
+/// because the copy runs in the parent, after the build's own drop:
+/// `target -> /tmp/outside` wrote through the committed link, and
+/// `CARGO_TARGET_DIR = /any/path` with `artifacts = ["target/id_rsa"]` read
+/// an arbitrary file into the release, where a static-serving app then
+/// hands it out over HTTP.
+fn artifact_roots(release: &Path, cache: &Path) -> [PathBuf; 2] {
+    [
+        release
+            .canonicalize()
+            .unwrap_or_else(|_| release.to_owned()),
+        cache.canonicalize().unwrap_or_else(|_| cache.to_owned()),
+    ]
+}
+
+/// Kills an abandoned build's whole process group, `group` being the pid of
+/// the holder that leads it (see `run`).
 ///
 /// The group, not the child: `run` spawns `sh -c`, and a hung build is
 /// normally something the shell started. Killing the shell alone leaves that
@@ -877,12 +989,10 @@ pub async fn run(
 /// already been given up on, and a kill that cannot be delivered leaves
 /// nothing this function can do about it that the caller has not already
 /// decided.
-async fn abandon(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        crate::shared::kill_group(pid);
-    }
-    // The group signal is the one that matters; this covers a host whose
-    // `kill` refuses the group form.
+async fn abandon(child: &mut tokio::process::Child, group: u32) {
+    crate::shared::kill_group(group);
+    // The group signal is the one that matters; this covers a build that
+    // left its group before the signal landed.
     let _ = child.kill().await;
 }
 
@@ -911,17 +1021,7 @@ mod tests {
             artifacts: vec![],
         };
 
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("this build exits 0");
+        build(rel.path(), &spec).await.expect("this build exits 0");
 
         let pid = std::fs::read_to_string(rel.path().join("bg.pid"))
             .expect("the build wrote its background job's pid");
@@ -967,7 +1067,7 @@ mod tests {
             &spec,
             None,
             &[],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             // Two seconds, not 250ms, for the reason `shep`'s own
             // `run_bounded` test learned the hard way: a budget this small is
             // shared with process startup, and on a loaded runner the shell
@@ -1023,17 +1123,9 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
         };
 
-        let err = run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect_err("a declared artifact that is not there must fail the build");
+        let err = build(rel.path(), &spec)
+            .await
+            .expect_err("a declared artifact that is not there must fail the build");
 
         assert!(
             format!("{err}").contains("did not leave there"),
@@ -1183,17 +1275,27 @@ mod tests {
     /// cold build of a real workspace legitimately runs tens of minutes.
     const TEST_BUILD_BUDGET: Duration = Duration::from_secs(60);
 
-    /// A throwaway stand-in for the dog's own build cache.
+    /// Runs a build with every knob at its default: sheep `"web"`, no
+    /// `as_user`, no passthrough, a fresh cache tempdir, and
+    /// `TEST_BUILD_BUDGET`.
     ///
-    /// Its own directory, never `release/target`, because that entry is the
-    /// one a repository can ship and therefore the one `copy_artifact` must
-    /// not trust.
-    ///
-    /// Returns the `TempDir` so it is cleaned up. An earlier version forgot it
-    /// to dodge a lifetime, which left a directory behind per call for the
-    /// life of the process and after it.
-    fn tempdir_cache() -> tempfile::TempDir {
-        fixtures::tempdir()
+    /// Exists because this module's own `run` calls had started to drift the
+    /// way `fixtures.rs`'s module doc describes for `run_git` and
+    /// `head_of`: one nine-line block, copied a couple dozen times, one
+    /// budget or one cache dir away from its neighbor by accident rather
+    /// than intent. A test that needs a specific cache, user, passthrough or
+    /// budget still calls `run` directly instead of going through this.
+    async fn build(rel: &Path, spec: &BuildSpec) -> Result<(), Error> {
+        run(
+            "web",
+            rel,
+            spec,
+            None,
+            &[],
+            fixtures::tempdir().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
     }
 
     use crate::fixtures;
@@ -1315,19 +1417,7 @@ mod tests {
             command: Some("exit 3".into()),
             ..Default::default()
         };
-        assert!(
-            run(
-                "web",
-                rel.path(),
-                &spec,
-                None,
-                &[],
-                tempdir_cache().path(),
-                TEST_BUILD_BUDGET
-            )
-            .await
-            .is_err()
-        );
+        assert!(build(rel.path(), &spec).await.is_err());
     }
 
     /// fails if an absent build command is an error rather than a no-op.
@@ -1337,19 +1427,7 @@ mod tests {
     async fn an_absent_build_command_is_not_an_error() {
         let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec::default();
-        assert!(
-            run(
-                "web",
-                rel.path(),
-                &spec,
-                None,
-                &[],
-                tempdir_cache().path(),
-                TEST_BUILD_BUDGET
-            )
-            .await
-            .is_ok()
-        );
+        assert!(build(rel.path(), &spec).await.is_ok());
     }
 
     /// fails if declared artifacts are not copied into the release. With
@@ -1414,22 +1492,38 @@ mod tests {
             env: BTreeMap::new(),
             artifacts: vec![],
         };
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("builds");
+        build(rel.path(), &spec).await.expect("builds");
         let leaked = std::fs::read_to_string(rel.path().join("leaked.txt")).unwrap_or_default();
         assert!(
             leaked.trim().is_empty(),
             "the build saw CARGO_PKG_NAME = {leaked:?}, so the environment was inherited"
         );
+    }
+
+    /// fails if `BASE_ENV` stops reaching the build.
+    ///
+    /// Nothing else pins it: with the `BASE_ENV` loop deleted the suite
+    /// stayed green, because `sh` resolves `printenv` through its own
+    /// built-in default path when `PATH` is unset. A build with no `PATH`
+    /// and no `HOME` would find `cargo` and `npm` missing on a host where
+    /// both are installed, which reads as a broken host rather than a
+    /// dropped variable.
+    #[tokio::test]
+    async fn the_base_environment_reaches_the_build() {
+        let rel = fixtures::fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("printenv PATH > path.txt; printenv HOME > home.txt; true".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![],
+        };
+        build(rel.path(), &spec).await.expect("builds");
+        for name in ["path.txt", "home.txt"] {
+            let value = std::fs::read_to_string(rel.path().join(name)).unwrap_or_default();
+            assert!(
+                !value.trim().is_empty(),
+                "{name} is empty, so a BASE_ENV variable did not reach the build"
+            );
+        }
     }
 
     /// fails if `passthrough` stops being the way a build gets a variable.
@@ -1451,7 +1545,7 @@ mod tests {
             &spec,
             None,
             &["CARGO_PKG_NAME".to_owned()],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             TEST_BUILD_BUDGET,
         )
         .await
@@ -1478,7 +1572,7 @@ mod tests {
     #[tokio::test]
     async fn an_artifact_that_is_already_where_it_belongs_is_not_truncated() {
         let rel = fixtures::fixture_release(&[]);
-        let cache = tempdir_cache();
+        let cache = fixtures::tempdir();
         std::fs::create_dir_all(cache.path().join("release")).expect("cache");
         std::fs::write(cache.path().join("release/koji"), b"binary").expect("built");
         // Exactly what `link_cache` does.
@@ -1538,17 +1632,9 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/id_rsa")],
         };
-        let err = run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect_err("a source outside the tree must be refused");
+        let err = build(rel.path(), &spec)
+            .await
+            .expect_err("a source outside the tree must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "must say why: {err}"
@@ -1701,17 +1787,9 @@ mod tests {
             artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
         };
 
-        let err = run(
-            "web",
-            &release,
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect_err("an escaping artifact must be refused");
+        let err = build(&release, &spec)
+            .await
+            .expect_err("an escaping artifact must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "the refusal must say why, got: {err}"
@@ -1790,19 +1868,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
-        assert!(
-            run(
-                "web",
-                rel.path(),
-                &spec,
-                None,
-                &[],
-                tempdir_cache().path(),
-                TEST_BUILD_BUDGET
-            )
-            .await
-            .is_ok()
-        );
+        assert!(build(rel.path(), &spec).await.is_ok());
     }
 
     /// fails if `as_user` is silently ignored on the accept side of the
@@ -1826,7 +1892,7 @@ mod tests {
             &spec,
             Some(&user),
             &[],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             TEST_BUILD_BUDGET,
         )
         .await
@@ -1863,7 +1929,7 @@ mod tests {
             &spec,
             Some("shep-deploy-test-no-such-user"),
             &[],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             TEST_BUILD_BUDGET,
         )
         .await
@@ -1937,17 +2003,7 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("builds");
+        build(rel.path(), &spec).await.expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
     }

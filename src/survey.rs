@@ -11,7 +11,7 @@ use shep_client::shep_core::config::AppConfig;
 
 use crate::daemon::Daemon;
 use crate::error::Error;
-use crate::paths::Tree;
+use crate::paths::{self, Tree};
 use crate::roll;
 use crate::state::{State, Watch};
 
@@ -63,6 +63,40 @@ pub enum Standing {
     Eligible,
     /// Left alone, and why.
     NotEligible(String),
+    /// A deploy tree with no registered sheep behind it.
+    ///
+    /// The one row the roll cannot produce, because the roll is what it is
+    /// missing from: a sheep deleted from shep while its tree stayed on disk
+    /// appeared in no row of the one command meant to say where everything
+    /// stands.
+    Orphaned,
+    /// A deploy tree whose directory name cannot be a sheep's.
+    ///
+    /// Not [`Self::Unreadable`]: the record reads fine, the name is the
+    /// problem, and the way out is a rename rather than a repair.
+    Unnamed,
+    /// A deploy tree whose record cannot be read, and what reading it said.
+    ///
+    /// Its own standing rather than a fall-through, because the fall-through
+    /// was dangerous: a live target's `cwd` is `current`, a git worktree
+    /// shipping a `Flockfile.toml`, so an unreadable record classified it as
+    /// `NeedsSetup` and told the operator to run `setup` against a running
+    /// service, which clones over its tree. Reachable without corruption:
+    /// the record refuses unknown fields, so one written by a newer
+    /// shep-deploy reads this way to an older binary.
+    Unreadable(String),
+    /// The deploy directory itself could not be listed, and what listing it
+    /// said. Every target is under it, so no row alongside is complete.
+    Unlisted(String),
+    /// A registered sheep whose name cannot be a deploy tree's directory
+    /// name, so nothing here can be built for it.
+    ///
+    /// Not [`Self::NotEligible`]: that names a checkout problem the
+    /// operator fixes in place, and this one is fixed by renaming the
+    /// sheep. Caught here because the name comes from the shepherd's roll,
+    /// which this dog does not get to validate, and `Tree::for_sheep` is
+    /// only for names that passed.
+    BadName,
 }
 
 /// Where `app` stands, without touching anything.
@@ -76,7 +110,14 @@ pub enum Standing {
 #[must_use]
 pub fn classify(shep_home: &Path, app: &AppConfig) -> Standing {
     let tree = Tree::for_sheep(shep_home, &app.name);
-    if let Ok(state) = State::read(&tree.state_file()) {
+    let state = match State::read(&tree.state_file()) {
+        Ok(state) => Some(state),
+        // No record is no target, which is the ordinary case for every
+        // sheep the dog has not taken over.
+        Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Standing::Unreadable(err.to_string()),
+    };
+    if let Some(state) = state {
         let (branch, sha) = (state.branch, state.deployed);
         // A hold is only reported for a target something polls. `failed`
         // is written by an operator's own deploy too, and for a manual
@@ -123,7 +164,15 @@ pub fn render(rows: &[(String, Standing)]) -> String {
         return "no sheep are registered, so there is nothing to survey\n".to_owned();
     }
 
-    let name_width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 2;
+    // Characters, not bytes: `{name:width$}` pads by character, and a name
+    // with a multi-byte character in it would otherwise pull its row's
+    // columns left of every other row's.
+    let name_width = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2;
     let label_width = rows
         .iter()
         .map(|(_, standing)| standing.label().len())
@@ -152,6 +201,11 @@ impl Standing {
             Self::NeedsSetup => "needs setup",
             Self::Eligible => "eligible",
             Self::NotEligible(_) => "not eligible",
+            Self::Orphaned => "orphaned",
+            Self::Unnamed => "unnamed",
+            Self::Unreadable(_) => "unreadable",
+            Self::Unlisted(_) => "unlisted",
+            Self::BadName => "bad name",
         }
     }
 
@@ -184,6 +238,31 @@ impl Standing {
             Self::NeedsSetup => "a git checkout that ships a Flockfile".to_owned(),
             Self::Eligible => "a git checkout, nothing declares a deploy".to_owned(),
             Self::NotEligible(why) => why.clone(),
+            Self::Orphaned => "has a deploy tree, and the shepherd has no sheep by that name. \
+                               Re-register the app from its Flockfile with `cwd` set to the \
+                               tree's `current`, or remove the tree if the app is gone"
+                .to_owned(),
+            Self::Unnamed => "has a deploy tree whose directory name cannot be a sheep's, so \
+                              nothing polls or restores it. `shep flock` lists every sheep and \
+                              `shep describe <sheep>` its cwd: check none runs from inside it, \
+                              then rename the directory"
+                .to_owned(),
+            // Says what to do and, more to the point, what NOT to do: the
+            // one wrong move here is treating it as a sheep with no tree.
+            Self::Unreadable(why) => format!(
+                "has a deploy tree whose record cannot be read: {why}. Repair the record \
+                 before deploying; do not run setup against it, the sheep may be running from \
+                 inside that tree"
+            ),
+            Self::Unlisted(why) => format!(
+                "is the deploy directory and could not be listed: {why}. Every target is \
+                 under it, so no other row here is complete; fix the directory before \
+                 trusting this survey"
+            ),
+            Self::BadName => "is registered under a name this dog cannot use as a directory \
+                              name: one path component, nothing that forges a log line. \
+                              Rename the sheep before setup"
+                .to_owned(),
         }
     }
 }
@@ -211,16 +290,209 @@ fn short(sha: &str) -> &str {
 /// Whatever [`crate::roll::registered`] returns.
 pub async fn survey<D: Daemon>(daemon: &D, shep_home: &Path) -> Result<String, Error> {
     let apps = roll::registered(daemon).await?;
-    let rows: Vec<(String, Standing)> = apps
-        .values()
-        .map(|app| (app.name.clone(), classify(shep_home, app)))
-        .collect();
+    // A deploy directory that cannot be listed is a row, not a refusal: this
+    // is the read-only command whose one job is to say where everything
+    // stands, and one unreadable entry must not cost every other row.
+    let (targets, unlisted) = match paths::targets(shep_home) {
+        Ok(targets) => (targets, None),
+        Err(err) => (
+            paths::Targets::default(),
+            Some((shep_home.join("deploy"), err.to_string())),
+        ),
+    };
+    let mut rows = rows(shep_home, &apps, &targets);
+    if let Some((dir, why)) = unlisted {
+        rows.push((dir.display().to_string(), Standing::Unlisted(why)));
+    }
     Ok(render(&rows))
+}
+
+/// One row per registered sheep, then one per deploy tree no registered
+/// sheep accounts for.
+///
+/// Split from [`survey`] so the join is testable without a daemon: the
+/// roll comes from one, the target list from the filesystem, and the row a
+/// tree gets when it is in the second and not the first is the whole of
+/// what this adds.
+fn rows(
+    shep_home: &Path,
+    apps: &std::collections::BTreeMap<String, AppConfig>,
+    targets: &paths::Targets,
+) -> Vec<(String, Standing)> {
+    let mut rows: Vec<(String, Standing)> = apps
+        .values()
+        .map(|app| {
+            // The roll's names are the shepherd's, and shep's own rule for
+            // a name is not this dog's: a name with a separator in it would
+            // build a tree outside the deploy directory.
+            if paths::is_sheep_name(&app.name) {
+                (app.name.clone(), classify(shep_home, app))
+            } else {
+                (crate::shared::printable(&app.name), Standing::BadName)
+            }
+        })
+        .collect();
+    rows.extend(
+        targets
+            .named
+            .iter()
+            .filter(|name| !apps.contains_key(*name))
+            .map(|name| (name.clone(), Standing::Orphaned)),
+    );
+    rows.extend(
+        targets
+            .unnamed
+            .iter()
+            .map(|dir| (crate::shared::printable(dir.display()), Standing::Unnamed)),
+    );
+    rows
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures;
+
+    /// fails if the deploy directory failing to list is described as a
+    /// record that cannot be read. It holds no record and holds every
+    /// target, and "repair the record" sends the operator looking for a
+    /// file that does not exist.
+    #[test]
+    fn a_deploy_directory_that_cannot_be_listed_is_its_own_row() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home.path().join("deploy"), b"not a directory").expect("a file");
+        let apps = std::collections::BTreeMap::new();
+
+        let (targets, unlisted) = match paths::targets(home.path()) {
+            Ok(targets) => (targets, None),
+            Err(err) => (paths::Targets::default(), Some(err.to_string())),
+        };
+        let why = unlisted.expect("a file where a directory belongs cannot be listed");
+        let mut rows = rows(home.path(), &apps, &targets);
+        rows.push((
+            home.path().join("deploy").display().to_string(),
+            Standing::Unlisted(why),
+        ));
+
+        let shown = render(&rows);
+        assert!(shown.contains("unlisted"), "{shown}");
+        assert!(shown.contains("could not be listed"), "{shown}");
+        assert!(!shown.contains("record"), "{shown}");
+    }
+
+    /// fails if a registered name that cannot be a directory name reaches
+    /// `Tree::for_sheep`. The roll's names are the shepherd's, and one with
+    /// a separator in it would name a tree outside the deploy directory;
+    /// a control character in it would forge the row.
+    #[test]
+    fn a_registered_sheep_with_an_impossible_name_is_a_row_not_a_path() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let mut apps = std::collections::BTreeMap::new();
+        for name in ["../x", "a\nb"] {
+            apps.insert(name.to_owned(), app(name, Some("/srv/x")));
+        }
+
+        let rows = rows(home.path(), &apps, &paths::Targets::default());
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (name, standing) in &rows {
+            assert!(
+                matches!(standing, Standing::BadName),
+                "{name}: {standing:?}"
+            );
+            assert!(
+                !name.contains('\n'),
+                "the row must not forge a line: {name:?}"
+            );
+        }
+        let shown = render(&rows);
+        assert!(shown.contains("bad name"), "{shown}");
+        assert!(shown.contains("Rename the sheep"), "{shown}");
+    }
+
+    /// fails if a target whose record cannot be read is offered `setup`.
+    ///
+    /// A live target's `cwd` is `current`, a git worktree that ships a
+    /// `Flockfile.toml`, so falling through to the checkout questions
+    /// classified it as `NeedsSetup` and the row told an operator to run
+    /// `shep-deploy setup` against a running service, which clones over its
+    /// tree. A record with a key this binary does not know is enough to get
+    /// there: one written by a newer shep-deploy reads this way to an older
+    /// one.
+    #[test]
+    fn a_target_with_an_unreadable_record_is_not_offered_setup() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        std::fs::create_dir_all(tree.root()).expect("tree");
+        std::fs::write(
+            tree.state_file(),
+            "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n\
+             newer_key = true\n",
+        )
+        .expect("a record from the future");
+        let checkout = checkout_fixture(&[("Flockfile.toml", "[[app]]\nname = \"web\"\n")]);
+
+        let standing = classify(home.path(), &app("web", checkout.path().to_str()));
+
+        assert!(
+            matches!(&standing, Standing::Unreadable(why) if why.contains("newer_key")),
+            "must name what was wrong with the record: {standing:?}"
+        );
+        let shown = render(&[("web".to_owned(), standing)]);
+        assert!(!shown.contains("needs setup"), "{shown}");
+        assert!(shown.contains("do not run setup"), "{shown}");
+    }
+
+    /// fails if a deploy tree whose sheep is no longer registered appears in
+    /// no row. The roll cannot name it, because the roll is what it is
+    /// missing from, and a tree on disk with a service that may still be
+    /// running out of it is exactly what an operator surveys for.
+    #[test]
+    fn a_tree_with_no_registered_sheep_is_a_row_of_its_own() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target(home.path(), "gone", Watch::Auto, None, None);
+        let registered: std::collections::BTreeMap<String, AppConfig> =
+            [("web".to_owned(), app("web", None))].into_iter().collect();
+        let targets = paths::targets(home.path()).expect("lists");
+
+        let rows = rows(home.path(), &registered, &targets);
+
+        assert!(
+            rows.iter()
+                .any(|(name, standing)| name == "gone" && *standing == Standing::Orphaned),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(name, _)| name == "web"),
+            "the registered sheep is still listed: {rows:?}"
+        );
+        let shown = render(&rows);
+        assert!(shown.contains("orphaned"), "{shown}");
+    }
+
+    /// fails if a deploy tree whose directory name cannot be a sheep's is
+    /// missing from the survey, or is printed with the character that made
+    /// it unnameable. Its standing is its own: the record reads fine, the
+    /// name is the problem, and the way out is a rename.
+    #[test]
+    fn a_tree_whose_name_cannot_be_a_sheeps_is_an_unnamed_row() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("deploy").join("bad\nname");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("deploy.toml"), "").expect("record");
+        let targets = paths::targets(home.path()).expect("lists");
+        assert_eq!(targets.unnamed, vec![dir]);
+
+        let rows = rows(home.path(), &std::collections::BTreeMap::new(), &targets);
+        let shown = render(&rows);
+
+        assert!(shown.contains("unnamed"), "{shown}");
+        assert!(shown.contains("rename the directory"), "{shown}");
+        assert!(
+            !shown.contains("bad\nname"),
+            "the name is printed with its newline replaced: {shown:?}"
+        );
+    }
 
     /// An `AppConfig` with just the two fields this module reads.
     fn app(name: &str, cwd: Option<&str>) -> AppConfig {
@@ -230,35 +502,15 @@ mod tests {
         app
     }
 
-    /// A tempdir with `git init -q` already run in it, plus the given files.
+    /// A git checkout holding `files` and NOT committing them.
+    ///
+    /// Uncommitted on purpose: two tests here pass no files at all, and a
+    /// repository with nothing staged cannot be committed. Nothing this
+    /// module classifies reads a commit, only whether `.git` is there and
+    /// what the working tree holds.
     fn checkout_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let status = std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(dir.path())
-            .status()
-            .expect("git is on PATH");
-        assert!(status.success(), "git init failed");
-        // An identity, because a commit without one fails. A developer's
-        // machine has a global `user.email` and a CI runner does not, so
-        // leaving this out makes the fixture pass locally and fail only on
-        // CI, which is where this test failed on the repository's very first
-        // push. `deploy.rs` and `optin.rs`'s own fixtures already set one.
-        for (key, value) in [("user.email", "test@example.com"), ("user.name", "test")] {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .arg("config")
-                .arg(key)
-                .arg(value)
-                .status()
-                .expect("git is on PATH");
-            assert!(status.success(), "git config {key} failed");
-        }
-        for (name, contents) in files {
-            std::fs::write(dir.path().join(name), contents).expect("write fixture file");
-        }
+        let dir = fixtures::empty_checkout();
+        fixtures::write_files(dir.path(), files);
         dir
     }
 
@@ -276,15 +528,10 @@ mod tests {
         std::fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
             deployed: sha.map(str::to_owned),
             failed: failed.map(str::to_owned),
-            verify: crate::state::Verify::default(),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: std::path::PathBuf::from("/srv/x"),
+            ..crate::fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -359,7 +606,7 @@ mod tests {
             home.path(),
             "bpm",
             Watch::Manual,
-            Some("a1b2c3d4e5f6"),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
             None,
         );
 
@@ -422,8 +669,8 @@ mod tests {
             home.path(),
             "bpm",
             Watch::Auto,
-            Some("a1b2c3d4e5f6"),
-            Some("d4e5f6a7b8c9"),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            Some("d4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b8c9d4e5"),
         );
 
         let row = render(&[(
@@ -455,8 +702,8 @@ mod tests {
             home.path(),
             "bpm",
             Watch::Manual,
-            Some("a1b2c3d4e5f6"),
-            Some("d4e5f6a7b8c9"),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+            Some("d4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b8c9d4e5"),
         );
 
         let row = render(&[(
@@ -480,22 +727,22 @@ mod tests {
                 "bpm".to_owned(),
                 Standing::Watched {
                     branch: "main".to_owned(),
-                    sha: Some("a1b2c3d4e5f6".to_owned()),
+                    sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
                 },
             ),
             (
                 "koji-staging".to_owned(),
                 Standing::Manual {
                     branch: "main".to_owned(),
-                    sha: Some("a1b2c3d4e5f6".to_owned()),
+                    sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
                 },
             ),
             (
                 "reactmap-eu".to_owned(),
                 Standing::Held {
                     branch: "main".to_owned(),
-                    sha: Some("a1b2c3d4e5f6".to_owned()),
-                    failed: "d4e5f6a7b8c9".to_owned(),
+                    sha: Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_owned()),
+                    failed: "d4e5f6a7b8c9d4e5f6a7b8c9d4e5f6a7b8c9d4e5".to_owned(),
                 },
             ),
             ("reactmap".to_owned(), Standing::NeedsSetup),
