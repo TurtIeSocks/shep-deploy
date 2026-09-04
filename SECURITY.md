@@ -47,18 +47,32 @@ gap on 2026-08-28 and reached the deploy tree's own `deploy.toml`, whose
 `remote` every later fetch reads. Absolute and `..`-bearing artifact paths are
 refused at parse time now, and again before the copy.
 
-A residual remains on the destination and is worth naming. The copy resolves
-where an artifact's destination really lands, then opens it. A component
-swapped for a symlink between those two steps is followed, because the kernel
-honours `O_NOFOLLOW` on a path's last component and on nothing above it. A
-component that is already a link when the first check runs is refused at any
-depth IF it resolves outside the release and the cache, which is the check that
-matters. A link staying inside them is allowed, and has to be, because
-`shared::link_cache` makes `release/target` one. The destination is resolved
-again immediately before the open, so the window is one call wide. Closing the
-rest needs a handle-based walk, which is a dependency and a rewrite rather than
-a line. `docs/specs/deferred.md` records what such a fix has to satisfy, and
-what three attempts at describing one got wrong.
+A residual on the destination was open for four review rounds and closed on
+2026-09-04. The copy used to resolve where a destination really landed and then
+open it, and a component swapped for a symlink between those two steps was
+followed: the kernel honours `O_NOFOLLOW` on a path's last component and on
+nothing above it. Both ends are now walked one component at a time from the
+release or the build cache, with `openat` and `O_NOFOLLOW | O_DIRECTORY`
+against the descriptor of the directory above, so nothing between a root and
+the file is resolved by name at open time.
+
+A component that answers `ELOOP` is read with `readlinkat` and followed only
+when it names one of the two roots exactly, which is what keeps
+`shared::link_cache`'s `release/target` working. The walk continues from that
+root's own descriptor rather than from wherever the link pointed. Missing
+destination parents are made with `mkdirat` on the walked descriptor, and the
+file itself is opened `O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW`. The
+name-based checks still run first, because a walk can only refuse and they are
+what say which end resolved where. A test races two thousand copies against a
+thread swapping a parent directory for a symlink outside both roots. Against a
+walk that follows such a component it goes red in a hundredth of a second.
+
+A source that is not a regular file is refused, and it is opened `O_NONBLOCK`
+so that refusal cannot be made to wait. Opening a named pipe for reading blocks
+until something opens it for writing, and nothing above the copy bounds that: a
+build's own budget is spent and its process group killed before any artifact is
+copied. A build that ran `mkfifo target/koji` and exited 0 used to leave the
+dog waiting forever, with the tree lock held.
 
 **The cleared environment bounds what a build inherits from this process.** A
 build gets `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, whatever `passthrough` names

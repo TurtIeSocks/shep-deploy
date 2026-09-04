@@ -61,13 +61,18 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt as _;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use serde::Deserialize;
 use std::os::unix::process::CommandExt as _;
 
@@ -75,7 +80,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::error::Error;
-use crate::shared::{is_eloop, o_nofollow, printable};
+use crate::shared::printable;
 
 /// The environment variables a build keeps from this process, by name.
 ///
@@ -406,6 +411,228 @@ fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
     resolve_deepest(candidate).is_some_and(|real| roots.iter().any(|root| real.starts_with(root)))
 }
 
+/// How every directory in a [`Walk`] is opened.
+///
+/// `O_NOFOLLOW` so a component that is a symlink is refused by the kernel
+/// rather than followed, and `O_DIRECTORY` so one that has become a regular
+/// file is refused too. Both are decided at open time, which is what makes
+/// them different in kind from a check on a name.
+const WALK_DIRECTORY: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+/// The refusal an end of a copy earns when a name stops meaning what it meant
+/// while the copy was using it.
+///
+/// Deliberately the same sentence for every way that can happen. An operator
+/// reading it cannot act on which component moved, and whoever moved it does
+/// not need telling how far they got.
+fn raced(artifact: &Path) -> Error {
+    Error::Config(format!(
+        "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
+        printable(artifact.display())
+    ))
+}
+
+/// One end of a copy, resolved into the root it lands under and the
+/// components that reach it from there.
+///
+/// Splitting a path that way is what makes a handle-based walk possible.
+/// Handed a whole path, the kernel resolves every directory above the last
+/// one by name and follows whatever symlink it finds there; `O_NOFOLLOW`
+/// governs the last component and nothing above it. Handed a root and a list
+/// of names, [`Self::parent`] can open them one at a time against the
+/// descriptor of the one before, so nothing above the leaf is ever resolved
+/// by name twice and a directory swapped mid-walk is refused instead of
+/// followed.
+///
+/// The resolution done here is a snapshot and is not trusted as one. It picks
+/// which names to walk; the walk is what decides where they may go.
+struct Walk<'a> {
+    /// The two directories an artifact may land under, resolved. Both ends of
+    /// a copy are confined to these, and a symlinked component is followed
+    /// only when it names one of them.
+    roots: &'a [PathBuf; 2],
+    /// The one of `roots` this end lands under, and where its walk starts.
+    root: PathBuf,
+    /// The directories to walk through from `root`, in order.
+    parents: Vec<OsString>,
+    /// The file itself, opened from the descriptor `parents` ends at.
+    leaf: OsString,
+    /// The entry being copied, for the refusals this reports.
+    artifact: &'a Path,
+    /// This end's whole path, for the [`Error::Io`] it reports.
+    path: PathBuf,
+}
+
+impl<'a> Walk<'a> {
+    /// Resolves `path` against `roots`, or `None` if it lands under neither.
+    ///
+    /// The deepest ancestor of `path` that exists is canonicalised, exactly
+    /// as [`resolve_deepest`] does it and for the same reason, and whatever
+    /// of `path` does not exist yet is appended verbatim. A destination's own
+    /// name is normally in that second part, and so are the directories a
+    /// redirected build's output tree still needs.
+    ///
+    /// `None` is not the message an operator reads. [`lands_within`] has
+    /// already answered the same question by name, and its answer says which
+    /// end resolved where; this one only has to be right.
+    fn new(roots: &'a [PathBuf; 2], artifact: &'a Path, path: &Path) -> Option<Self> {
+        let mut probe = path.to_owned();
+        let mut tail = Vec::new();
+        let real = loop {
+            if let Ok(real) = probe.canonicalize() {
+                break real;
+            }
+            tail.push(probe.file_name()?.to_owned());
+            if !probe.pop() {
+                return None;
+            }
+        };
+        tail.reverse();
+
+        let root = roots.iter().find(|root| real.starts_with(root))?;
+        let mut rest: Vec<OsString> = real
+            .strip_prefix(root)
+            .ok()?
+            .components()
+            .map(|component| component.as_os_str().to_owned())
+            .collect();
+        rest.extend(tail);
+        // A path that IS a root has no last component to open. An entry can
+        // reach that: `artifacts = ["target"]` under a `CARGO_TARGET_DIR`
+        // redirect resolves its source to the redirect itself. `copy_artifact`
+        // refuses it by name before either walk is built, so `None` here is a
+        // root that appeared underneath one, which is a race like any other.
+        let leaf = rest.pop()?;
+
+        Some(Self {
+            roots,
+            root: root.clone(),
+            parents: rest,
+            leaf,
+            artifact,
+            path: path.to_owned(),
+        })
+    }
+
+    /// Opens the directory [`Self::leaf`] lives in, one component at a time
+    /// from `root`'s own descriptor.
+    ///
+    /// `create` makes the directories a destination needs on the way, with
+    /// `mkdirat` on the descriptor the walk has reached rather than
+    /// `create_dir_all` on a name.
+    fn parent(&self, create: bool) -> Result<OwnedFd, Error> {
+        let mut dir = self.open_root(&self.root)?;
+        for component in &self.parents {
+            dir = self.step(&dir, component, create)?;
+        }
+        Ok(dir)
+    }
+
+    /// The file this walk ends at.
+    fn leaf(&self) -> &OsStr {
+        &self.leaf
+    }
+
+    /// One component of the walk, opened against the one above it.
+    fn step(&self, dir: &OwnedFd, component: &OsStr, create: bool) -> Result<OwnedFd, Error> {
+        match rustix::fs::openat(dir, component, WALK_DIRECTORY, Mode::empty()) {
+            Ok(fd) => Ok(fd),
+            // A symlink where a directory was. `O_NOFOLLOW` answers `ELOOP`
+            // for one, and a kernel that got far enough to see it is not a
+            // directory answers `ENOTDIR`. Both mean the same thing here, and
+            // `follow` puts the kernel's own error back if the component
+            // turns out not to be a link at all.
+            Err(errno) if errno == Errno::LOOP || errno == Errno::NOTDIR => {
+                self.follow(dir, component, errno)
+            }
+            Err(errno) if errno == Errno::NOENT && create => {
+                // `EEXIST` is the build's own output tree, or a concurrent
+                // artifact, having got here first. The open below is what
+                // decides whether what is there now can be walked through.
+                match rustix::fs::mkdirat(dir, component, Mode::from_bits_truncate(0o755)) {
+                    Ok(()) => {}
+                    Err(errno) if errno == Errno::EXIST => {}
+                    Err(errno) => return Err(self.io(errno)),
+                }
+                rustix::fs::openat(dir, component, WALK_DIRECTORY, Mode::empty())
+                    .map_err(|errno| self.refuse(errno))
+            }
+            Err(errno) => Err(self.io(errno)),
+        }
+    }
+
+    /// Continues the walk from the root a symlinked component names, or
+    /// refuses the component.
+    ///
+    /// A symlinked component is not wrong by itself, which is the constraint
+    /// every earlier attempt at this walk broke: `shared::link_cache` makes
+    /// `release/target` a link at the dog's own cache on purpose, so refusing
+    /// every one of them refuses the ordinary cargo arrangement.
+    ///
+    /// So one is followed, and only ever to a root, and the walk then
+    /// continues from THAT root's own descriptor rather than from anything
+    /// the link resolved to. A link naming a root is worth no more than the
+    /// root itself, which is the property that makes reading it safe.
+    fn follow(&self, dir: &OwnedFd, component: &OsStr, original: Errno) -> Result<OwnedFd, Error> {
+        let Ok(target) = rustix::fs::readlinkat(dir, component, Vec::new()) else {
+            // Not a link after all, so `ENOTDIR` came from a regular file or
+            // something else that is simply not a directory. The kernel's own
+            // answer is the honest one to report.
+            return Err(self.io(original));
+        };
+        let target = PathBuf::from(OsString::from_vec(target.into_bytes()));
+        // A relative target is refused rather than resolved. This holds the
+        // descriptor of the directory the link sits in and deliberately not
+        // that directory's name, so there is nothing to resolve a relative
+        // target against, and canonicalising it against this process's own
+        // working directory would answer for somewhere else entirely.
+        //
+        // Nothing legitimate is lost. `shared::link_cache` writes an absolute
+        // target, and a link that is already there when the path is resolved
+        // is followed by `Walk::new` whatever its spelling. What reaches here
+        // is a component that became a link while the walk ran.
+        let named = target
+            .canonicalize()
+            .ok()
+            .filter(|_| target.is_absolute())
+            .filter(|real| self.roots.iter().any(|root| root == real));
+        match named {
+            Some(real) => self.open_root(&real),
+            None => Err(raced(self.artifact)),
+        }
+    }
+
+    /// Opens one of the two roots, the only directory a walk resolves by name.
+    ///
+    /// Safe to do by name because [`artifact_roots`] canonicalised both, so
+    /// neither ends in a symlink, and because a root is where the walk's
+    /// trust comes from rather than something it derives.
+    fn open_root(&self, root: &Path) -> Result<OwnedFd, Error> {
+        rustix::fs::open(root, WALK_DIRECTORY, Mode::empty()).map_err(|errno| self.io(errno))
+    }
+
+    /// The kernel's own answer, against this end's path.
+    fn io(&self, errno: Errno) -> Error {
+        Error::Io {
+            path: self.path.clone(),
+            source: io::Error::from(errno),
+        }
+    }
+
+    /// Whichever of the two a failed open deserves: a refusal when it failed
+    /// because something moved, the kernel's answer otherwise.
+    fn refuse(&self, errno: Errno) -> Error {
+        if errno == Errno::LOOP || errno == Errno::NOTDIR {
+            raced(self.artifact)
+        } else {
+            self.io(errno)
+        }
+    }
+}
+
 /// Copies one declared artifact from wherever the build actually left it
 /// into its named path inside `release`.
 ///
@@ -417,18 +644,29 @@ fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
 /// source. Skipping unconditionally would corrupt exactly the artifacts
 /// this function exists to preserve.
 ///
+/// Both ends are opened through [`Walk`], a per-component walk from one of
+/// the two roots that never resolves a directory by name twice. That is what
+/// bounds the copy, and it is a different thing from the `lands_within` pair
+/// that runs first: those answer where a name resolves, and produce the
+/// message an operator reads. The walk answers where a handle goes, and can
+/// only refuse.
+///
 /// # Errors
 /// [`Error::Config`], naming the entry, in four cases: `artifact` is absolute
 /// or contains `..` (see [`contained_artifacts`] for why that is a security
 /// boundary); either end resolves outside the release and the build cache;
-/// the destination changed underneath the check; or the build never produced
-/// it at the path declared. [`Error::Io`] naming the destination's parent if
-/// that directory cannot be created, the destination if it cannot be opened or
-/// have its permissions set, and the source in every other case - including a
-/// write to the destination that fails. `io::copy` does not report which side
-/// of a copy an error came from, so the one path it can name is the artifact
-/// that could not be copied. Read `No space left on device` against a source
-/// path as the release's filesystem rather than the cache's.
+/// the walk found a component that moved while it ran; or the build never
+/// produced it at the path declared. Three more name a file that cannot be
+/// one: the entry names the release or the build cache itself, its source is
+/// not a regular file, or its destination exists and is not one, which is
+/// refused rather than replaced. [`Error::Io`] naming the end being
+/// walked if a directory on the way to it cannot be opened or created, the
+/// destination if it cannot be opened or have its permissions set, and the
+/// source in every other case - including a write to the destination that
+/// fails. `io::copy` does not report which side of a copy an error came from,
+/// so the one path it can name is the artifact that could not be copied. Read
+/// `No space left on device` against a source path as the release's
+/// filesystem rather than the cache's.
 fn copy_artifact(
     release: &Path,
     roots: &[PathBuf; 2],
@@ -437,10 +675,10 @@ fn copy_artifact(
 ) -> Result<(), Error> {
     // Checked again here, not only in `contained_artifacts`, because a
     // `BuildSpec` can be built in code without going through the parser -
-    // every test in this module does exactly that. Placed BEFORE the
-    // `create_dir_all` below so a refused artifact cannot leave directories
-    // behind on its way out, and before the `from == to` guard because that
-    // guard is what hides the escape in the no-`CARGO_TARGET_DIR` case.
+    // every test in this module does exactly that. Placed BEFORE the walk
+    // below so a refused artifact cannot leave directories behind on its way
+    // out, and before the `from == to` guard because that guard is what hides
+    // the escape in the no-`CARGO_TARGET_DIR` case.
     if artifact.is_absolute()
         || artifact
             .components()
@@ -472,6 +710,26 @@ fn copy_artifact(
                     .display()
             )));
         }
+
+        // An entry can name a root outright. `artifact_source` strips
+        // `target` and rejoins the rest onto `CARGO_TARGET_DIR`, so
+        // `artifacts = ["target"]` under a redirect resolves its source to
+        // the redirect itself, and its destination through the link
+        // `link_cache` leaves at `release/target`. Both are the cache.
+        //
+        // Said here rather than left to `Walk`, which has no last component
+        // to open in that case and can only report it as a component that
+        // moved. Nothing moved, and an operator told otherwise goes looking
+        // for a build job that does not exist.
+        // The path itself, not its deepest existing ancestor: a destination
+        // that does not exist yet has one, and it is normally the release.
+        if path.canonicalize().is_ok_and(|real| roots.contains(&real)) {
+            return Err(Error::Config(format!(
+                "build.artifacts entry `{}` names the release or its build cache as its \
+                 {end}, which is a directory rather than a file the build produced",
+                printable(artifact.display())
+            )));
+        }
     }
 
     if from == to {
@@ -496,45 +754,78 @@ fn copy_artifact(
         return Ok(());
     }
 
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(Error::at(parent))?;
-    }
+    // Both ends are opened through a walk that starts at one of the two roots
+    // and never resolves a directory by name again. That is the whole fix for
+    // the race this function spent four review rounds narrowing: every check
+    // above resolves a NAME, and a build's backgrounded job can swap a
+    // directory above either end between a name being approved and the same
+    // name being followed. `O_NOFOLLOW` does not help, because the kernel
+    // honours it on the last component and follows every directory above it.
+    //
+    // The walk cannot produce the message an operator reads, because by the
+    // time it refuses, the thing it refused is usually no longer there to be
+    // named. That is what the `lands_within` pair above is for: it answers
+    // the same question by name, first, and says which end resolved where.
+    let (Some(source_walk), Some(dest_walk)) = (
+        Walk::new(roots, artifact, &from),
+        Walk::new(roots, artifact, &to),
+    ) else {
+        return Err(raced(artifact));
+    };
 
-    // Opened BEFORE the last containment check, and the check then runs
-    // against the object actually opened rather than against the name again.
+    let source_dir = source_walk.parent(false)?;
+    // `O_NONBLOCK` because a build can leave a named pipe at a declared
+    // artifact path, and opening one for reading waits for a writer. The type
+    // check below runs on the handle, so it never got the chance, and nothing
+    // above bounds this: the build's own budget is spent before any artifact
+    // is copied, and its process group is killed. A build that ran
+    // `mkfifo target/koji` and exited 0 left the dog waiting forever for a
+    // writer that was already dead, with the tree lock held.
     //
-    // The build's own command can leave a background job running: `sh -c`
-    // exits, `run` returns, and that job keeps going. It can swap a component
-    // for a symlink in the gap between a name being approved and the same name
-    // being followed a second time by `fs::copy`. Checking a path, then using
-    // the path, is the check-then-use shape this whole review has been about.
-    //
-    // Comparing device and inode is what makes the two the same thing: the
-    // handle cannot be redirected once open, so if the file it refers to is
-    // the same file the resolved-and-contained path names, the read is of
-    // something that passed the check.
-    let mut source = fs::File::open(&from).map_err(Error::at(&from))?;
+    // It changes nothing for a regular file, which is the only thing this
+    // copies. Both kernels ignore the flag there.
+    let source = rustix::fs::openat(
+        &source_dir,
+        source_walk.leaf(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| {
+        // `ELOOP` is the source itself being a symlink, which the walk
+        // refuses at the leaf the same way it refuses one in the middle. A
+        // build's output is a file; a link where one should be is either the
+        // swap this walk exists for or a build declaring something it did not
+        // produce, and neither is worth following.
+        if errno == Errno::LOOP {
+            raced(artifact)
+        } else {
+            Error::Io {
+                path: from.clone(),
+                source: io::Error::from(errno),
+            }
+        }
+    })?;
+    let mut source = fs::File::from(source);
     let opened = source.metadata().map_err(Error::at(&from))?;
-    let resolved = resolve_deepest(&from)
-        .and_then(|real| fs::metadata(real).ok())
-        .filter(|named| named.dev() == opened.dev() && named.ino() == opened.ino());
-    if resolved.is_none() || !lands_within(roots, &from) {
+
+    // Refused here, before the destination is walked, because opening a
+    // directory read-only succeeds and nothing else would have caught it:
+    // `artifacts = ["target/dist"]` under a redirect walked the destination,
+    // made its parents, created the destination itself, and only then failed
+    // in `io::copy` with `EISDIR` against the source. The build fails either
+    // way. What it left behind was an empty file in the release and a
+    // directory tree made for it.
+    //
+    // Same reasoning as the lexical check at the top of this function: a
+    // refusal that can happen before anything is created should.
+    if !opened.file_type().is_file() {
         return Err(Error::Config(format!(
-            "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
+            "build.artifacts entry `{}` names a source that is not a regular file; \
+             artifacts are copied one file at a time",
             printable(artifact.display())
         )));
     }
 
-    // `O_NOFOLLOW` on the destination, because the source was the only half
-    // the previous fix covered. `File::create` follows symlinks and truncates,
-    // so a component swapped in after the check was followed at write time,
-    // at the dog's uid. Measured 2026-08-28: a background job toggling
-    // `release/target` between a directory and a symlink won that race in
-    // 0.03s and put build output outside the release.
-    //
-    // Refusing rather than resolving-and-rechecking: the kernel deciding at
-    // open time is not a race, and a legitimate artifact destination is never
-    // a symlink.
     // Identity, not spelling. `link_cache` symlinks `release/target` at the
     // dog's own cache, so a redirect through `CARGO_TARGET_DIR` gives a source
     // and a destination that differ as strings and name one file. The lexical
@@ -545,116 +836,108 @@ fn copy_artifact(
     // this and guarded it lexically, which held only while `fs::copy` was the
     // route. Replacing it with an explicit open reopened the hole, so the
     // guard is now on the same footing as the source check above it.
+    //
+    // Still by name rather than through the walk, and safe that way round: a
+    // wrong answer here can only skip a copy, never redirect one. The open
+    // below is what decides where anything is written.
     if fs::metadata(&to)
         .is_ok_and(|there| there.dev() == opened.dev() && there.ino() == opened.ino())
     {
         return Ok(());
     }
 
-    // Resolved once more, because every line between the first check and this
-    // open is a window a backgrounded build job can act in, and the first
-    // check is several syscalls back: a `create_dir_all`, the source's own
-    // open and two stats. `O_NOFOLLOW` below does not cover this - the kernel
-    // honours it on the last component and follows every directory above it,
-    // so a component swapped for a link during that window was followed.
-    //
-    // What is left is the gap between this line and the open itself. Closing
-    // that needs a handle-based walk, which is a dependency and a rewrite
-    // rather than a line this crate can spell: `docs/specs/deferred.md`
-    // records the constraints such a walk has to satisfy, and what three
-    // attempts at describing one got wrong. A recorded decision rather than
-    // an oversight either way.
-    //
-    // A component that is ALREADY a link when the first check runs is caught
-    // there rather than here, at any depth, because `resolve_deepest` follows
-    // the whole chain. Refusing every symlinked component instead was tried
-    // and is wrong: `shared::link_cache` makes `release/target` a link at the
-    // dog's own cache, so that refusal broke the ordinary cargo arrangement.
-    if !lands_within(roots, &to) {
-        return Err(Error::Config(format!(
-            "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
-            printable(artifact.display())
-        )));
-    }
+    let dest_dir = dest_walk.parent(true)?;
+    let leaf = dest_walk.leaf();
 
-    // Unlinked first, then created fresh with `create_new`, and the two
-    // together are the fix for a hard link. The checks above resolve names
-    // and compare inodes, and a hard link has neither a name to resolve nor
-    // an inode of its own: `release/dist/app.js` linked by the build to a
-    // file elsewhere on the same filesystem passes every one of them, and
-    // opening it for writing then truncates and rewrites the far file at the
-    // dog's uid. `remove_file` takes the link away without touching what it
-    // pointed at, and `create_new` refuses to open anything that appeared in
-    // between.
+    // Unlinked first, then created fresh with `O_EXCL`, and the two together
+    // are the fix for a hard link. The checks above resolve names and compare
+    // inodes, and a hard link has neither a name to resolve nor an inode of
+    // its own: `release/dist/app.js` linked by the build to a file elsewhere
+    // on the same filesystem passes every one of them, and opening it for
+    // writing then truncates and rewrites the far file at the dog's uid.
+    // Unlinking takes the link away without touching what it pointed at, and
+    // `O_EXCL` refuses to open anything that appeared in between.
     //
     // Only a regular file is unlinked. A directory, a symlink or anything
     // else at the destination is not an artifact the build left, and
     // unlinking it would take the release's own `target -> cache` link with
-    // it when `artifacts` names `target` itself, so those are refused. The
-    // window between this look, the unlink and the open is the one
-    // `docs/specs/deferred.md` records; what a job swapping a parent for a
-    // link inside it can cost is a file unlinked as well as one written.
-    match fs::symlink_metadata(&to) {
-        Ok(there) if !there.file_type().is_file() => {
+    // it when `artifacts` names `target` itself, so those are refused.
+    //
+    // Both syscalls take the walked descriptor rather than the path, so the
+    // window that used to sit between this look, the unlink and the open is
+    // now a window in which the name can change but the directory it is
+    // looked up in cannot.
+    match rustix::fs::statat(&dest_dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(there) if FileType::from_raw_mode(there.st_mode) != FileType::RegularFile => {
             return Err(Error::Config(format!(
                 "build.artifacts entry `{}` names a destination that is not a regular file; \
                  refusing to replace it",
                 printable(artifact.display())
             )));
         }
-        Ok(_) => match fs::remove_file(&to) {
+        Ok(_) => match rustix::fs::unlinkat(&dest_dir, leaf, AtFlags::empty()) {
             Ok(()) => {}
-            // Gone between the look and the unlink: the window the comment
-            // above names, and nothing to remove is not a failure.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(Error::at(&to)(err)),
+            // Gone between the look and the unlink, and nothing to remove is
+            // not a failure.
+            Err(errno) if errno == Errno::NOENT => {}
+            Err(errno) => {
+                return Err(Error::Io {
+                    path: to.clone(),
+                    source: io::Error::from(errno),
+                });
+            }
         },
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => {
+        Err(errno) if errno == Errno::NOENT => {}
+        Err(errno) => {
             return Err(Error::Io {
                 path: to.clone(),
-                source: err,
+                source: io::Error::from(errno),
             });
         }
     }
-    let mut sink = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(o_nofollow())
-        .open(&to)
-        .map_err(|err| {
-            // Something reappeared at the name between the unlink and the
-            // open. A backgrounded build job is the only thing that could,
-            // and the copy is refused rather than written through it. Said
-            // as a refusal, because the raw `File exists` or `Too many
-            // levels of symbolic links` reads as a broken host.
-            if err.kind() == io::ErrorKind::AlreadyExists || is_eloop(&err) {
-                Error::Config(format!(
-                    "build.artifacts entry `{}` had its destination replaced underneath the \
-                     copy; refusing to write through it",
-                    printable(artifact.display())
-                ))
-            } else {
-                Error::Io {
-                    path: to.clone(),
-                    source: err,
-                }
+
+    // Created 0o600 and widened afterwards, so nothing can open the
+    // destination while a build's output is still going into it.
+    let sink = rustix::fs::openat(
+        &dest_dir,
+        leaf,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|errno| {
+        // Something reappeared at the name between the unlink and the open. A
+        // backgrounded build job is the only thing that could, and the copy is
+        // refused rather than written through it. Said as a refusal, because
+        // the raw `File exists` or `Too many levels of symbolic links` reads
+        // as a broken host.
+        if errno == Errno::EXIST || errno == Errno::LOOP {
+            Error::Config(format!(
+                "build.artifacts entry `{}` had its destination replaced underneath the \
+                 copy; refusing to write through it",
+                printable(artifact.display())
+            ))
+        } else {
+            Error::Io {
+                path: to.clone(),
+                source: io::Error::from(errno),
             }
-        })?;
+        }
+    })?;
+    let mut sink = fs::File::from(sink);
     io::copy(&mut source, &mut sink).map_err(Error::at(&from))?;
 
     // `fs::copy` carried the source's mode and this does not: a file created
-    // by `OpenOptions` gets `0o666 & !umask`, so 0755 arrives as 0644 and the
-    // executable bit is gone. That was silent and total for the arrangement
-    // this whole function exists to serve. `CARGO_TARGET_DIR` points at the
-    // dog's cache, cargo builds the binary there, `copy_artifact` brings it
-    // back so `script = "./target/release/koji"` resolves, and shep then
-    // cannot exec it. The release builds cleanly, fails verification, and is
-    // rolled back for a reason nothing reports.
+    // by an explicit open gets the mode it was created with, so 0755 would
+    // arrive as 0600 and the executable bit would be gone. That was silent and
+    // total for the arrangement this whole function exists to serve.
+    // `CARGO_TARGET_DIR` points at the dog's cache, cargo builds the binary
+    // there, `copy_artifact` brings it back so `script = "./target/release/koji"`
+    // resolves, and shep then cannot exec it. The release builds cleanly, fails
+    // verification, and is rolled back for a reason nothing reports.
     //
     // Set from the handle rather than the path, so it lands on the file that
     // was actually written rather than on whatever the name resolves to now.
-    // Same reasoning as the `O_NOFOLLOW` open above.
+    // Same reasoning as the walked open above.
     //
     // Masked to the ordinary nine bits, which is the difference between
     // copying a mode and copying a privilege. `Permissions` carries setuid,
@@ -1697,12 +1980,12 @@ mod tests {
     ///
     /// `a_committed_target_symlink_cannot_carry_a_write_out` covers `target`
     /// itself. This covers a component one level deeper, which is where the
-    /// round-7 review expected the guard to end: `O_NOFOLLOW` is honoured on
-    /// the leaf only, and `create_dir_all` treats an existing
-    /// symlink-to-directory as a job already done. What actually holds the
-    /// line here is neither of those, it is `lands_within` resolving the
-    /// deepest existing ancestor before anything is created, so the depth of
-    /// the component does not matter.
+    /// round-7 review expected the guard to end, because `O_NOFOLLOW` is
+    /// honoured on the leaf only. Two things hold the line instead, and the
+    /// depth of the component does not matter to either: `lands_within`
+    /// resolves the deepest existing ancestor before anything is created, and
+    /// `Walk` opens every directory below a root against the descriptor of
+    /// the one above it.
     ///
     /// Verified 2026-08-28 that the equivalent link pointing INSIDE the
     /// release does copy through, and that this is correct rather than a
@@ -2006,5 +2289,326 @@ mod tests {
         build(rel.path(), &spec).await.expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
+    }
+
+    /// fails if a component that becomes a symlink to one of the two roots
+    /// stops being followed.
+    ///
+    /// This is constraint 1 in `docs/specs/deferred.md`, and the one every
+    /// earlier attempt at this walk broke: `shared::link_cache` makes
+    /// `release/target` a symlink at the dog's own build cache on purpose, so
+    /// a walk that refuses every symlinked component refuses the ordinary
+    /// cargo arrangement.
+    ///
+    /// Deterministic, where the racing test above is not: `Walk::new` reads
+    /// the path BEFORE the link exists and the walk runs after, which is the
+    /// same order the racer produces and needs no thread to arrange.
+    #[test]
+    fn a_component_that_becomes_a_link_to_a_root_is_followed_to_that_root() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let roots = artifact_roots(release.path(), cache.path());
+        let artifact = PathBuf::from("target/koji");
+        let to = release.path().join(&artifact);
+
+        let walk = Walk::new(&roots, &artifact, &to).expect("the destination lands in the release");
+        std::os::unix::fs::symlink(cache.path(), release.path().join("target")).expect("link");
+
+        let dir = walk
+            .parent(false)
+            .expect("a link naming a root is followed");
+        rustix::fs::openat(
+            &dir,
+            walk.leaf(),
+            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY,
+            Mode::from_bits_truncate(0o600),
+        )
+        .expect("the walk ends somewhere writable");
+        assert!(
+            cache.path().join("koji").exists(),
+            "the walk must continue from the root the link named, not from the link"
+        );
+    }
+
+    /// fails if a component that becomes a symlink to anywhere else is
+    /// followed.
+    ///
+    /// The twin of the test above and the reason it is not simply "follow
+    /// symlinks": a link is worth exactly what it names, and anything that is
+    /// not one of the two roots is refused whether it existed when the path
+    /// was resolved or appeared afterwards.
+    #[test]
+    fn a_component_that_becomes_a_link_to_anywhere_else_is_refused() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let outside = fixtures::tempdir();
+        let roots = artifact_roots(release.path(), cache.path());
+        let artifact = PathBuf::from("target/koji");
+        let to = release.path().join(&artifact);
+
+        let walk = Walk::new(&roots, &artifact, &to).expect("the destination lands in the release");
+        std::os::unix::fs::symlink(outside.path(), release.path().join("target")).expect("link");
+
+        let err = walk
+            .parent(false)
+            .expect_err("a link naming neither root must be refused");
+        assert!(
+            format!("{err}").contains("changed underneath the check"),
+            "must say the name stopped meaning what it meant: {err}"
+        );
+        assert!(
+            !outside.path().join("koji").exists(),
+            "nothing may be created outside both roots"
+        );
+    }
+
+    /// fails if an artifact naming one of the two roots is reported as a race.
+    ///
+    /// `artifact_source` strips `target` and rejoins the rest onto
+    /// `CARGO_TARGET_DIR`, so `artifacts = ["target"]` under a redirect
+    /// resolves its SOURCE to the redirect itself. Point that at the dog's own
+    /// cache, as the arrangement this whole branch exists for does, and the
+    /// source IS a root: `Walk` has no last component to open and answers
+    /// `None`.
+    ///
+    /// Refusing is right. Saying "changed underneath the check" is not, because
+    /// nothing changed underneath anything, and an operator who reads that goes
+    /// looking for a build job that does not exist.
+    #[tokio::test]
+    async fn an_artifact_naming_a_root_itself_is_refused_as_a_directory() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+
+        let err = copy_artifact(release.path(), &roots, &env, Path::new("target"))
+            .expect_err("an artifact naming the cache root must be refused");
+
+        assert!(
+            !format!("{err}").contains("changed underneath"),
+            "nothing moved, so the refusal must not blame a race: {err}"
+        );
+        assert!(
+            format!("{err}").contains("rather than a file"),
+            "must say the entry names a directory: {err}"
+        );
+    }
+
+    /// fails if a directory declared as an artifact gets as far as creating
+    /// things in the release before it is refused.
+    ///
+    /// `O_RDONLY | O_NOFOLLOW` on a directory succeeds, and the source's type
+    /// was never checked, so `artifacts = ["target/dist"]` under a redirect
+    /// opened the directory, walked the destination, created its parents and
+    /// then the destination itself, and only failed in `io::copy` with
+    /// `EISDIR`. The build fails either way. What it left behind was an empty
+    /// file in the release and a directory tree made for it.
+    ///
+    /// Same reasoning as the lexical check at the top of `copy_artifact`: a
+    /// refusal that can happen before anything is created should.
+    #[tokio::test]
+    async fn a_directory_declared_as_an_artifact_creates_nothing() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        std::fs::create_dir(cache.path().join("dist")).expect("the build's output dir");
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+
+        let err = copy_artifact(release.path(), &roots, &env, Path::new("target/dist"))
+            .expect_err("a directory is not an artifact");
+
+        assert!(
+            format!("{err}").contains("not a regular file"),
+            "must say what is wrong with the entry: {err}"
+        );
+        assert!(
+            !release.path().join("target").exists(),
+            "a refusal this early must not leave a directory tree in the release"
+        );
+    }
+
+    /// fails if a symlinked component whose target is relative is followed.
+    ///
+    /// `Walk::follow` reads a component with `readlinkat` and holds only the
+    /// descriptor of the directory it sits in, never that directory's name. A
+    /// relative target cannot be resolved from a descriptor without one, and
+    /// canonicalising it against this process's own working directory would
+    /// answer for a completely different place.
+    ///
+    /// So a relative target is refused, and this pins it. Nothing legitimate
+    /// is lost: `shared::link_cache` writes an absolute target, and a link
+    /// that is already there when the path is resolved is followed by
+    /// `Walk::new` whatever its spelling.
+    #[test]
+    fn a_component_that_becomes_a_relative_link_is_refused() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let roots = artifact_roots(release.path(), cache.path());
+        let artifact = PathBuf::from("target/koji");
+        let to = release.path().join(&artifact);
+
+        let walk = Walk::new(&roots, &artifact, &to).expect("the destination lands in the release");
+        // The two fixtures are siblings, so this names the cache root exactly
+        // as a relative path from the release. It is still refused.
+        let sibling = Path::new("..").join(cache.path().file_name().expect("a name"));
+        std::os::unix::fs::symlink(&sibling, release.path().join("target")).expect("link");
+
+        let err = walk
+            .parent(false)
+            .expect_err("a relative link target must be refused");
+        assert!(
+            format!("{err}").contains("changed underneath the check"),
+            "must be the refusal, not the kernel's own error: {err}"
+        );
+    }
+
+    /// fails if a named pipe declared as an artifact stops the copy dead.
+    ///
+    /// Opening a FIFO for reading blocks until something opens it for writing,
+    /// and the regular-file check runs on the handle, so it never got the
+    /// chance. The build's own budget does not cover this: the child is
+    /// reaped and its group killed before any artifact is copied, so a build
+    /// that ran `mkfifo target/koji` and exited 0 left the dog waiting for a
+    /// writer that was already dead. Forever, and with the tree lock held.
+    ///
+    /// `O_NONBLOCK` is what makes the type check reachable. It changes
+    /// nothing for a regular file, which is the only thing this copies.
+    ///
+    /// Run on its own thread with a deadline, because the failure being
+    /// tested is a hang and an assertion cannot be reached from inside one.
+    #[test]
+    fn a_named_pipe_declared_as_an_artifact_does_not_stop_the_copy() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let made = std::process::Command::new("mkfifo")
+            .arg(cache.path().join("koji"))
+            .status()
+            .expect("mkfifo");
+        assert!(
+            made.success(),
+            "the fixture needs a named pipe to prove anything"
+        );
+
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+
+        let (tell, heard) = std::sync::mpsc::channel();
+        let release_path = release.path().to_owned();
+        std::thread::spawn(move || {
+            let answer = copy_artifact(&release_path, &roots, &env, Path::new("target/koji"));
+            let _ = tell.send(format!("{:?}", answer.err()));
+        });
+
+        let answer = heard
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the copy must answer rather than wait for a writer that may never come");
+        assert!(
+            answer.contains("not a regular file"),
+            "a named pipe is not an artifact: {answer}"
+        );
+    }
+
+    /// fails if a directory swapped for a symlink WHILE the copy runs can
+    /// carry the write outside the release and the cache.
+    ///
+    /// The gap this closes is the one `docs/specs/deferred.md` carried through
+    /// four review rounds: every containment check resolves a name, and
+    /// `O_NOFOLLOW` binds only the last component, so a build's backgrounded
+    /// job can swap a DIRECTORY above the destination between the check and
+    /// the open, and the kernel follows it.
+    ///
+    /// A loop against a thread doing nothing but flipping that one component,
+    /// because a single attempt proves nothing either way. Two thousand
+    /// attempts, measured: a walk that follows a swapped parent loses within
+    /// the first few of them, in a hundredth of a second. Nobody won this
+    /// race by hand in round 7, which is what made it read as theatre.
+    ///
+    /// What is asserted is the invariant rather than the outcome of any one
+    /// attempt. A copy may succeed and a copy may be refused, but nothing may
+    /// ever appear outside the two roots.
+    #[test]
+    fn a_parent_swapped_for_a_symlink_during_the_copy_cannot_carry_a_write_out() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let outside = fixtures::tempdir();
+
+        std::fs::create_dir_all(cache.path().join("dist")).expect("build output dir");
+        std::fs::write(cache.path().join("dist/app.js"), b"ARTIFACT").expect("build output");
+
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+        // `target/` is stripped and rejoined onto `CARGO_TARGET_DIR`, so the
+        // source is `<cache>/dist/app.js` and the destination
+        // `<release>/target/dist/app.js`. `dist` is the component the racer
+        // swaps.
+        let artifact = PathBuf::from("target/dist/app.js");
+
+        let swapped = release.path().join("target/dist");
+        std::fs::create_dir_all(&swapped).expect("the destination's parent");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let racer = {
+            let (stop, swapped, elsewhere) = (
+                Arc::clone(&stop),
+                swapped.clone(),
+                outside.path().to_owned(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_dir_all(&swapped);
+                    let _ = std::os::unix::fs::symlink(&elsewhere, &swapped);
+                    let _ = std::fs::remove_file(&swapped);
+                    let _ = std::fs::create_dir_all(&swapped);
+                }
+            })
+        };
+
+        let escaped = outside.path().join("app.js");
+        let mut leaked = None;
+        let mut copied = 0_u32;
+        for _ in 0..2_000 {
+            if copy_artifact(release.path(), &roots, &env, &artifact).is_ok() {
+                copied += 1;
+            }
+            if escaped.exists() {
+                leaked = Some(std::fs::read(&escaped).unwrap_or_default());
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        racer.join().expect("the racer");
+
+        assert!(
+            leaked.is_none(),
+            "a swapped parent carried the copy outside both roots: {:?}",
+            leaked.as_deref().map(String::from_utf8_lossy)
+        );
+        // The positive control. `leaked.is_none()` holds just as well if every
+        // attempt was refused for a reason that has nothing to do with a
+        // swapped parent, and a `Walk::new` that answered `None` every time
+        // would keep this green while proving nothing.
+        assert!(
+            copied > 0,
+            "no attempt copied anything, so the invariant above proves nothing"
+        );
     }
 }

@@ -16,6 +16,16 @@ shep-client = "0.2.0"
 # `signal` for `killpg(2)`; both are safe wrappers, which is what lets a crate
 # that forbids unsafe use them at all.
 nix = { version = "0.29", default-features = false, features = ["fs", "signal"] }
+# Also already in the tree: `tempfile` below depends on it, so this is a
+# second direct edge on something every build of this crate already compiles.
+# `fs` for `openat(2)` and the rest of the handle-based walk in `build.rs`.
+#
+# nix cannot do that walk. Its 0.29 `openat` hands back a bare `RawFd`, and
+# turning one of those into a `File` needs `FromRawFd`, which is unsafe, and
+# `main.rs` forbids unsafe outright. nix 0.31 does return an `OwnedFd`, but
+# shep-core pins 0.29, so taking it would compile two copies of nix. rustix
+# returns an `OwnedFd` and costs no compilation at all.
+rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "process", "signal"] }
 toml = "0.8"
 # The staging file `State::write` goes through is shep-core's

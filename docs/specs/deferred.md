@@ -126,61 +126,72 @@ repository can then name paths under but cannot extend. Same shape as the
 environment allowlist, for the same reason. Not built, because nothing has
 asked for it yet and the narrowing costs nothing until something does.
 
-## Resolve an artifact's destination without a race
+## Resolve an artifact's destination without a race -- FIXED 2026-09-04
 
-`copy_artifact` checks where a destination really lands, then opens it.
-Between those two steps a build's backgrounded job can swap a directory
-component for a symlink, and the kernel follows it: `O_NOFOLLOW` governs the
+`copy_artifact` used to check where a destination really landed, then open it.
+Between those two steps a build's backgrounded job could swap a directory
+component for a symlink, and the kernel followed it: `O_NOFOLLOW` governs the
 last component of a path and nothing above it.
 
-Round 7 of the founder's review raised this from two independent lenses.
-Neither won the race in a harness. This crate has measured a comparable one
-being won in 0.03s, so treat it as narrow rather than as theatre.
+Both ends of a copy are now walked one component at a time from an approved
+root, with `openat` and `O_NOFOLLOW | O_DIRECTORY` against the descriptor of
+the directory above, so no directory between a root and the file is resolved
+by name at open time. A component that answers `ELOOP` is read with
+`readlinkat` and followed only when it names one of the two roots exactly, and
+the walk continues from that root's own descriptor rather than from wherever
+the link pointed. Missing destination parents are made with `mkdirat` on the
+walked descriptor; the file is opened `O_CREAT | O_EXCL | O_WRONLY |
+O_NOFOLLOW`. `src/build.rs`'s `Walk` is the whole of it.
 
-Two things narrow it already. A component that is a symlink when the first
-check runs is refused at any depth IF it resolves outside the release and the
-cache, because `lands_within` resolves the deepest existing ancestor rather
-than trusting the spelling. And the destination is resolved again immediately
-before the open, so what is left is one call rather than the several syscalls
-it was.
+Round 7 of the founder's review raised this from two independent lenses, and
+neither won the race in a harness, which read as narrow. It is not. The
+regression test wins it against the old code in a hundredth of a second, and
+all it took was a thread doing nothing but flipping one directory. A window
+nobody could reproduce by hand was trivial to reproduce with a loop.
 
-### What any fix has to satisfy
+### What the fix had to satisfy
 
-This section used to propose a mechanism. It proposed four, each one correcting
-the last and introducing the next, which is what happens to a design iterated
-in prose and never run. So it now records the constraints instead, and leaves
-the mechanism to whoever builds it against a compiler.
+The section this replaces proposed four mechanisms, each one correcting the
+last and introducing the next, which is what happens to a design iterated in
+prose and never run. The constraints it settled on instead are what the walk
+was built against, and they are kept here because every one of them named a
+version that was tried and was wrong.
 
 1. **A symlinked component is not automatically wrong.** `shared::link_cache`
    makes `release/target` a link on purpose. Refusing every symlinked component
    was the first attempt, and it broke
-   `an_artifact_that_is_already_where_it_belongs_is_not_truncated`.
+   `an_artifact_that_is_already_where_it_belongs_is_not_truncated`. The walk
+   follows one, to a root and no further.
 
 2. **Confinement to the release alone is too tight.** That link points at
    `<tree>/cache/target`, the release's sibling. A release-rooted `openat2`
    with `RESOLVE_IN_ROOT` reinterprets an absolute target against the release
    and clamps a relative one climbing out, so the link resolves nowhere useful.
-   That was the second attempt.
+   That was the second attempt. The walk anchors at whichever of the two roots
+   an end lands under.
 
 3. **Confinement to the tree alone is too loose.** The tree also holds `git/`,
    `current`, `deploy.toml` and `complete/`. An artifact landing on
    `deploy.toml` is the round-1 escape exactly, and a tree-rooted lookup
-   permits it. That was the third.
+   permits it. That was the third. The tree is never a root.
 
 4. **So confinement and containment are two jobs.** Resolution has to be
    anchored somewhere it cannot be walked out of, AND the object it arrives at
    has to be checked as being under the release or the cache. One without the
-   other fails as above. `lands_within` already does the containment half by
-   name; what it cannot do is hold a handle while it does so.
+   other fails as above. `lands_within` still does the containment half, and
+   still runs first: the walk can only refuse, and `lands_within` is what says
+   which end resolved where in the message an operator reads.
 
 5. **It has to hold across both platforms.** `openat2` is Linux 5.6 and later,
-   so anything cross-platform means `cap-std`'s directory handles or a
-   per-component walk built on `openat`.
+   so anything cross-platform meant `cap-std`'s directory handles or a
+   per-component walk built on `openat`. It is the second.
 
-Still deferred, now for the reason that is actually the reason: the window is
-one call wide, what gets written through it is the build's own output, and the
-rewrite touches the most-reviewed function in the crate. Worth its own change
-rather than one made on the way past.
+One thing the constraints did not anticipate. nix cannot do this walk in a
+crate that forbids unsafe: its 0.29 `openat` hands back a bare `RawFd`, and
+turning one of those into a `File` needs `FromRawFd`. nix 0.31 does return an
+`OwnedFd`, but shep-core pins 0.29, so taking it would compile two copies of
+nix. `rustix` returns an `OwnedFd`, is already in the tree under `tempfile`,
+and so costs no compilation at all.
 
 
 ## Two things shep should export, so a dog stops copying them
