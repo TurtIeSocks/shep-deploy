@@ -237,6 +237,18 @@ impl Tree {
         self.root.join("deploy.toml")
     }
 
+    /// The lock every read-modify-write of [`Self::state_file`] holds, so
+    /// two writers cannot each rename their own snapshot over the other's.
+    ///
+    /// Separate from [`Self::lock_file`], which a deploy holds for as long
+    /// as a build takes: this one is held for one read and one write, so
+    /// `--watch manual` typed during a build lands at once. See
+    /// `crate::lock::hold_record`.
+    #[must_use]
+    pub fn record_lock(&self) -> PathBuf {
+        self.root.join("deploy.toml.lock")
+    }
+
     /// The dog's own build cache for this sheep, shared by every release.
     ///
     /// Outside `releases/` deliberately: retention removes worktrees under

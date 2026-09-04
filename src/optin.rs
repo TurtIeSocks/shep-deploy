@@ -155,6 +155,7 @@ pub async fn prepare<D: Daemon>(
         // The tree exists in this case, so the hold litters nothing, and the
         // repair below writes the record under it.
         let _deploying = lock::hold(&tree)?;
+        let _record = lock::hold_record(&tree)?;
         let next = format!(
             "Deploy it with `shep deploy {sheep}`, or change how it is watched with `shep \
              deploy {sheep} --watch auto|manual`."
@@ -505,7 +506,9 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
             // operator costs an instance respawned on the old config on every
             // deploy from now on, so the write's failure is printed rather
             // than allowed to replace the error that names them.
-            if let Err(err) = state.write(&tree.state_file()) {
+            let written =
+                lock::hold_record(&tree).and_then(|_record| state.write(&tree.state_file()));
+            if let Err(err) = written {
                 if outcome.is_ok() {
                     return Err(err);
                 }

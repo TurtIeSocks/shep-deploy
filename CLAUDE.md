@@ -212,6 +212,12 @@ class rather than the instances.
   `CARGO_TARGET_DIR` set.** Without it, source and destination collapse to the
   same path and the self-copy guard returns `Ok` before reaching anything the
   test is about. The test says so in its own doc; do not simplify it.
+- **Two locks per tree, and the order is fixed.** `lock::hold` is the deploy
+  lock, non-blocking, held for a whole build. `lock::hold_record` is the
+  record lock, blocking, held for one read and one write of `deploy.toml`:
+  `set_watch` and every whole-record write in `deploy` and `optin` take it.
+  A deploy takes the tree lock first and the record lock inside; nothing
+  holding the record lock waits for the tree's.
 - **A build's process group is led by a holder, not by the build.** `sh -c
   'read _'` on a pipe the dog holds, so the group id stays reserved after the
   build is reaped and `killpg` cannot land on a recycled pid. Never signal a

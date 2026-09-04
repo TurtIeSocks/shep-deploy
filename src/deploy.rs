@@ -33,7 +33,8 @@
 //! cannot both be inside a deploy of one sheep: the second is refused in one
 //! sentence rather than colliding somewhere inside git. See [`crate::lock`]
 //! for what that collision did before the lock existed. [`set_watch`] does
-//! NOT take it, on purpose, and its own doc says how a `--watch` typed
+//! NOT take it, on purpose; it and every whole-record write a deploy makes
+//! take the record lock instead, and its own doc says how a `--watch` typed
 //! mid-tick and the tick's record write stay out of each other's way.
 //!
 //! Behind the lock there is still one cheap guard: `current` is read when a
@@ -557,9 +558,8 @@ async fn attempt<D: Daemon>(
         Landed::Verified => {
             state.deployed = Some(head.to_owned());
             // The operator's fields from disk, not this deploy's copy of
-            // them: see `adopt_operator_fields`.
-            adopt_operator_fields(tree, state);
-            if let Err(err) = state.write(&tree.state_file()) {
+            // them: see `write_record`.
+            if let Err(err) = write_record(tree, state) {
                 eprintln!("shep-deploy: {sheep}: deployed {head}, but could not record it: {err}");
             }
             Ok(Outcome::Deployed {
@@ -658,15 +658,25 @@ async fn record(
         // read at its own start, and `State::write` replaces the whole
         // record, so writing it blind is last-writer-wins over a record
         // somebody else may have advanced since.
-        match landed_elsewhere(tree, head, failed.as_deref()) {
-            Some(fresher) => *state = fresher,
-            None => {
-                state.failed = failed;
-                adopt_operator_fields(tree, state);
-                if let Err(err) = state.write(&tree.state_file()) {
-                    eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
-                }
+        //
+        // Under the record lock from the re-read to the write, so what was
+        // re-read is what is written over.
+        match lock::hold_record(tree) {
+            Err(err) => {
+                eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
             }
+            Ok(_record) => match landed_elsewhere(tree, head, failed.as_deref()) {
+                Some(fresher) => *state = fresher,
+                None => {
+                    state.failed = failed;
+                    adopt_operator_fields(tree, state);
+                    if let Err(err) = state.write(&tree.state_file()) {
+                        eprintln!(
+                            "shep-deploy: {sheep}: could not record what {head} came to: {err}"
+                        );
+                    }
+                }
+            },
         }
     }
 
@@ -721,6 +731,23 @@ fn adopt_operator_fields(tree: &Tree, state: &mut State) {
     }
 }
 
+/// Writes `state` whole, under the record lock, with the operator's fields
+/// taken from disk first.
+///
+/// The lock is what makes the adopt-then-write one step: without it a
+/// `set_watch` could land between the read `adopt_operator_fields` makes
+/// and the rename this makes, and be renamed over. Every whole-record
+/// write a deploy makes goes through here.
+///
+/// # Errors
+/// [`Error::Io`] if the record lock cannot be taken, and whatever
+/// [`State::write`] returns.
+fn write_record(tree: &Tree, state: &mut State) -> Result<(), Error> {
+    let _record = lock::hold_record(tree)?;
+    adopt_operator_fields(tree, state);
+    state.write(&tree.state_file())
+}
+
 /// The on-disk record, when it already says `head` is deployed and this
 /// attempt is about to say `head` failed.
 ///
@@ -749,8 +776,9 @@ fn adopt_operator_fields(tree: &Tree, state: &mut State) {
 /// is not. Anything writing the record WITHOUT going through `go` still races:
 /// `set_watch` does, by design, so that `--watch manual` lands during a deploy
 /// rather than waiting an hour for its lock; see [`adopt_operator_fields`] for
-/// the other half of that arrangement. One read that refuses to overwrite a
-/// fresher record is cheap enough to keep for those.
+/// the other half of that arrangement, and `lock::hold_record` for the lock
+/// both sides now hold across their read and write. One read that refuses to
+/// overwrite a fresher record is cheap enough to keep under it.
 fn landed_elsewhere(tree: &Tree, head: &str, failing: Option<&str>) -> Option<State> {
     failing?;
     let on_disk = State::read(&tree.state_file()).ok()?;
@@ -972,14 +1000,15 @@ fn undo_swap(
 /// deploy holds the tree's lock from its fetch through its build, which the
 /// default `build_timeout` allows an hour for. A `--watch manual` refused as
 /// `AlreadyDeploying` for that hour is the opposite of what the setting is
-/// for. So this writes without the lock, and the two things that could go
-/// wrong are handled the other way round: the record is re-read immediately
-/// before the write, so a `failed` or `deployed` the tick has recorded since
-/// the caller's read is kept; and every whole-record write a deploy makes
-/// takes `watch` and `verify` from the disk rather than from its own stale
-/// copy, see `adopt_operator_fields`, so the setting lands whichever of the
-/// two writes last. What is left is a window the width of one read and one
-/// write.
+/// for. So this writes without the tree lock, under the record lock instead
+/// (`lock::hold_record`), which every whole-record write a deploy makes
+/// also takes: the read here and the write here are one step nothing can
+/// land between, and the deploy's own writes take `watch` and `verify`
+/// from the disk rather than from their stale copy, see
+/// `adopt_operator_fields`, so the setting survives them. Before the record
+/// lock there was a window the width of one read and one write, in which a
+/// deploy's rename could drop this one or this one drop a `deployed` the
+/// deploy had just recorded.
 ///
 /// # Errors
 /// [`Error::Config`] if `watch` is `auto` and the target's record names no
@@ -990,6 +1019,7 @@ fn undo_swap(
 /// after: the read is this function's, so a caller has nothing older to
 /// print from.
 pub fn set_watch(tree: &Tree, watch: Watch) -> Result<(Watch, State), Error> {
+    let _record = lock::hold_record(tree)?;
     let mut state = State::read(&tree.state_file())?;
     let was = state.watch;
 
@@ -1267,8 +1297,7 @@ async fn restore<D: Daemon>(
 
     if state.deployed.as_deref() != Some(to.as_str()) {
         state.deployed = Some(to.clone());
-        adopt_operator_fields(tree, state);
-        state.write(&tree.state_file())?;
+        write_record(tree, state)?;
     }
 
     match reload_until(daemon, sheep, patience).await {
@@ -2794,6 +2823,51 @@ mod tests {
             Some(fixture.tree.release(&previous)),
             "current goes back to the release the record names"
         );
+    }
+
+    /// fails if a `--watch` and a deploy's record write can drop each
+    /// other's update. Staged exactly: the record lock held as a deploy
+    /// holds it, `set_watch` waiting on another thread, a fresher
+    /// `deployed` written meanwhile, and after the release the record has
+    /// to carry both the fresh sha and the operator's `manual`. Before the
+    /// record lock, `set_watch`'s snapshot renamed over the fresh one.
+    #[test]
+    fn a_watch_set_while_a_deploy_writes_the_record_loses_nothing() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        fs::create_dir_all(tree.root()).expect("tree");
+        let mut state = State {
+            deployed: Some(fixtures::SHA.to_owned()),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("the record before");
+
+        let held = lock::hold_record(&tree).expect("the deploy's hold");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let operator = {
+            let home = home.path().to_owned();
+            std::thread::spawn(move || {
+                let result = set_watch(&Tree::for_sheep(&home, "web"), Watch::Manual);
+                tx.send(()).expect("report");
+                result
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "set_watch must wait for the record lock"
+        );
+
+        // The deploy's write, under its hold.
+        state.deployed = Some(fixtures::OTHER_SHA.to_owned());
+        state.write(&tree.state_file()).expect("the deploy's write");
+        drop(held);
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("set_watch lands");
+        operator.join().expect("thread").expect("sets");
+        let after = State::read(&tree.state_file()).expect("reads");
+        assert_eq!(after.deployed.as_deref(), Some(fixtures::OTHER_SHA));
+        assert_eq!(after.watch, Watch::Manual);
     }
 
     /// fails if a race stops being held. With the tree lock, `current`
