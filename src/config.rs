@@ -110,7 +110,7 @@ pub struct DogConfig {
     /// A build otherwise starts from a cleared environment plus a small fixed
     /// set (see `crate::build::BASE_ENV`), so anything a build needs from the
     /// dog's own environment is opted into here by name and is visible in
-    /// `shep.toml` rather than inherited invisibly.
+    /// `dogs.toml` rather than inherited invisibly.
     pub passthrough: Vec<String>,
 }
 
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// fails if a wrong-typed value produces a message that does not name
-    /// the key. This section is hand-edited in `shep.toml`, and
+    /// the key. This section is hand-edited in `dogs.toml`, and
     /// `retention = "five"` is a plausible thing to write; a bare "invalid
     /// type: string" with no key names nothing an operator can go and fix.
     #[test]

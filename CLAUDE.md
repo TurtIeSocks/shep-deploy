@@ -149,7 +149,12 @@ class rather than the instances.
   `verify = "alive"` into it. It denies unknown fields for that reason; keep it
   that way.
 - **`Error::Config` is built at dozens of sites across ten modules.** It is
-  not the `[dog.deploy]` variant its doc used to claim.
+  not the dog-section variant its doc used to claim.
+- **The dog's section is `[deploy]` in `$SHEP_HOME/dogs.toml`**, since shep
+  0.1.32; before that it was `[dog.deploy]` in `shep.toml`, and a shepherd
+  migrates the old spelling only at boot. A test that writes the section
+  after the shepherd is up has to write the new file, or the dog runs at its
+  default interval. Cost the integration job on 2026-09-04.
 - **`retention` keeps the newest N, and spares two more by name.** The release
   `current` points at and the one `deploy.toml` names are never removed,
   whatever their age. In the ordinary case the live release is the newest, so

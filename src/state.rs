@@ -358,7 +358,7 @@ mod tests {
     /// `Probed`, and the next deploy fails on the identical message with
     /// nothing anywhere indicating the edit did nothing.
     ///
-    /// Matches what `crate::config` already does to a `[dog.deploy]` typo, and
+    /// Matches what `crate::config` already does to a `[deploy]` typo, and
     /// for the same stated reason: a setting that silently does something
     /// other than what it says is worse than one that is refused.
     #[test]

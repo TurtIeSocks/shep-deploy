@@ -605,7 +605,7 @@ impl fmt::Display for Error {
             Self::BuildTimedOut { after } => write!(
                 f,
                 "the build did not finish within {after:?} and was abandoned; raise \
-                 build_timeout in [dog.deploy] if it legitimately needs longer"
+                 build_timeout under [deploy] in dogs.toml if it legitimately needs longer"
             ),
             Self::Build { status } => match status {
                 Some(code) => write!(f, "the build exited with status {code}"),

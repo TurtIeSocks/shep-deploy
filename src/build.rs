@@ -82,7 +82,7 @@ use crate::shared::{is_eloop, o_nofollow, printable};
 /// keep a build's own output readable, and `TZ` keeps a timestamp in a
 /// generated artifact from moving with the machine's default. Everything
 /// else an operator wants is opted into by name through `passthrough` in
-/// `[dog.deploy]`, so it appears in `shep.toml` where it can be read rather
+/// `[deploy]`, so it appears in `dogs.toml` where it can be read rather
 /// than being inherited invisibly.
 ///
 /// Notably absent and absent on purpose: `SSH_AUTH_SOCK`. A forwarded agent
@@ -758,7 +758,7 @@ fn copy_artifact(
 /// [`Error::Build`] if the command launches and
 /// exits non-zero, or is killed by a signal, naming the exit status when there
 /// is one. [`Error::BuildTimedOut`] if it runs past `budget`, which is
-/// `build_timeout` from `[dog.deploy]`.
+/// `build_timeout` from the dog's `[deploy]` section.
 pub async fn run(
     sheep: &str,
     release: &Path,

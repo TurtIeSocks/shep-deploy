@@ -151,7 +151,7 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         // NOT `abandon` here. That signals the process group by negating
         // `child.id()`, which is only safe while the child is alive: by this
         // point `try_wait` has reaped it, and the wait above can have taken
-        // the whole budget, which `[dog.deploy]` allows to be minutes. A pid
+        // the whole budget, which the dog's `[deploy]` section allows to be minutes. A pid
         // recycled in that window would put a SIGKILL into an unrelated
         // process group, and the dog runs as root under the arrangement
         // shep's own docs recommend, so the usual same-uid check would not

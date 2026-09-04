@@ -121,10 +121,10 @@ where every registered sheep stands and starts, registers and writes nothing.
 
 Adopted as a dog, `shep-deploy` takes no arguments and polls instead. Every 30
 seconds by default, it deploys any `watch = "auto"` target whose branch has
-moved. Configure it in `shep.toml`:
+moved. Configure it in `$SHEP_HOME/dogs.toml`:
 
 ```toml
-[dog.deploy]
+[deploy]
 interval = "30s"
 retention = 5
 git_timeout = "5m"
@@ -133,7 +133,9 @@ passthrough = ["CARGO_HOME"]
 ```
 
 All five are read once, when the dog starts, so changing any takes a `shep
-restart deploy`.
+restart deploy`. A shep older than 0.1.32 read the same keys from
+`[dog.deploy]` in `shep.toml`; a newer one moves that section into
+`dogs.toml` the next time the shepherd boots.
 
 `retention` is how many of the newest releases each target keeps. Two are
 spared whatever their age: the one `current` points at, and the one
@@ -399,7 +401,7 @@ operator's, not a deploy dog's.
 
 A build starts from a cleared environment, not this process's. It gets `PATH`,
 `HOME`, `LANG`, `LC_ALL` and `TZ`, whatever `passthrough` names in
-`[dog.deploy]` in `shep.toml`, and the release's own `[dog.deploy.build] env`.
+`[deploy]` in `dogs.toml`, and the release's own `[dog.deploy.build] env`.
 Nothing else. Dropping uid and gid bounds what a build can touch; it does
 nothing about what it can read out of its own environment, because those values
 are copied in before the drop happens. A dog started with a registry token in

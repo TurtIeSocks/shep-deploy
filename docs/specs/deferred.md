@@ -41,7 +41,7 @@ artifact escape at the kernel rather than at a path check.
 **What makes this a deferral rather than a task.** It is Linux only, and
 shep-deploy supports macOS too. macOS has Seatbelt (`sandbox_init`), which is
 deprecated, undocumented and awkward to target, so the honest shape is
-`sandbox = "landlock"` in `[dog.deploy]`, opt in, a no-op with a note on
+`sandbox = "landlock"` in the dog's `[deploy]` section of `dogs.toml`, opt in, a no-op with a note on
 macOS. A feature that silently does nothing on half the platforms it claims to
 support needs to say so where an operator will read it.
 
@@ -121,7 +121,7 @@ of this crate turns on the difference.
 
 If a build genuinely needs to salvage output from outside the tree, the
 declaration has to come from somewhere the operator controls: an
-`artifact_roots` list in `[dog.deploy]`, alongside `passthrough`, which the
+`artifact_roots` list in the dog's `[deploy]` section, alongside `passthrough`, which the
 repository can then name paths under but cannot extend. Same shape as the
 environment allowlist, for the same reason. Not built, because nothing has
 asked for it yet and the narrowing costs nothing until something does.

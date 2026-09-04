@@ -48,7 +48,7 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// `interval = "1s"`, and the deploy it triggers is a local fetch, a
 /// worktree, a swap and a reload, which the rest of this file does in about
 /// two seconds. Above it: `crate::config`'s `DEFAULT_INTERVAL` is thirty
-/// seconds, so a dog that never found its own `[dog.deploy]` section cannot
+/// seconds, so a dog that never found its own `[deploy]` section cannot
 /// get inside this however healthy it is. That gap is the only thing making
 /// the section's interval observable at all - see
 /// [`the_supervised_dog_deploys_a_moved_branch_without_being_asked`].
@@ -1136,8 +1136,14 @@ fn a_sheep_taken_over_by_setup_follows_a_later_swap() {
 /// anything, so the file reappearing is a tick that ran to completion and
 /// found nothing to do.
 ///
-/// `shep.toml` is written before the adopt, not after, because the dog reads
-/// its section once at startup rather than per tick.
+/// `dogs.toml` is written before the adopt, not after, because the dog reads
+/// its section once at startup rather than per tick. `dogs.toml`, not
+/// `shep.toml`: shep 0.1.32 moved every dog's section there, under its bare
+/// name, and migrates a `[dog.<name>]` still in `shep.toml` only at boot.
+/// This test writes after the shepherd is up, so a section written to the
+/// old file would never be read, and the dog would run at its default
+/// interval and fail the window below. That is what happened the day shep
+/// 0.2.0 shipped.
 ///
 /// # Why the dog's own stdout is asserted on as well
 ///
@@ -1162,10 +1168,10 @@ fn the_supervised_dog_deploys_a_moved_branch_without_being_asked() {
     // A second rather than the default half minute, and the whole test is
     // built to notice the difference.
     fs::write(
-        shepherd.home().join("shep.toml"),
-        "[dog.deploy]\ninterval = \"1s\"\n",
+        shepherd.home().join("dogs.toml"),
+        "[deploy]\ninterval = \"1s\"\n",
     )
-    .expect("write shep.toml");
+    .expect("write dogs.toml");
 
     // Adopted and supervised, with no argv, exactly as the contract says.
     // The name is the binary's own stem with `shep-` stripped, which is what
