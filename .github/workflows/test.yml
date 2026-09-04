@@ -19,6 +19,7 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -30,6 +31,7 @@ jobs:
 
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
@@ -43,6 +45,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
@@ -53,6 +56,7 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       # Matches `rust-version` in Cargo.toml, which matches shep's. A dog
@@ -71,6 +75,7 @@ jobs:
     # here is a real signal against shep's current published surface, not
     # against whatever `main` happens to look like on a given day.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
@@ -78,3 +83,16 @@ jobs:
         run: cargo install shep --locked
       - name: Run the integration tier against it
         run: SHEP_BIN="$(command -v shep)" cargo test --features integration --locked
+
+  audit:
+    # The whole premise of this crate is running code from a tracked branch,
+    # so an advisory against something in its own tree is worth a red job.
+    # `cargo install` rather than a third-party action: one fewer moving tag
+    # in a workflow, at the cost of a minute's compile.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
