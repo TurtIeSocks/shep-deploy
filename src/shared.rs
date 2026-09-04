@@ -16,11 +16,14 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 
 use crate::error::Error;
 
@@ -180,6 +183,29 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
     decode(dir, args, status, stdout, stderr)
 }
 
+/// Kills a whole process group by the leader's pid.
+///
+/// One spelling, shared, because two are what drift. `crate::build` abandons a
+/// build the same way and cannot share the rest: its child is a
+/// `tokio::process::Child` and this one is a `std::process::Child`, so the
+/// fallback differs while the signal and the group form must not.
+///
+/// `killpg(2)` through `nix` rather than spawning `kill`. The spawn was there
+/// because the crate forbids unsafe and `libc::killpg` is unsafe; `nix` wraps
+/// the same call safely and is already a dependency. It also removes the one
+/// place this crate ran a binary found on `PATH` other than `git`, and the
+/// fork it cost on every abandoned build.
+///
+/// The failure is ignored on purpose. Every caller is already giving up on the
+/// child, and a kill that cannot be delivered leaves nothing they can do about
+/// it that they have not already decided. A pid too large for `pid_t` is the
+/// same case: no such group can exist.
+pub(crate) fn kill_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+}
+
 /// Kills a timed-out child and everything it spawned, then reaps it.
 ///
 /// The group, not just the pid. `Child::kill` signals the immediate process
@@ -190,31 +216,12 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
 /// past the budget, which is the exact failure this function exists to
 /// prevent.
 ///
-/// `kill` the command rather than `libc::killpg`, because the crate forbids
-/// unsafe outright. Same "ask the host rather than reimplement its answer"
-/// idiom `crate::build` uses for `id`, and for the same reason.
-///
 /// Reaped afterwards: leaving a zombie git would keep the bare clone's lock
 /// and fail the next tick for a reason that looks unrelated.
-/// Kills a whole process group by the leader's pid.
-///
-/// One spelling, shared, because two are what drift. `crate::build` abandons a
-/// build the same way and cannot share the rest: its child is a
-/// `tokio::process::Child` and this one is a `std::process::Child`, so the
-/// fallback differs while the signal and the group form must not.
-///
-/// The failure is ignored on purpose. Every caller is already giving up on the
-/// child, and a kill that cannot be delivered leaves nothing they can do about
-/// it that they have not already decided.
-pub(crate) fn kill_group(pid: u32) {
-    let group = format!("-{pid}");
-    let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
-}
-
 fn abandon(child: &mut std::process::Child) {
     kill_group(child.id());
-    // The group signal is the one that matters; this covers a host whose
-    // `kill` refuses the group form.
+    // The group signal is the one that matters; this covers a child that
+    // left its group before the signal landed.
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -334,26 +341,44 @@ fn decode(
 /// file impossible to symlink without dragging its tracked siblings along
 /// as dangling links.
 ///
+/// `-z` terminates each entry with NUL instead of newline, and it is the
+/// only output mode in which a path is never quoted. Without it git wraps
+/// any path holding a space, a quote or a non-ASCII byte in `"..."` with
+/// C-style escapes, `core.quotePath=false` notwithstanding, which covers only
+/// the non-ASCII case. The quotes then became part of the path: a
+/// gitignored `sp ace` was linked into the release as `"sp ace"`, pointing at
+/// a file of that name that does not exist, and `symlink(2)` does not check.
+/// Measured 2026-09-03.
+///
 /// # Errors
 /// [`Error::Io`] if `git` cannot be launched or answers with non-UTF-8
 /// bytes; [`Error::Git`] if it launches but exits non-zero.
 pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
     let stdout = run_git(
         checkout,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "status",
-            "--ignored=matching",
-            "--porcelain",
-        ],
+        &["status", "--ignored=matching", "--porcelain", "-z"],
     )?;
 
     Ok(stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("!! "))
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("!! "))
         .map(|path| PathBuf::from(path.trim_end_matches('/')))
         .collect())
+}
+
+/// One `.shepignore` entry, with the two things it can mean told apart at
+/// parse time rather than at every match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// A bare name: matches a path component at any depth, so `node_modules`
+    /// excludes the top-level directory and every `packages/*/node_modules`
+    /// beneath it. `.gitignore`'s own rule for a pattern with no `/`.
+    Anywhere(String),
+    /// A path: matches only that subtree from the checkout root, so
+    /// `packages/app/dist` never touches a top-level `dist`. Written with a
+    /// `/` inside it, or with a leading `/`, which `.gitignore` also reads
+    /// as "anchor this here".
+    Anchored(PathBuf),
 }
 
 /// The patterns listed in `checkout`'s `.shepignore`, one per line, blank
@@ -363,20 +388,26 @@ pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// zero-configuration case - no `.shepignore` means share everything
 /// [`ignored_present`] finds.
 ///
-/// A pattern containing a glob metacharacter (`*`, `?`, `[`) is refused
-/// with [`Error::Config`] rather than accepted and silently matched
-/// against nothing. `.shepignore`'s syntax is narrower than `.gitignore`'s,
-/// see [`to_link`] for what it does support, and an operator who writes
-/// `*.log` believing otherwise deserves a failure they see immediately,
-/// naming the pattern, rather than an artifact this subtraction was built
-/// to keep out quietly staying shared forever because the glob never
-/// matched anything.
+/// Every spelling `.gitignore` allows and this file does not is refused with
+/// [`Error::Config`] naming the pattern, never accepted and silently matched
+/// against nothing: a glob (`*`, `?`, `[`), a negation (`!name`), and a `..`
+/// component. `.shepignore`'s syntax is narrower than `.gitignore`'s, see
+/// [`to_link`] for what it does support, and an operator who writes `*.log`
+/// believing otherwise deserves a failure they see immediately rather than
+/// an artifact this subtraction was built to keep out quietly staying shared
+/// forever because the glob never matched anything.
+///
+/// Two spellings `.gitignore` allows ARE honoured, because each used to be
+/// accepted and then matched nothing: a leading `/` anchors the pattern to
+/// the checkout root, and a trailing `/` is not part of the name. Before
+/// 2026-09-03 `/dist` was read as a two-component path that no relative
+/// entry could ever start with, so the build output it named stayed shared.
 ///
 /// # Errors
 /// [`Error::Io`], naming `checkout/.shepignore`, if the file exists but
 /// cannot be read for any reason other than simply not being there.
-/// [`Error::Config`] if any pattern contains a glob metacharacter.
-pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<String>, Error> {
+/// [`Error::Config`] if any pattern is one of the refused spellings above.
+pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<Pattern>, Error> {
     let path = checkout.join(".shepignore");
 
     let text = match fs::read_to_string(&path) {
@@ -388,41 +419,70 @@ pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<String>, Error> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|pattern| {
-            if pattern.contains(['*', '?', '[']) {
-                Err(Error::Config(format!(
-                    ".shepignore pattern {pattern:?} uses glob syntax (`*`, `?`, `[`), which \
-                     is not supported - a .shepignore pattern is a bare name (matches at any \
-                     depth) or a path containing `/` (anchored to the checkout root), nothing \
-                     else"
-                )))
-            } else {
-                Ok(pattern.to_owned())
-            }
-        })
+        .map(parse_pattern)
         .collect()
 }
 
-/// Whether `path` (relative to the checkout) is named by `.shepignore`
-/// entry `pattern`.
+/// One trimmed, non-blank, non-comment `.shepignore` line as a [`Pattern`].
 ///
-/// Follows `.gitignore`'s own anchoring rule and nothing more: a pattern
-/// with no `/` in it matches a path component at any depth, so
-/// `node_modules` excludes both the top-level directory and every
-/// `packages/*/node_modules` beneath it. A pattern containing `/` is
-/// anchored to the checkout root instead and matches only that exact
-/// subtree, so `packages/app/dist` never touches a top-level `dist`.
-/// Wildcards never reach this function: `shepignore_patterns` refuses any
-/// pattern containing a glob metacharacter before `to_link` ever calls
-/// this, rather than accepting one and silently matching nothing.
-fn pattern_matches(path: &Path, pattern: &str) -> bool {
-    let pattern = Path::new(pattern);
+/// # Errors
+/// [`Error::Config`] naming the line, for a glob, a negation, a `..`
+/// component, or a line that is nothing but slashes.
+fn parse_pattern(line: &str) -> Result<Pattern, Error> {
+    let refuse = |why: &str| {
+        Error::Config(format!(
+            ".shepignore pattern {line:?} {why} - a .shepignore pattern is a bare name \
+             (matches at any depth) or a path containing `/` (anchored to the checkout root), \
+             nothing else"
+        ))
+    };
 
-    if pattern.components().count() == 1 {
-        path.components()
-            .any(|component| component.as_os_str() == pattern.as_os_str())
+    if line.contains(['*', '?', '[']) {
+        return Err(refuse(
+            "uses glob syntax (`*`, `?`, `[`), which is not supported",
+        ));
+    }
+    if line.starts_with('!') {
+        return Err(refuse(
+            "is a negation, which is not supported: everything is shared unless named here",
+        ));
+    }
+
+    let anchored_by_slash = line.starts_with('/');
+    let body = line
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    if body.is_empty() {
+        return Err(refuse("names nothing"));
+    }
+    if Path::new(body)
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(refuse(
+            "climbs out of the checkout with `..`, so it cannot name anything in it",
+        ));
+    }
+
+    if anchored_by_slash || body.contains('/') {
+        Ok(Pattern::Anchored(PathBuf::from(body)))
     } else {
-        path.starts_with(pattern)
+        Ok(Pattern::Anywhere(body.to_owned()))
+    }
+}
+
+/// Whether `path` (relative to the checkout) is named by `pattern`.
+///
+/// The two arms are the two meanings [`Pattern`] documents. Wildcards never
+/// reach here: [`shepignore_patterns`] refuses them before [`to_link`] ever
+/// calls this.
+fn pattern_matches(path: &Path, pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Anywhere(name) => path
+            .components()
+            .any(|component| component.as_os_str() == name.as_str()),
+        Pattern::Anchored(prefix) => path.starts_with(prefix),
     }
 }
 
@@ -561,7 +621,9 @@ pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(
 /// already being there.
 pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
     let link = release.join("target");
-    if link.exists() || link.symlink_metadata().is_ok() {
+    // `symlink_metadata` answers for a directory, a file, a live link and a
+    // dangling one alike, which is every "something is already there".
+    if link.symlink_metadata().is_ok() {
         return Ok(());
     }
 
@@ -871,7 +933,59 @@ mod tests {
             ("dist/app.js", "//"),
         ]);
         let patterns = shepignore_patterns(repo.path()).expect("reads");
-        assert_eq!(patterns, vec!["dist".to_string()]);
+        assert_eq!(patterns, vec![Pattern::Anywhere("dist".to_owned())]);
+    }
+
+    /// fails if a leading `/` stops anchoring a pattern to the checkout
+    /// root. `.gitignore` reads `/dist` that way, so an operator will write
+    /// it; before 2026-09-03 it parsed as a two-component path no relative
+    /// entry could start with, and matched nothing while saying nothing.
+    #[test]
+    fn a_leading_slash_anchors_a_pattern_to_the_checkout_root() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "/dist\n"),
+            ("dist/app.js", "//"),
+            ("packages/app/dist/bundle.js", "//"),
+        ]);
+        let linked = to_link(repo.path()).expect("computes");
+        assert!(!linked.contains(&PathBuf::from("dist")), "{linked:?}");
+        assert!(
+            linked.contains(&PathBuf::from("packages/app/dist")),
+            "anchored means only the root one: {linked:?}"
+        );
+    }
+
+    /// fails if a trailing `/` is read as part of the name. `dist/` is how
+    /// `.gitignore` spells "the directory", and the same operator copies the
+    /// line across.
+    #[test]
+    fn a_trailing_slash_is_not_part_of_the_name() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            (".shepignore", "dist/\n"),
+            ("dist/app.js", "//"),
+        ]);
+        let linked = to_link(repo.path()).expect("computes");
+        assert!(!linked.contains(&PathBuf::from("dist")), "{linked:?}");
+    }
+
+    /// fails if a spelling this file cannot honour is accepted and silently
+    /// matches nothing. Each of these is valid `.gitignore`, and each used
+    /// to parse: `!dist` as a name beginning with `!`, `../x` as a path no
+    /// entry starts with, `/` as an empty name.
+    #[test]
+    fn a_negation_a_parent_component_and_a_bare_slash_are_refused_by_name() {
+        for pattern in ["!dist", "../sibling", "/", "./"] {
+            let repo = fixture_repo(&[(".gitignore", "dist/\n"), (".shepignore", pattern)]);
+            let err = shepignore_patterns(repo.path())
+                .expect_err(&format!("{pattern:?} must be refused"));
+            assert!(matches!(err, Error::Config(_)), "{pattern:?}: {err}");
+            assert!(
+                err.to_string().contains(pattern),
+                "the refusal must name the pattern: {err}"
+            );
+        }
     }
 
     /// fails if a bare `.shepignore` pattern stops matching a nested
