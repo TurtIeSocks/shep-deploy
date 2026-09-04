@@ -79,8 +79,10 @@ pub enum Restored {
         /// Where it is still running from.
         from: PathBuf,
     },
-    /// Nothing was changed. The sheep is still registered and running,
-    /// exactly as it was before this call.
+    /// Nothing was changed by this dog. This says nothing about whether the
+    /// sheep is still registered or running: `all` also uses it for a
+    /// `deploy.toml` it could not even read, and `put_back` uses it for a
+    /// sheep the shepherd no longer has registered at all.
     Failed {
         /// The sheep that could not be restored.
         sheep: String,
@@ -156,8 +158,19 @@ pub enum Restored {
 /// of five sheep would not restart would be worse than one that did nothing
 /// at all.
 pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
-    let Ok(names) = paths::targets(shep_home) else {
-        return Vec::new();
+    let names = match paths::targets(shep_home) {
+        Ok(names) => names,
+        // The deploy directory exists but could not be listed. There is
+        // nothing to iterate, but silence here reads as success: `report(&[])`
+        // is empty, so `on_remove` prints nothing and exits 0 with every
+        // sheep under the tree left running. One row naming the directory
+        // says something instead.
+        Err(err) => {
+            return vec![Restored::Failed {
+                sheep: shep_home.join("deploy").display().to_string(),
+                why: err.to_string(),
+            }];
+        }
     };
     // Read once for every target rather than once per target: it costs a
     // SaveRoll round trip, and a removal is not the moment to make N of
@@ -365,6 +378,12 @@ async fn put_back<D: Daemon>(
 /// they see about this.
 #[must_use]
 pub fn report(results: &[Restored]) -> String {
+    if results.is_empty() {
+        // Silence here is indistinguishable from success. There were no
+        // deploy targets at all, and the operator is entitled to be told
+        // that rather than left to guess why nothing printed.
+        return "no deploy targets, nothing to restore\n".to_owned();
+    }
     results
         .iter()
         .map(|result| match result {
@@ -387,7 +406,7 @@ pub fn report(results: &[Restored]) -> String {
                 format!("{sheep} still running from {}\n", from.display())
             }
             Restored::Failed { sheep, why } => {
-                format!("{sheep} could not be restored and was left as it is: {why}\n")
+                format!("{sheep} could not be restored ({why}); nothing was changed by this dog\n")
             }
             // NOT the same wording as `Failed`: this sheep was stopped and
             // a fresh instance started to get its own previous config back,
@@ -438,7 +457,24 @@ fn registered_against(registered: &BTreeMap<String, AppConfig>, sheep: &str, tre
     registered
         .get(sheep)
         .and_then(|app| app.cwd.as_deref())
-        .is_some_and(|cwd| Path::new(cwd) == tree.current())
+        .is_some_and(|cwd| {
+            // The dog and the daemon can resolve $SHEP_HOME to different
+            // spellings of the same directory (see daemon.rs:141), so a
+            // literal path comparison can call a sheep the cutover DID
+            // register "never moved" and leave it running from the tree.
+            // Canonicalise both sides before comparing; if either side
+            // cannot be canonicalised (for example it no longer exists),
+            // fall back to the literal comparison rather than failing open.
+            let registered_path = Path::new(cwd);
+            let current = tree.current();
+            match (
+                std::fs::canonicalize(registered_path),
+                std::fs::canonicalize(&current),
+            ) {
+                (Ok(registered_real), Ok(current_real)) => registered_real == current_real,
+                _ => registered_path == current,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -1143,7 +1179,7 @@ mod tests {
             results[0]
         );
         let text = report(&results);
-        assert!(text.contains("left as it is"), "{text}");
+        assert!(text.contains("nothing was changed by this dog"), "{text}");
         assert!(
             !text.contains("neither fully running nor fully removed"),
             "{text}"
@@ -1170,5 +1206,80 @@ mod tests {
         let text = report(&results);
         assert!(text.contains("aaa"), "{text}");
         assert!(text.contains("zzz"), "{text}");
+    }
+
+    /// fails if a deploy directory that exists but cannot be listed is
+    /// swallowed into an empty report. `paths::targets` returns that error
+    /// rather than treating it as "nothing here", and dropping it left
+    /// `report(&[])` printing nothing and `on_remove` exiting 0 with every
+    /// sheep under the tree left running.
+    #[tokio::test]
+    async fn a_deploy_directory_that_cannot_be_listed_is_reported_not_silenced() {
+        let home = tempfile::tempdir().expect("tempdir");
+        // A file where a directory is expected makes `read_dir` fail with
+        // something other than `NotFound`, which `paths::targets` does not
+        // treat as "nothing to restore".
+        fs::write(home.path().join("deploy"), b"not a directory").expect("write file");
+
+        let results = all(&Recording::new(&[], Refuse::Never), home.path()).await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "the failure must be reported, not swallowed: {results:?}"
+        );
+        assert!(
+            matches!(&results[0], Restored::Failed { sheep, .. } if sheep.ends_with("deploy")),
+            "got: {:?}",
+            results[0]
+        );
+        assert!(
+            !report(&results).is_empty(),
+            "silence here reads as success"
+        );
+    }
+
+    /// fails if a run with no deploy targets at all prints nothing. Silence
+    /// is indistinguishable from success, and `main.rs`'s sibling branch
+    /// prints a sentence for exactly this reason.
+    #[test]
+    fn an_empty_report_says_there_was_nothing_to_restore() {
+        assert_eq!(report(&[]), "no deploy targets, nothing to restore\n");
+    }
+
+    /// fails if the dog and the daemon spell `$SHEP_HOME` differently and a
+    /// sheep the cutover DID register reads as never moved because of it.
+    /// `daemon.rs:141` says the two can resolve the same directory through
+    /// different paths, so the comparison has to see through that rather
+    /// than compare spellings literally.
+    #[tokio::test]
+    async fn a_registration_reached_through_a_symlinked_parent_is_recognised() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("create home");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("symlink parent");
+
+        let tree = Tree::for_sheep(&home, "ctm");
+        fs::create_dir_all(tree.root()).expect("create tree");
+        let release = tmp.path().join("release");
+        fs::create_dir_all(&release).expect("create release dir");
+        std::os::unix::fs::symlink(&release, tree.current()).expect("symlink current");
+
+        write_target_never_cut_over(&home, "ctm", "/srv/ctm", "./run.sh");
+        let cwd_through_link = link.join("deploy").join("ctm").join("current");
+        let daemon = Recording::with_registered(&["ctm"]).registered_at(&cwd_through_link);
+
+        let results = all(&daemon, &home).await;
+
+        let text = report(&results);
+        assert!(
+            !text.contains("never moved"),
+            "the two spellings resolve to the same directory: {text}"
+        );
+        assert!(
+            !daemon.calls().is_empty(),
+            "it must actually be put back, not merely reported"
+        );
     }
 }
