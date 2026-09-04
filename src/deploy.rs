@@ -160,14 +160,22 @@ pub(crate) const RELOAD_DEADLINE_SLACK: Duration = Duration::from_secs(5);
 /// by the same field, and an app that needs a minute to compile its client
 /// says so by setting `listen_timeout`, which this reads.
 fn budget(app: &AppConfig, instances: u32) -> Duration {
-    let per_instance = app.listen_timeout.as_duration()
-        + app.graceful_timeout.as_duration()
-        + RELOAD_DEADLINE_SLACK;
+    // Saturating throughout, and then held under `verify::MAX_WAIT`. Both
+    // timeouts come out of the release's own Flockfile, which the deployed
+    // repository writes, and `UpDuration` accepts any value up to `u64::MAX`
+    // milliseconds: a plain `+` here panicked, and a sum that did not would
+    // have had this dog watching one reload for longer than the host will
+    // exist, holding the tree's lock and the poll loop with it.
+    let per_instance = app
+        .listen_timeout
+        .as_duration()
+        .saturating_add(app.graceful_timeout.as_duration())
+        .saturating_add(RELOAD_DEADLINE_SLACK);
 
     // A flock with nothing running still gets one instance's worth. Such a
     // reload replaces nothing and can never turn over, so what this buys is
     // a clean failure at a sensible moment rather than an instant one.
-    per_instance.saturating_mul(instances.max(1))
+    verify::bounded(per_instance.saturating_mul(instances.max(1)))
 }
 
 /// Deploys the head of `state.branch` to the tree's sheep, rolling back if

@@ -61,7 +61,7 @@ use crate::roll;
 use crate::shared;
 use crate::state::{State, Verify, Watch};
 use crate::swap;
-use crate::verify::{DWELL, Generation, POLL, is_alive};
+use crate::verify::{self, DWELL, Generation, POLL, is_alive};
 
 /// Everything opt-in built, ready for a cutover to register and swap into
 /// place.
@@ -477,7 +477,13 @@ const SHEPHERD_QUIET: &str = "The shepherd stopped answering while the new insta
 /// instance and drains nothing, where a reload replaces every instance one
 /// at a time and has to wait out each drain.
 fn cutover_budget(app: &AppConfig) -> Duration {
-    app.listen_timeout.as_duration() + RELOAD_DEADLINE_SLACK
+    // Saturating and capped, for the reason `crate::deploy`'s `budget` gives:
+    // `listen_timeout` is the repository's number, not the operator's.
+    verify::bounded(
+        app.listen_timeout
+            .as_duration()
+            .saturating_add(RELOAD_DEADLINE_SLACK),
+    )
 }
 
 /// Registers `app`, waits for a newcomer, and watches it for a dwell.
@@ -831,7 +837,12 @@ mod tests {
     async fn opting_in_twice_is_refused_by_name() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        write_target(home.path(), "bpm", Watch::Auto, Some("old"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        );
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
@@ -1702,7 +1713,12 @@ mod tests {
     async fn a_record_that_cannot_be_read_refuses_rather_than_guessing() {
         let home = tempfile::tempdir().expect("tempdir");
         let checkout = checkout_with_commit();
-        write_target(home.path(), "bpm", Watch::Auto, Some("old"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        );
         let tree = Tree::for_sheep(home.path(), "bpm");
         std::fs::write(tree.state_file(), "this is not toml = = =").expect("corrupt the record");
         let entries = [("bpm", checkout.path())];
