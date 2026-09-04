@@ -81,10 +81,7 @@ fn path_str(path: &Path) -> Result<&str, Error> {
 /// [`Error::Io`], naming `git_dir`, if it cannot be created or is not
 /// valid UTF-8. [`Error::Git`] if `git init` refuses.
 pub fn init_bare(git_dir: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(git_dir).map_err(|source| Error::Io {
-        path: git_dir.to_owned(),
-        source,
-    })?;
+    std::fs::create_dir_all(git_dir).map_err(Error::at(git_dir))?;
     run_git(git_dir, &["init", "-q", "--bare"]).map(|_| ())
 }
 

@@ -241,10 +241,7 @@ async fn resolve_id(release: &Path, user: &str, flag: &str, kind: &str) -> Resul
         .arg(user)
         .output()
         .await
-        .map_err(|source| Error::Io {
-            path: release.to_owned(),
-            source,
-        })?;
+        .map_err(Error::at(release))?;
 
     if !output.status.success() {
         return Err(Error::Config(format!(
@@ -498,10 +495,7 @@ fn copy_artifact(
     }
 
     if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
+        fs::create_dir_all(parent).map_err(Error::at(parent))?;
     }
 
     // Opened BEFORE the last containment check, and the check then runs
@@ -517,14 +511,8 @@ fn copy_artifact(
     // handle cannot be redirected once open, so if the file it refers to is
     // the same file the resolved-and-contained path names, the read is of
     // something that passed the check.
-    let mut source = fs::File::open(&from).map_err(|err| Error::Io {
-        path: from.clone(),
-        source: err,
-    })?;
-    let opened = source.metadata().map_err(|err| Error::Io {
-        path: from.clone(),
-        source: err,
-    })?;
+    let mut source = fs::File::open(&from).map_err(Error::at(&from))?;
+    let opened = source.metadata().map_err(Error::at(&from))?;
     let resolved = resolve_deepest(&from)
         .and_then(|real| fs::metadata(real).ok())
         .filter(|named| named.dev() == opened.dev() && named.ino() == opened.ino());
@@ -631,10 +619,7 @@ fn copy_artifact(
                 }
             }
         })?;
-    io::copy(&mut source, &mut sink).map_err(|err| Error::Io {
-        path: from.clone(),
-        source: err,
-    })?;
+    io::copy(&mut source, &mut sink).map_err(Error::at(&from))?;
 
     // `fs::copy` carried the source's mode and this does not: a file created
     // by `OpenOptions` gets `0o666 & !umask`, so 0755 arrives as 0644 and the
@@ -662,10 +647,7 @@ fn copy_artifact(
     // not.
     let mode = opened.permissions().mode() & 0o777;
     sink.set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|err| Error::Io {
-            path: to,
-            source: err,
-        })?;
+        .map_err(Error::at(to))?;
 
     Ok(())
 }
@@ -845,10 +827,7 @@ pub async fn run(
     // shape and same reason as `crate::shared::run_git_within`.
     child.process_group(0);
 
-    let mut child = child.spawn().map_err(|source| Error::Io {
-        path: release.to_owned(),
-        source,
-    })?;
+    let mut child = child.spawn().map_err(Error::at(release))?;
 
     // Captured before the wait, because `Child::id` answers `None` once the
     // child has been reaped and the group is named after the leader's pid.
@@ -867,10 +846,7 @@ pub async fn run(
     // idle, so the budget expires at once whatever it is set to. See
     // `crate::deploy`'s `a_current_that_moved_during_the_build_is_not_swapped_over`.
     let status = match timeout(budget, child.wait()).await {
-        Ok(waited) => waited.map_err(|source| Error::Io {
-            path: release.to_owned(),
-            source,
-        })?,
+        Ok(waited) => waited.map_err(Error::at(release))?,
         Err(_) => {
             abandon(&mut child).await;
             return Err(Error::BuildTimedOut { after: budget });

@@ -126,10 +126,7 @@ impl State {
     /// [`Error::Config`] if it is not valid TOML, is missing a field that
     /// has no default, or fails [`Self::validate`].
     pub fn read(path: &Path) -> Result<Self, Error> {
-        let text = fs::read_to_string(path).map_err(|source| Error::Io {
-            path: path.to_owned(),
-            source,
-        })?;
+        let text = fs::read_to_string(path).map_err(Error::at(path))?;
         let state: Self = toml::from_str(&text)
             .map_err(|source| Error::Config(format!("{}: {source}", path.display())))?;
         state.validate(path)?;

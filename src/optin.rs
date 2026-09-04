@@ -238,10 +238,7 @@ pub async fn prepare<D: Daemon>(
     // out in `Prepared` so the cutover runs under it too.
     let hold = lock::hold(&tree)?;
 
-    std::fs::create_dir_all(tree.releases()).map_err(|source| Error::Io {
-        path: tree.releases(),
-        source,
-    })?;
+    std::fs::create_dir_all(tree.releases()).map_err(Error::at(tree.releases()))?;
     git::init_bare(&tree.git())?;
     git::fetch(&tree.git(), &state.remote, config.git_timeout)?;
     let sha = git::remote_head(&tree.git(), &state.branch)?;

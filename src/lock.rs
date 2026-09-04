@@ -72,10 +72,7 @@ pub struct Deploying {
 pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
     let path = tree.lock_file();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
+        std::fs::create_dir_all(parent).map_err(Error::at(parent))?;
     }
 
     let file = OpenOptions::new()
@@ -84,10 +81,7 @@ pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
         .write(true)
         .mode(LOCK_MODE)
         .open(&path)
-        .map_err(|source| Error::Io {
-            path: path.clone(),
-            source,
-        })?;
+        .map_err(Error::at(&path))?;
 
     // `truncate(false)` above, deliberately. The file's contents are never
     // read and never written, so truncating would be a write to a file another

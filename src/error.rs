@@ -354,6 +354,18 @@ pub enum Error {
 }
 
 impl Error {
+    /// The `map_err` for an I/O call on `path`: builds [`Self::Io`] naming
+    /// it.
+    ///
+    /// One spelling for what was thirty hand-written closures across
+    /// thirteen modules, each `|source| Error::Io { path: x.to_owned(),
+    /// source }` with its own choice of how to copy the path. The path is
+    /// taken up front, so a call site reads as `.map_err(Error::at(dir))`.
+    pub(crate) fn at(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> Self {
+        let path = path.into();
+        move |source| Self::Io { path, source }
+    }
+
     /// Whether a failed request is worth asking again.
     ///
     /// The refusal this whole retry exists for is `ReloadInFlight`, which shep

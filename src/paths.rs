@@ -48,10 +48,7 @@ pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
 
     let mut found = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| Error::Io {
-            path: root.clone(),
-            source,
-        })?;
+        let entry = entry.map_err(Error::at(&root))?;
         if !entry.path().join("deploy.toml").is_file() {
             continue;
         }

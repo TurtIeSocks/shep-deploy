@@ -79,10 +79,7 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
         // bounded and not.
         .process_group(0)
         .spawn()
-        .map_err(|source| Error::Io {
-            path: dir.to_owned(),
-            source,
-        })?;
+        .map_err(Error::at(dir))?;
 
     // Taken before the loop so the child always has a reader, whatever the
     // loop then decides about the clock. See the doc above.
@@ -311,10 +308,7 @@ pub(crate) fn run_git(dir: &Path, args: &[&str]) -> Result<String, Error> {
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|source| Error::Io {
-            path: dir.to_owned(),
-            source,
-        })?;
+        .map_err(Error::at(dir))?;
 
     decode(dir, args, output.status, output.stdout, output.stderr)
 }
@@ -592,20 +586,14 @@ pub fn to_link(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
 /// the operator fixes by editing that file rather than by looking at the
 /// filesystem. The message names the colliding path and the file to edit.
 pub fn link_into(release: &Path, checkout: &Path, paths: &[PathBuf]) -> Result<(), Error> {
-    let checkout = fs::canonicalize(checkout).map_err(|source| Error::Io {
-        path: checkout.to_owned(),
-        source,
-    })?;
+    let checkout = fs::canonicalize(checkout).map_err(Error::at(checkout))?;
 
     for relative in paths {
         let target = checkout.join(relative);
         let link = release.join(relative);
 
         if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent).map_err(|source| Error::Io {
-                path: parent.to_owned(),
-                source,
-            })?;
+            fs::create_dir_all(parent).map_err(Error::at(parent))?;
         }
 
         symlink(&target, &link).map_err(|source| {
@@ -658,12 +646,9 @@ pub fn link_cache(release: &Path, cache_target: &Path) -> Result<(), Error> {
         return Ok(());
     }
 
-    fs::create_dir_all(cache_target).map_err(|source| Error::Io {
-        path: cache_target.to_owned(),
-        source,
-    })?;
+    fs::create_dir_all(cache_target).map_err(Error::at(cache_target))?;
 
-    symlink(cache_target, &link).map_err(|source| Error::Io { path: link, source })
+    symlink(cache_target, &link).map_err(Error::at(link))
 }
 
 #[cfg(test)]

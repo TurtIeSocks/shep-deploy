@@ -75,10 +75,7 @@ pub fn point_at(current: &Path, release: &Path) -> Result<(), Error> {
 
     match fs::symlink_metadata(&tmp) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::remove_file(&tmp).map_err(|source| Error::Io {
-                path: tmp.clone(),
-                source,
-            })?;
+            fs::remove_file(&tmp).map_err(Error::at(&tmp))?;
         }
         Ok(_) => {
             return Err(Error::Config(format!(
@@ -97,10 +94,7 @@ pub fn point_at(current: &Path, release: &Path) -> Result<(), Error> {
         }
     }
 
-    symlink(release, &tmp).map_err(|source| Error::Io {
-        path: tmp.clone(),
-        source,
-    })?;
+    symlink(release, &tmp).map_err(Error::at(&tmp))?;
 
     fs::rename(&tmp, current).map_err(|source| {
         let _ = fs::remove_file(&tmp);

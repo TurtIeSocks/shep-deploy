@@ -81,10 +81,7 @@ pub fn prune(tree: &Tree, keep: usize, recorded: Option<&str>) -> Result<Vec<Str
     };
 
     for entry in entries {
-        let entry = entry.map_err(|source| Error::Io {
-            path: releases.clone(),
-            source,
-        })?;
+        let entry = entry.map_err(Error::at(&releases))?;
         let (Some(name), Ok(modified)) = (
             entry.file_name().to_str().map(str::to_owned),
             entry.metadata().and_then(|meta| meta.modified()),
