@@ -5,6 +5,46 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-09-04
+
+### Changed
+
+- One spelling for an Io error's map_err
+- Seal the provenance list so only to_link can mint it
+
+### Fixed
+
+- Read ignored paths unquoted, honour .shepignore's gitignore spellings, kill groups with killpg
+- Put `--` before a remote, and `--detach` on every worktree add
+- Refuse a deploy.toml whose values cannot work, and write it durably
+- An unreadable record is its own standing, never an invitation to setup
+- Give `alive` the app's own budget to reach Online, count rows, cap every wait
+- Floor the durations at a second and validate passthrough names
+- Create the lock file owner-only
+- Name an unknown response variant without printing its body
+- Drop control characters from a smit before publishing it
+- Report a target the dog cannot name, and name the markers directory
+- Say something when nothing can be restored, and compare paths by what they resolve to
+- Survive a panic in one target, notice the deploy directory going, mute a refused smit
+- Close the repository's routes into the dog's own process, and the state gaps around a swap
+- List an orphaned tree, count swallowed repeats, note two limits
+- Round two of the review, on the changes round one made
+- Rounds three to six of the review, each on the round before
+- Run every git call and the artifact copy off the runtime's thread
+- Refuse every committed field the shepherd acts on at its own uid
+- Keep the pre-adoption app, watch a verified flock after its turnover, hold a race
+- Keep the interpreter a sheep already runs under when its Flockfile names none
+- Speak protocol 3, which the published shep now requires
+- Read the dog's section from dogs.toml, where shep keeps it since 0.1.32
+- Compare paths by what they resolve to, and the rest of the first review round
+- Stage the record through shep-core's atomic file helper, and refuse a half-recorded origin
+- Lead the build's process group with a holder, so a reaped pid is never signalled
+- Hold a record lock across every read-modify-write of deploy.toml
+- Keep a verify edited during the cutover, and lock the record's first write too
+- Drain a scaled original's repair whole, however its rows arrive
+- Wait for the repair's own rows, by the ids the shepherd answered with
+
+
 ## [0.2.2] - 2026-09-03
 
 ### Fixed
