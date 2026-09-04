@@ -95,6 +95,16 @@ symlinks, so a committed link out of the release reaches whatever it points
 at. All of them stay available in `Flockfile.override.toml`, which is the
 operator's.
 
+`interpreter`, `script`, `args` and `cwd` are not on that list because they
+are the app's own command line. The daemon sets the child's gid and uid
+before it changes directory and before it execs, so a committed interpreter
+runs as `user` exactly as the script would, and a bare name is looked up on
+the daemon's own `PATH` by a process that has already dropped. What remains
+is small: the daemon stats the program at its own uid before spawning, to
+refuse a batch whose program is provably absent, so a committed absolute
+path learns whether that path exists on the host, one bit, through the
+refusal, and nothing else.
+
 **Nothing bounds what a build reads out of its own release.** Gitignored files
 are symlinked into every release by design, which is what makes a `.env` work
 at runtime. A build command can therefore read every secret the app itself can

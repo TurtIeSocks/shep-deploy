@@ -445,6 +445,20 @@ pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<Strin
     // symlink and all, which is the only spelling that follows a swap.
     let mut registering = app;
     registering.cwd = Some(tree.current().display().to_string());
+    // The interpreter the sheep already runs under, when the Flockfile names
+    // none. `shep start` fills an unset `interpreter` from `shep.toml`'s
+    // `[interpreters]` by the script's extension, and a fresh home maps
+    // `js`, `py`, `rb`, `sh` and more out of the box; the shepherd itself
+    // never does, and runs a script with no interpreter directly. This dog
+    // cannot read that map, so a Flockfile that relies on it would have
+    // been registered here with none and the replacement exec'd `server.js`
+    // as a program. The registered value IS the map's answer for this
+    // sheep, so it is carried. An explicit value, `"none"` included,
+    // outranks the map for the CLI and is left alone here for the same
+    // reason. Read out of shep-cli's `apply_interpreters` on 2026-09-04.
+    if registering.interpreter.is_none() {
+        registering.interpreter = previous_config.interpreter.clone();
+    }
 
     match attempt(daemon, &sheep, registering, &generation, &previous).await {
         CutOver::Done => {
@@ -1727,6 +1741,27 @@ mod tests {
             current.to_str(),
             "cwd must be the current symlink itself, not a release and not None"
         );
+    }
+
+    /// fails if a Flockfile that names no `interpreter` is registered with
+    /// none. `shep start` filled the sheep's from `shep.toml`'s
+    /// `[interpreters]` by extension, the shepherd itself never does, and
+    /// this dog cannot read the map: registered bare, the replacement would
+    /// exec `server.js` as a program. An explicit value, `"none"` included,
+    /// is the Flockfile's own and stays.
+    #[tokio::test(start_paused = true)]
+    async fn the_new_registration_keeps_the_interpreter_the_sheep_ran_under() {
+        let (daemon, mut prepared, _dirs) = cutover_fixture().await;
+        prepared.previous_config.interpreter = Some("node".to_owned());
+        prepared.app.interpreter = None;
+        cut_over(&daemon, prepared).await.expect("cuts over");
+        assert_eq!(daemon.started()[0].interpreter.as_deref(), Some("node"));
+
+        let (daemon, mut prepared, _dirs) = cutover_fixture().await;
+        prepared.previous_config.interpreter = Some("node".to_owned());
+        prepared.app.interpreter = Some("none".to_owned());
+        cut_over(&daemon, prepared).await.expect("cuts over");
+        assert_eq!(daemon.started()[0].interpreter.as_deref(), Some("none"));
     }
 
     /// fails if the OLD instances are deleted by name rather than by id, or

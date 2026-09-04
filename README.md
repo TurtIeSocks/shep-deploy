@@ -241,7 +241,9 @@ cleared still shows until the next tick.
 
 `setup` takes a sheep over: it builds the tree, fetches the repository, links
 the shared files in, builds the first release, and re-registers the sheep with
-its `cwd` set to `current`.
+its `cwd` set to `current`. A Flockfile that names no `interpreter` keeps the
+one the sheep already ran under: `shep start` fills that in from `shep.toml`'s
+`[interpreters]`, and this dog cannot read that map.
 
 The first cutover is the one deploy that may have downtime. It runs two
 instances at once, so an app that does not bind with `SO_REUSEPORT` cannot take
