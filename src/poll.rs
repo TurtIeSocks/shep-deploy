@@ -368,7 +368,7 @@ mod tests {
         State {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
-            deployed: Some("a1b2c3".to_owned()),
+            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".to_owned()),
             failed: None,
             verify: Verify::default(),
             watch,
@@ -1069,8 +1069,18 @@ mod tests {
     #[tokio::test]
     async fn every_tick_republishes_every_targets_smit() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "bpm", Watch::Auto, Some("a1b2c3d4e5f6"));
-        write_target(home.path(), "ctm", Watch::Manual, Some("f6e5d4c3b2a1"));
+        write_target(
+            home.path(),
+            "bpm",
+            Watch::Auto,
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+        );
+        write_target(
+            home.path(),
+            "ctm",
+            Watch::Manual,
+            Some("f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"),
+        );
         let daemon = SmitRecording::default();
 
         tick(&daemon, home.path(), &config()).await;
@@ -1094,7 +1104,12 @@ mod tests {
     #[tokio::test]
     async fn a_manual_target_still_gets_a_smit() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "ctm", Watch::Manual, Some("f6e5d4c3b2a1"));
+        write_target(
+            home.path(),
+            "ctm",
+            Watch::Manual,
+            Some("f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"),
+        );
         let daemon = SmitRecording::default();
         tick(&daemon, home.path(), &config()).await;
         assert_eq!(daemon.smits().len(), 1);
@@ -1124,7 +1139,12 @@ mod tests {
     #[tokio::test]
     async fn a_too_long_branch_name_does_not_stop_the_tick() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "long", Watch::Auto, Some("a1b2c3d4e5f6"));
+        write_target(
+            home.path(),
+            "long",
+            Watch::Auto,
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"),
+        );
         let tree = Tree::for_sheep(home.path(), "long");
         let mut state = State::read(&tree.state_file()).expect("reads");
         state.branch = "x".repeat(100);

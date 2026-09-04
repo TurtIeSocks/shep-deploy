@@ -14,7 +14,7 @@
 //! at opt-in and never touched again.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -117,30 +117,125 @@ pub struct State {
 }
 
 impl State {
-    /// Read and parse the `deploy.toml` at `path`.
+    /// Read and parse the `deploy.toml` at `path`, refusing a record whose
+    /// values cannot work.
     ///
     /// # Errors
     /// [`Error::Io`], naming `path`, if the file cannot be read - most
     /// often because this sheep is not a deploy target at all.
-    /// [`Error::Config`] if it is not valid TOML, or is missing a field
-    /// that has no default.
+    /// [`Error::Config`] if it is not valid TOML, is missing a field that
+    /// has no default, or fails [`Self::validate`].
     pub fn read(path: &Path) -> Result<Self, Error> {
         let text = fs::read_to_string(path).map_err(|source| Error::Io {
             path: path.to_owned(),
             source,
         })?;
-        toml::from_str(&text)
-            .map_err(|source| Error::Config(format!("{}: {source}", path.display())))
+        let state: Self = toml::from_str(&text)
+            .map_err(|source| Error::Config(format!("{}: {source}", path.display())))?;
+        state.validate(path)?;
+        Ok(state)
     }
 
-    /// Serialise to TOML and write to `path` atomically.
+    /// Refuses a record that parses and still cannot be acted on, naming the
+    /// field and what is wrong with it.
     ///
-    /// The write lands at `<path>.tmp` in the same directory first, then
-    /// `rename(2)`s it over `path`. `rename(2)` within one directory is a
-    /// single atomic syscall, so a process killed mid-write leaves either
-    /// the old `deploy.toml` intact or the new one in full - never a
-    /// truncated file. That matters here specifically because this file is
-    /// the only record of how to restore the sheep once the dog is removed.
+    /// This file is hand-edited, and every field here is handed to git or
+    /// joined onto a path later, where a bad value fails in words that name
+    /// the mechanism rather than the mistake. An empty `branch` reaches
+    /// `git rev-parse --verify refs/heads/` and fails as "needed a single
+    /// revision". A `deployed` of `""` makes `Tree::release("")` the
+    /// `releases/` directory itself, which exists, so a rollback would point
+    /// `current` at it. A `remote` beginning with `-` is an option to git
+    /// rather than a URL, and `--upload-pack=<command>` is one it runs.
+    /// Measured 2026-09-03, all three.
+    ///
+    /// # Errors
+    /// [`Error::Config`], naming `path` and the field, for: an empty
+    /// `remote`, `branch` or `checkout`; a `remote` or `branch` beginning
+    /// with `-` or carrying a control character; a relative `checkout`; a
+    /// `deployed` or `failed` that is not a full commit sha; `deployed` and
+    /// `failed` naming the same sha; or exactly one of `origin_cwd` and
+    /// `origin_script` set.
+    fn validate(&self, path: &Path) -> Result<(), Error> {
+        let refuse =
+            |field: &str, why: &str| Error::Config(format!("{}: `{field}` {why}", path.display()));
+
+        for (field, value) in [("remote", &self.remote), ("branch", &self.branch)] {
+            if value.trim().is_empty() {
+                return Err(refuse(field, "is empty"));
+            }
+            if value.starts_with('-') {
+                return Err(refuse(
+                    field,
+                    "begins with `-`, which git would read as an option rather than a name",
+                ));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(refuse(field, "carries a control character"));
+            }
+        }
+
+        if self.checkout.as_os_str().is_empty() {
+            return Err(refuse("checkout", "is empty"));
+        }
+        if !self.checkout.is_absolute() {
+            return Err(refuse(
+                "checkout",
+                "is not an absolute path, and a relative one would be resolved against \
+                 wherever the dog happens to be running",
+            ));
+        }
+
+        for (field, value) in [("deployed", &self.deployed), ("failed", &self.failed)] {
+            if let Some(sha) = value
+                && !is_sha(sha)
+            {
+                return Err(refuse(
+                    field,
+                    "is not a full commit sha: 40 (or 64) hexadecimal characters, as `git \
+                     rev-parse` prints one",
+                ));
+            }
+        }
+        if self.deployed.is_some() && self.deployed == self.failed {
+            return Err(refuse(
+                "failed",
+                "names the sha `deployed` names. A release that is serving cannot also be the \
+                 one being held; remove `failed`",
+            ));
+        }
+
+        if self.origin_cwd.is_some() != self.origin_script.is_some() {
+            let missing = if self.origin_cwd.is_none() {
+                "origin_cwd"
+            } else {
+                "origin_script"
+            };
+            return Err(refuse(
+                missing,
+                "is missing while its partner is set. Both are written together at setup and \
+                 both are needed to put the sheep back on removal; set both or neither",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Serialise to TOML and write to `path` atomically and durably.
+    ///
+    /// The write lands at `<path>.tmp` in the same directory first, is
+    /// flushed to disk, then `rename(2)`d over `path`, and the directory is
+    /// flushed after that. `rename(2)` within one directory is a single
+    /// atomic syscall, so a process killed mid-write leaves either the old
+    /// `deploy.toml` intact or the new one in full - never a truncated file.
+    /// The two flushes extend that from a killed process to a lost power
+    /// supply: without them the rename can reach the disk ahead of the bytes
+    /// it names, which leaves a zero-length record. That matters here
+    /// specifically because this file is the only record of how to restore
+    /// the sheep once the dog is removed.
+    ///
+    /// A failed rename removes the temporary file it leaves behind, so one
+    /// failure does not sit next to the record forever, unread by anything.
     ///
     /// # Errors
     /// [`Error::Io`], naming whichever of `path` or `<path>.tmp` the
@@ -158,20 +253,56 @@ impl State {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-
-        fs::write(&tmp, text).map_err(|source| Error::Io {
+        let at_tmp = |source| Error::Io {
             path: tmp.clone(),
             source,
-        })?;
-        fs::rename(&tmp, path).map_err(|source| Error::Io {
-            path: path.to_owned(),
-            source,
-        })
+        };
+
+        let written = fs::File::create(&tmp)
+            .and_then(|mut file| {
+                file.write_all(text.as_bytes())?;
+                file.sync_all()
+            })
+            .map_err(at_tmp);
+        if let Err(err) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+
+        if let Err(source) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(Error::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+
+        // The directory entry, so the rename itself survives a power loss.
+        // Best effort: a filesystem that refuses to sync a directory has
+        // already accepted the data, and failing the deploy over the entry
+        // would be the worse outcome.
+        if let Some(dir) = path.parent() {
+            let _ = fs::File::open(dir).and_then(|dir| dir.sync_all());
+        }
+        Ok(())
     }
+}
+
+/// Whether `text` is a full git object id: 40 hexadecimal characters for
+/// SHA-1, 64 for SHA-256.
+///
+/// The one rule for what a release is named by, shared with
+/// `crate::retention` so the two cannot disagree about which directories
+/// under `releases/` are releases.
+#[must_use]
+pub fn is_sha(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// fails if a typo in `deploy.toml` is silently dropped.
     ///
     /// This file is not ours alone: `crate::deploy` tells an operator to type
@@ -204,8 +335,6 @@ verfiy = "alive"
         );
     }
 
-    use super::*;
-
     /// fails if state does not survive a write-then-read. This file is the
     /// only record of how a sheep ran BEFORE the dog took over, so losing a
     /// field means removal cannot restore the sheep and the operator is
@@ -225,7 +354,7 @@ verfiy = "alive"
         let original = State {
             remote: "https://github.com/WatWowMap/ReactMap".into(),
             branch: "main".into(),
-            deployed: Some("a1b2c3d".into()),
+            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".into()),
             failed: None,
             verify: Verify::Probed,
             watch: Watch::Manual,
@@ -236,6 +365,122 @@ verfiy = "alive"
         let text = toml::to_string(&original).expect("serialises");
         let back: State = toml::from_str(&text).expect("parses");
         assert_eq!(back, original);
+    }
+
+    /// A full sha, as `git rev-parse` prints one.
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Writes `text` as a record and reads it back through `State::read`,
+    /// so the validation runs the way it does in production.
+    fn read_text(text: &str) -> Result<State, Error> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        fs::write(&path, text).expect("write record");
+        State::read(&path)
+    }
+
+    /// fails if a record that parses is acted on when its values cannot
+    /// work. Each of these used to reach git, or a path join, and fail
+    /// there in words about the mechanism: an empty `branch` as "needed a
+    /// single revision", `deployed = ""` as a rollback onto `releases/`
+    /// itself, a `remote` beginning with `-` as whatever git made of the
+    /// option. The refusal has to name the field an operator typed.
+    #[test]
+    fn a_record_whose_values_cannot_work_is_refused_by_field() {
+        let base = |extra: &str| {
+            format!(
+                "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n{extra}"
+            )
+        };
+        let cases = [
+            (
+                "remote",
+                "remote = \"\"\nbranch = \"main\"\ncheckout = \"/srv/x\"".to_owned(),
+            ),
+            (
+                "remote",
+                "remote = \"--upload-pack=x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"".to_owned(),
+            ),
+            (
+                "branch",
+                "remote = \"https://example.com/x\"\nbranch = \"\"\ncheckout = \"/srv/x\""
+                    .to_owned(),
+            ),
+            (
+                "branch",
+                "remote = \"https://example.com/x\"\nbranch = \"-x\"\ncheckout = \"/srv/x\""
+                    .to_owned(),
+            ),
+            (
+                "branch",
+                "remote = \"https://example.com/x\"\nbranch = \"ma\\nin\"\ncheckout = \"/srv/x\""
+                    .to_owned(),
+            ),
+            (
+                "checkout",
+                "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"\"".to_owned(),
+            ),
+            (
+                "checkout",
+                "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"srv/x\""
+                    .to_owned(),
+            ),
+            ("deployed", base("deployed = \"\"")),
+            ("deployed", base("deployed = \"main\"")),
+            ("deployed", base("deployed = \"abc123\"")),
+            ("failed", base("failed = \"..\"")),
+            (
+                "failed",
+                base(&format!("deployed = \"{SHA}\"\nfailed = \"{SHA}\"")),
+            ),
+            ("origin_script", base("origin_cwd = \"/srv/x\"")),
+            ("origin_cwd", base("origin_script = \"bun .\"")),
+        ];
+        for (field, text) in cases {
+            let err = read_text(&text).expect_err(&format!("must refuse: {text}"));
+            assert!(matches!(err, Error::Config(_)), "{text}: {err}");
+            assert!(
+                err.to_string().contains(&format!("`{field}`")),
+                "must name `{field}`: {err}"
+            );
+        }
+    }
+
+    /// fails if a record with every value in shape is refused, or if a
+    /// zero-length one - what a crash mid-write used to be able to leave -
+    /// is read as anything but a named failure.
+    #[test]
+    fn a_sound_record_reads_and_an_empty_one_is_refused() {
+        let text = format!(
+            "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n\
+             deployed = \"{SHA}\"\norigin_cwd = \"/srv/x\"\norigin_script = \"bun .\"\n"
+        );
+        let state = read_text(&text).expect("a sound record");
+        assert_eq!(state.deployed.as_deref(), Some(SHA));
+
+        let err = read_text("").expect_err("nothing to read");
+        assert!(matches!(err, Error::Config(_)), "{err}");
+        assert!(err.to_string().contains("deploy.toml"), "{err}");
+    }
+
+    /// fails if a rename that cannot land leaves its temporary file behind.
+    /// Nothing reads `deploy.toml.tmp`, so a stale one would sit beside the
+    /// record forever, a full copy of it that no listing ever mentions.
+    #[test]
+    fn a_failed_write_leaves_no_tmp_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the record should go, so the rename fails.
+        let path = dir.path().join("deploy.toml");
+        fs::create_dir_all(&path).expect("something in the way");
+
+        sample(None)
+            .write(&path)
+            .expect_err("cannot rename onto a directory");
+
+        assert!(
+            !dir.path().join("deploy.toml.tmp").exists(),
+            "the temporary file must be removed with the failure"
+        );
     }
 
     /// fails if reading a `deploy.toml` that is not there produces
@@ -316,7 +561,7 @@ verfiy = "alive"
             "a completed write must not leave a .tmp file"
         );
 
-        let second = sample(Some("a1b2c3d"));
+        let second = sample(Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2"));
         second.write(&path).expect("second write");
         assert!(
             !tmp.exists(),

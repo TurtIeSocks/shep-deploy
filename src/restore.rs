@@ -492,7 +492,7 @@ mod tests {
         let state = State {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
-            deployed: Some("a1b2c3d".to_owned()),
+            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".to_owned()),
             failed: None,
             verify: Verify::default(),
             watch: Watch::default(),
@@ -512,7 +512,7 @@ mod tests {
         let state = State {
             remote: "https://example.com/x".to_owned(),
             branch: "main".to_owned(),
-            deployed: Some("a1b2c3d".to_owned()),
+            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".to_owned()),
             failed: None,
             verify: Verify::default(),
             watch: Watch::default(),
