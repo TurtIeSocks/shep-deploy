@@ -44,7 +44,7 @@ use toml::{Table, Value};
 
 use crate::build::BuildSpec;
 use crate::error::Error;
-use crate::shared::{is_eloop, o_nofollow, printable};
+use crate::shared::{FromCheckout, is_eloop, o_nofollow, printable};
 
 /// The most a Flockfile may be, in bytes.
 ///
@@ -78,7 +78,7 @@ pub struct Merged {
 /// [`Error::Config`] if either file is not valid TOML, is a symlink the
 /// repository committed, or is past [`MAX_FLOCKFILE_BYTES`], or if the
 /// committed file sets `user` or `group` on any app.
-pub fn read(release: &Path, shared: &[PathBuf]) -> Result<Merged, Error> {
+pub fn read(release: &Path, shared: &FromCheckout) -> Result<Merged, Error> {
     Ok(Merged {
         doc: merged_document(release, shared)?,
         release: release.to_owned(),
@@ -172,7 +172,7 @@ impl Merged {
 /// of one document; this one-question form is what the tests drive.
 #[cfg(test)]
 pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<AppConfig, Error> {
-    read(release, shared)?.app_config(sheep)
+    read(release, &FromCheckout::of(shared.to_vec()))?.app_config(sheep)
 }
 
 /// The release's `[dog.deploy.build]` block, or the default (no command, which
@@ -208,7 +208,7 @@ pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<App
 /// As [`app_config`]: the one-question form, for the tests.
 #[cfg(test)]
 pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error> {
-    read(release, shared)?.build_spec()
+    read(release, &FromCheckout::of(shared.to_vec()))?.build_spec()
 }
 
 /// The committed Flockfile with the operator's override merged over it,
@@ -219,7 +219,7 @@ pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error
 ///
 /// # Errors
 /// As [`read`].
-fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
+fn merged_document(release: &Path, shared: &FromCheckout) -> Result<Value, Error> {
     // The committed file is never followed through a symlink: it is the
     // repository's, and the repository does not get to choose which file on
     // this host the dog reads. See `read_flockfile`.
@@ -235,13 +235,15 @@ fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
     //
     // Asked of `shared`, the list of paths the caller just linked in from the
     // operator's checkout, because that is the only record of where a file
-    // came from. See `is_operators` for the two filesystem-based versions of
-    // this check that came before, and why neither could work.
+    // came from. Only `shared::to_link` can build that list, which is what
+    // makes the answer evidence rather than a claim; its doc records the
+    // filesystem-based versions of this check that came before, and why
+    // none of them could work.
     //
     // Decided BEFORE the read, because it also decides whether the read may
     // follow a symlink: the operator's override IS one, into their checkout,
     // and a committed one must not be.
-    let operators = is_operators(shared);
+    let operators = shared.includes_override();
     let override_path = release.join(OVERRIDE);
     let override_doc = read_optional(
         &override_path,
@@ -258,37 +260,11 @@ fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
     Ok(deep_merge(committed, override_doc))
 }
 
-/// Whether the override in this release is the operator's own file.
-///
-/// Answered from the list of paths the caller just shared, not from the
-/// filesystem. Three versions of this check asked the filesystem and all three
-/// were wrong, the last one subtly enough to be worth recording.
-///
-/// It required the override to resolve OUTSIDE the release, on the grounds
-/// that the operator's arrives as a symlink into their checkout. A repository
-/// can satisfy that in two commits. Release A ships an ordinary tracked file
-/// holding `user = "root"` under some innocuous name, and goes live, which by
-/// this crate's own invariant means `current` points at it. Release B then
-/// commits `Flockfile.override.toml` as a symlink to
-/// `../../current/.deploy-payload.toml`. That resolves into release A, which
-/// is outside release B, so the check passed and the refusal was skipped.
-/// Demonstrated 2026-08-28.
-///
-/// The lesson is not that the rule needed another clause. It is that
-/// provenance cannot be recovered from a path once the path exists: whoever
-/// can write the tree can write the evidence. `crate::shared::link_into` is
-/// the only thing that knows which files came from the operator's checkout,
-/// because it is what put them there, so the answer travels from its caller
-/// instead of being reconstructed here.
-fn is_operators(shared: &[PathBuf]) -> bool {
-    shared.iter().any(|p| p == Path::new(OVERRIDE))
-}
-
-/// The override's name, in the one place both the check and the read use it.
+/// The override's name, in the one place the check and the read use it.
 ///
 /// `crate::shared::to_link` needs it too, to keep a repo-committed
-/// `.shepignore` from filtering the operator's own file out of the list this
-/// module then treats as proof of provenance.
+/// `.shepignore` from filtering the operator's own file out of the list
+/// `FromCheckout::includes_override` then answers from.
 pub(crate) const OVERRIDE: &str = "Flockfile.override.toml";
 
 /// Whether a Flockfile read may follow a symlink.
@@ -1078,7 +1054,7 @@ mod tests {
 
     /// fails if a repository can buy the exemption with a symlink out.
     ///
-    /// The escape the previous version of `is_operators` allowed, in two
+    /// The escape the previous version of the provenance check allowed, in two
     /// commits and needing nothing from the operator. Release A ships an
     /// ordinary tracked file holding `user = "root"` and goes live, so
     /// `current` points at it. Release B commits `Flockfile.override.toml` as
@@ -1218,7 +1194,7 @@ mod tests {
     /// The override deliberately does NOT name `user`. It did, set to
     /// `nobody`, on the theory that a laundered merge would be the shape
     /// worth catching. That made the test vacuous: `shared` is empty here, so
-    /// `is_operators` is false, so `merged_document` runs
+    /// `includes_override` is false, so `merged_document` runs
     /// `refuse_repo_privilege` against the override document too, and THAT
     /// check produced the error being asserted on. Deleting the
     /// committed-document check left the test passing. Found in round 8 of

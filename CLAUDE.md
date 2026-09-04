@@ -190,6 +190,12 @@ class rather than the instances.
 - **The Flockfile is parsed once per deploy, through `flockfile::read`.** The
   free `app_config` and `build_spec` are `#[cfg(test)]` wrappers; production
   code asks both questions of one `Merged`.
+- **`shared::FromCheckout` is minted only by `shared::to_link`.** It is the
+  list of paths linked in from the operator's checkout, and its
+  `includes_override` answer is the whole proof that `Flockfile.override.toml`
+  is the operator's file. The field is private and there is no `From` impl on
+  purpose: a trait impl is reachable from every module, which would let any
+  caller mint the proof. Tests build one with `FromCheckout::of`.
 - **A regression test for the artifact escape is worthless without
   `CARGO_TARGET_DIR` set.** Without it, source and destination collapse to the
   same path and the self-copy guard returns `Ok` before reaching anything the
