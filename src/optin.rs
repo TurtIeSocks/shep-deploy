@@ -378,6 +378,20 @@ pub async fn prepare<D: Daemon>(
 /// and stay up, and deletes the instances it replaced.
 ///
 /// # Errors
+/// A cutover that lands with nothing stranded promotes the record's `watch`
+/// from the `manual` [`prepare`] wrote to `auto`, which is what makes the
+/// target the poll loop's. A stranded one does not: instances it could not
+/// delete are still registered, and every later deploy reloads the name and
+/// respawns each of them from its own pre-adoption spec, so a loop polling
+/// it would bring them back on a schedule. Remove the ids the error names,
+/// then `shep deploy <sheep> --watch auto`.
+///
+/// A `verify` the operator edited in the record while the cutover ran is
+/// kept; a `--watch manual` typed while it ran is not, because the record
+/// already said `manual` from [`prepare`] and the two cannot be told
+/// apart. Run it after setup returns.
+///
+/// # Errors
 /// [`Error::CutOver`] if the newcomer never came up, in which case it has
 /// been removed and the original is still serving, untouched. That error
 /// also carries whether the shepherd's persisted record could be put back:
@@ -406,18 +420,6 @@ pub async fn prepare<D: Daemon>(
 /// release is serving and only the record is missing, which the next
 /// `shep-deploy deploy` writes.
 ///
-/// A `verify` the operator edited in the record while the cutover ran is
-/// kept; a `--watch manual` typed while it ran is not, because the record
-/// already said `manual` from [`prepare`] and the two cannot be told
-/// apart. Run it after setup returns.
-///
-/// A cutover that lands with nothing stranded promotes the record's `watch`
-/// from the `manual` [`prepare`] wrote to `auto`, which is what makes the
-/// target the poll loop's. A stranded one does not: instances it could not
-/// delete are still registered, and every later deploy reloads the name and
-/// respawns each of them from its own pre-adoption spec, so a loop polling
-/// it would bring them back on a schedule. Remove the ids the error names,
-/// then `shep deploy <sheep> --watch auto`.
 pub async fn cut_over<D: Daemon>(daemon: &D, prepared: Prepared) -> Result<String, Error> {
     let Prepared {
         hold,
@@ -844,6 +846,11 @@ async fn undo_start<D: Daemon>(
     let mut removed = drain(daemon, &flock, previous).await;
 
     let patience = cutover_budget(&original);
+    // How many the repair `Start` spawns: one per instance the original
+    // config asks for. Waiting for the first and draining that listing left
+    // the rest registered whenever they appeared on a later poll, with
+    // `removed` reporting true.
+    let wanted = usize::try_from(original.instances.max(1)).unwrap_or(1);
     if daemon.start(vec![original]).await.is_err() {
         return Undone {
             removed,
@@ -868,19 +875,26 @@ async fn undo_start<D: Daemon>(
                 recorded: true,
             };
         };
-        // A row that is new to both the pre-cutover flock AND the listing the
+        // Rows that are new to both the pre-cutover flock AND the listing the
         // first drain worked from. A newcomer that drain could not delete is
-        // in the second and must not pass for the repair instance, or the
+        // in the second and must not pass for a repair instance, or the
         // wait ends before that instance appears and it is left running.
-        if flock
+        // All `wanted` of them, not the first: a scaled original spawns
+        // several, and they need not appear on the same poll.
+        let arrived = flock
             .iter()
-            .any(|info| !previous.contains(&info.id) && !seen.contains(&info.id))
-        {
+            .filter(|info| !previous.contains(&info.id) && !seen.contains(&info.id))
+            .count();
+        if arrived >= wanted {
             removed &= drain(daemon, &flock, previous).await;
             break;
         }
         if Instant::now() >= deadline {
+            // Whatever did arrive is taken down; what did not is reported.
             removed = false;
+            if arrived > 0 {
+                let _ = drain(daemon, &flock, previous).await;
+            }
             break;
         }
         sleep(POLL).await;
@@ -1301,6 +1315,8 @@ mod tests {
         /// When the first repair `Start` was accepted; its instance appears
         /// [`SPAWN_LAG`] after, as a real shepherd's would.
         repaired_at: Cell<Option<Instant>>,
+        /// How far apart a scaled repair's rows appear, if not together.
+        repair_stagger: Option<Duration>,
     }
 
     /// How long a shepherd takes to spawn after accepting a `Start`, as the
@@ -1324,7 +1340,15 @@ mod tests {
                 newcomers_at_most: None,
                 repairs: Cell::new(0),
                 repaired_at: Cell::new(None),
+                repair_stagger: None,
             }
+        }
+
+        /// The same double, with a scaled repair's rows appearing one per
+        /// `gap` rather than all on the poll after the spawn lag.
+        fn staggering_repairs_by(mut self, gap: Duration) -> Self {
+            self.repair_stagger = Some(gap);
+            self
         }
 
         /// The same double, spawning at most `n` newcomers however many the
@@ -1447,14 +1471,14 @@ mod tests {
             // Not at once. `undo_start` used to describe right after the
             // repair `Start` and find nothing, and a double that showed the
             // row instantly hid that.
-            let repair_spawned = self
-                .repaired_at
-                .get()
-                .is_some_and(|at| Instant::now() - at >= SPAWN_LAG);
-            if repair_spawned {
+            if let Some(at) = self.repaired_at.get() {
+                let since = Instant::now() - at;
                 for offset in 0..self.repairs.get() {
+                    // The offset-th row lands `offset` gaps after the first.
+                    let lands_at =
+                        SPAWN_LAG + self.repair_stagger.unwrap_or(Duration::ZERO) * offset;
                     let id = REPAIR_ID + offset;
-                    if !self.is_deleted(id) {
+                    if since >= lands_at && !self.is_deleted(id) {
                         flock.push(self.row(id, ProcStatus::Online, REPAIR_PID + offset, 0));
                     }
                 }
@@ -1477,7 +1501,14 @@ mod tests {
             if attempt == 0 {
                 self.accepted_at.set(Some(Instant::now()));
             } else {
-                self.repairs.set(self.repairs.get() + 1);
+                // One row per instance the repair asked for, as a shepherd
+                // spawns them: counting Starts instead hid a scaled repair.
+                let asked = self
+                    .starts
+                    .borrow()
+                    .last()
+                    .map_or(1, |app| app.instances.max(1));
+                self.repairs.set(self.repairs.get() + asked);
                 if self.repaired_at.get().is_none() {
                     self.repaired_at.set(Some(Instant::now()));
                 }
@@ -2118,6 +2149,28 @@ mod tests {
             2,
             "the newcomer, and the instance the repair Start spawned"
         );
+    }
+
+    /// fails if a scaled original's repair leaves an instance behind. The
+    /// repair `Start` spawns one row per instance the original asks for,
+    /// and they need not appear on the same poll; waiting for the first and
+    /// draining that listing left the rest registered while `removed` said
+    /// true, and every later deploy respawned them on the old config.
+    #[tokio::test(start_paused = true)]
+    async fn a_scaled_repair_is_drained_whole_however_its_rows_arrive() {
+        let (daemon, mut prepared, _dirs) = cutover_fixture_dies_during_dwell().await;
+        let daemon = daemon.staggering_repairs_by(POLL * 4);
+        prepared.previous_config.instances = 3;
+
+        cut_over(&daemon, prepared).await.expect_err("gives up");
+
+        for offset in 0..3 {
+            assert!(
+                daemon.is_deleted(REPAIR_ID + offset),
+                "repair row {offset} left registered: {:?}",
+                daemon.deleted()
+            );
+        }
     }
 
     /// fails if a repair that could not be made is glossed over.
