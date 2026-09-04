@@ -774,10 +774,20 @@ fn copy_artifact(
     };
 
     let source_dir = source_walk.parent(false)?;
+    // `O_NONBLOCK` because a build can leave a named pipe at a declared
+    // artifact path, and opening one for reading waits for a writer. The type
+    // check below runs on the handle, so it never got the chance, and nothing
+    // above bounds this: the build's own budget is spent before any artifact
+    // is copied, and its process group is killed. A build that ran
+    // `mkfifo target/koji` and exited 0 left the dog waiting forever for a
+    // writer that was already dead, with the tree lock held.
+    //
+    // It changes nothing for a regular file, which is the only thing this
+    // copies. Both kernels ignore the flag there.
     let source = rustix::fs::openat(
         &source_dir,
         source_walk.leaf(),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|errno| {
@@ -2457,6 +2467,56 @@ mod tests {
         assert!(
             format!("{err}").contains("changed underneath the check"),
             "must be the refusal, not the kernel's own error: {err}"
+        );
+    }
+
+    /// fails if a named pipe declared as an artifact stops the copy dead.
+    ///
+    /// Opening a FIFO for reading blocks until something opens it for writing,
+    /// and the regular-file check runs on the handle, so it never got the
+    /// chance. The build's own budget does not cover this: the child is
+    /// reaped and its group killed before any artifact is copied, so a build
+    /// that ran `mkfifo target/koji` and exited 0 left the dog waiting for a
+    /// writer that was already dead. Forever, and with the tree lock held.
+    ///
+    /// `O_NONBLOCK` is what makes the type check reachable. It changes
+    /// nothing for a regular file, which is the only thing this copies.
+    ///
+    /// Run on its own thread with a deadline, because the failure being
+    /// tested is a hang and an assertion cannot be reached from inside one.
+    #[test]
+    fn a_named_pipe_declared_as_an_artifact_does_not_stop_the_copy() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let made = std::process::Command::new("mkfifo")
+            .arg(cache.path().join("koji"))
+            .status()
+            .expect("mkfifo");
+        assert!(
+            made.success(),
+            "the fixture needs a named pipe to prove anything"
+        );
+
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+
+        let (tell, heard) = std::sync::mpsc::channel();
+        let release_path = release.path().to_owned();
+        std::thread::spawn(move || {
+            let answer = copy_artifact(&release_path, &roots, &env, Path::new("target/koji"));
+            let _ = tell.send(format!("{:?}", answer.err()));
+        });
+
+        let answer = heard
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the copy must answer rather than wait for a writer that may never come");
+        assert!(
+            answer.contains("not a regular file"),
+            "a named pipe is not an artifact: {answer}"
         );
     }
 

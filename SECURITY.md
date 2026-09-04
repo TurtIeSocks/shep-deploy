@@ -67,6 +67,13 @@ what say which end resolved where. A test races two thousand copies against a
 thread swapping a parent directory for a symlink outside both roots. Against a
 walk that follows such a component it goes red in a hundredth of a second.
 
+A source that is not a regular file is refused, and it is opened `O_NONBLOCK`
+so that refusal cannot be made to wait. Opening a named pipe for reading blocks
+until something opens it for writing, and nothing above the copy bounds that: a
+build's own budget is spent and its process group killed before any artifact is
+copied. A build that ran `mkfifo target/koji` and exited 0 used to leave the
+dog waiting forever, with the tree lock held.
+
 **The cleared environment bounds what a build inherits from this process.** A
 build gets `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, whatever `passthrough` names
 in `[deploy]` in `dogs.toml`, and the release's own `[dog.deploy.build]`
