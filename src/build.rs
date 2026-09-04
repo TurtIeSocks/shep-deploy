@@ -500,9 +500,11 @@ impl<'a> Walk<'a> {
             .map(|component| component.as_os_str().to_owned())
             .collect();
         rest.extend(tail);
-        // A path that IS a root has no last component to open, and no
-        // artifact names one: `contained_artifacts` refuses an empty entry
-        // along with an absolute one.
+        // A path that IS a root has no last component to open. An entry can
+        // reach that: `artifacts = ["target"]` under a `CARGO_TARGET_DIR`
+        // redirect resolves its source to the redirect itself. `copy_artifact`
+        // refuses it by name before either walk is built, so `None` here is a
+        // root that appeared underneath one, which is a race like any other.
         let leaf = rest.pop()?;
 
         Some(Self {
@@ -582,9 +584,20 @@ impl<'a> Walk<'a> {
             return Err(self.io(original));
         };
         let target = PathBuf::from(OsString::from_vec(target.into_bytes()));
+        // A relative target is refused rather than resolved. This holds the
+        // descriptor of the directory the link sits in and deliberately not
+        // that directory's name, so there is nothing to resolve a relative
+        // target against, and canonicalising it against this process's own
+        // working directory would answer for somewhere else entirely.
+        //
+        // Nothing legitimate is lost. `shared::link_cache` writes an absolute
+        // target, and a link that is already there when the path is resolved
+        // is followed by `Walk::new` whatever its spelling. What reaches here
+        // is a component that became a link while the walk ran.
         let named = target
             .canonicalize()
             .ok()
+            .filter(|_| target.is_absolute())
             .filter(|real| self.roots.iter().any(|root| root == real));
         match named {
             Some(real) => self.open_root(&real),
@@ -643,7 +656,10 @@ impl<'a> Walk<'a> {
 /// or contains `..` (see [`contained_artifacts`] for why that is a security
 /// boundary); either end resolves outside the release and the build cache;
 /// the walk found a component that moved while it ran; or the build never
-/// produced it at the path declared. [`Error::Io`] naming the end being
+/// produced it at the path declared. Three more name a file that cannot be
+/// one: the entry names the release or the build cache itself, its source is
+/// not a regular file, or its destination exists and is not one, which is
+/// refused rather than replaced. [`Error::Io`] naming the end being
 /// walked if a directory on the way to it cannot be opened or created, the
 /// destination if it cannot be opened or have its permissions set, and the
 /// source in every other case - including a write to the destination that
@@ -692,6 +708,26 @@ fn copy_artifact(
                 resolve_deepest(path)
                     .unwrap_or_else(|| path.clone())
                     .display()
+            )));
+        }
+
+        // An entry can name a root outright. `artifact_source` strips
+        // `target` and rejoins the rest onto `CARGO_TARGET_DIR`, so
+        // `artifacts = ["target"]` under a redirect resolves its source to
+        // the redirect itself, and its destination through the link
+        // `link_cache` leaves at `release/target`. Both are the cache.
+        //
+        // Said here rather than left to `Walk`, which has no last component
+        // to open in that case and can only report it as a component that
+        // moved. Nothing moved, and an operator told otherwise goes looking
+        // for a build job that does not exist.
+        // The path itself, not its deepest existing ancestor: a destination
+        // that does not exist yet has one, and it is normally the release.
+        if path.canonicalize().is_ok_and(|real| roots.contains(&real)) {
+            return Err(Error::Config(format!(
+                "build.artifacts entry `{}` names the release or its build cache as its \
+                 {end}, which is a directory rather than a file the build produced",
+                printable(artifact.display())
             )));
         }
     }
@@ -761,6 +797,24 @@ fn copy_artifact(
     })?;
     let mut source = fs::File::from(source);
     let opened = source.metadata().map_err(Error::at(&from))?;
+
+    // Refused here, before the destination is walked, because opening a
+    // directory read-only succeeds and nothing else would have caught it:
+    // `artifacts = ["target/dist"]` under a redirect walked the destination,
+    // made its parents, created the destination itself, and only then failed
+    // in `io::copy` with `EISDIR` against the source. The build fails either
+    // way. What it left behind was an empty file in the release and a
+    // directory tree made for it.
+    //
+    // Same reasoning as the lexical check at the top of this function: a
+    // refusal that can happen before anything is created should.
+    if !opened.file_type().is_file() {
+        return Err(Error::Config(format!(
+            "build.artifacts entry `{}` names a source that is not a regular file; \
+             artifacts are copied one file at a time",
+            printable(artifact.display())
+        )));
+    }
 
     // Identity, not spelling. `link_cache` symlinks `release/target` at the
     // dog's own cache, so a redirect through `CARGO_TARGET_DIR` gives a source
@@ -2298,6 +2352,114 @@ mod tests {
         );
     }
 
+    /// fails if an artifact naming one of the two roots is reported as a race.
+    ///
+    /// `artifact_source` strips `target` and rejoins the rest onto
+    /// `CARGO_TARGET_DIR`, so `artifacts = ["target"]` under a redirect
+    /// resolves its SOURCE to the redirect itself. Point that at the dog's own
+    /// cache, as the arrangement this whole branch exists for does, and the
+    /// source IS a root: `Walk` has no last component to open and answers
+    /// `None`.
+    ///
+    /// Refusing is right. Saying "changed underneath the check" is not, because
+    /// nothing changed underneath anything, and an operator who reads that goes
+    /// looking for a build job that does not exist.
+    #[tokio::test]
+    async fn an_artifact_naming_a_root_itself_is_refused_as_a_directory() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+
+        let err = copy_artifact(release.path(), &roots, &env, Path::new("target"))
+            .expect_err("an artifact naming the cache root must be refused");
+
+        assert!(
+            !format!("{err}").contains("changed underneath"),
+            "nothing moved, so the refusal must not blame a race: {err}"
+        );
+        assert!(
+            format!("{err}").contains("rather than a file"),
+            "must say the entry names a directory: {err}"
+        );
+    }
+
+    /// fails if a directory declared as an artifact gets as far as creating
+    /// things in the release before it is refused.
+    ///
+    /// `O_RDONLY | O_NOFOLLOW` on a directory succeeds, and the source's type
+    /// was never checked, so `artifacts = ["target/dist"]` under a redirect
+    /// opened the directory, walked the destination, created its parents and
+    /// then the destination itself, and only failed in `io::copy` with
+    /// `EISDIR`. The build fails either way. What it left behind was an empty
+    /// file in the release and a directory tree made for it.
+    ///
+    /// Same reasoning as the lexical check at the top of `copy_artifact`: a
+    /// refusal that can happen before anything is created should.
+    #[tokio::test]
+    async fn a_directory_declared_as_an_artifact_creates_nothing() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        std::fs::create_dir(cache.path().join("dist")).expect("the build's output dir");
+        let roots = artifact_roots(release.path(), cache.path());
+        let env: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            cache.path().display().to_string(),
+        )]
+        .into();
+
+        let err = copy_artifact(release.path(), &roots, &env, Path::new("target/dist"))
+            .expect_err("a directory is not an artifact");
+
+        assert!(
+            format!("{err}").contains("not a regular file"),
+            "must say what is wrong with the entry: {err}"
+        );
+        assert!(
+            !release.path().join("target").exists(),
+            "a refusal this early must not leave a directory tree in the release"
+        );
+    }
+
+    /// fails if a symlinked component whose target is relative is followed.
+    ///
+    /// `Walk::follow` reads a component with `readlinkat` and holds only the
+    /// descriptor of the directory it sits in, never that directory's name. A
+    /// relative target cannot be resolved from a descriptor without one, and
+    /// canonicalising it against this process's own working directory would
+    /// answer for a completely different place.
+    ///
+    /// So a relative target is refused, and this pins it. Nothing legitimate
+    /// is lost: `shared::link_cache` writes an absolute target, and a link
+    /// that is already there when the path is resolved is followed by
+    /// `Walk::new` whatever its spelling.
+    #[test]
+    fn a_component_that_becomes_a_relative_link_is_refused() {
+        let release = fixtures::tempdir();
+        let cache = fixtures::tempdir();
+        let roots = artifact_roots(release.path(), cache.path());
+        let artifact = PathBuf::from("target/koji");
+        let to = release.path().join(&artifact);
+
+        let walk = Walk::new(&roots, &artifact, &to).expect("the destination lands in the release");
+        // The two fixtures are siblings, so this names the cache root exactly
+        // as a relative path from the release. It is still refused.
+        let sibling = Path::new("..").join(cache.path().file_name().expect("a name"));
+        std::os::unix::fs::symlink(&sibling, release.path().join("target")).expect("link");
+
+        let err = walk
+            .parent(false)
+            .expect_err("a relative link target must be refused");
+        assert!(
+            format!("{err}").contains("changed underneath the check"),
+            "must be the refusal, not the kernel's own error: {err}"
+        );
+    }
+
     /// fails if a directory swapped for a symlink WHILE the copy runs can
     /// carry the write outside the release and the cache.
     ///
@@ -2362,8 +2524,11 @@ mod tests {
 
         let escaped = outside.path().join("app.js");
         let mut leaked = None;
+        let mut copied = 0_u32;
         for _ in 0..2_000 {
-            let _ = copy_artifact(release.path(), &roots, &env, &artifact);
+            if copy_artifact(release.path(), &roots, &env, &artifact).is_ok() {
+                copied += 1;
+            }
             if escaped.exists() {
                 leaked = Some(std::fs::read(&escaped).unwrap_or_default());
                 break;
@@ -2376,6 +2541,14 @@ mod tests {
             leaked.is_none(),
             "a swapped parent carried the copy outside both roots: {:?}",
             leaked.as_deref().map(String::from_utf8_lossy)
+        );
+        // The positive control. `leaked.is_none()` holds just as well if every
+        // attempt was refused for a reason that has nothing to do with a
+        // swapped parent, and a `Walk::new` that answered `None` every time
+        // would keep this green while proving nothing.
+        assert!(
+            copied > 0,
+            "no attempt copied anything, so the invariant above proves nothing"
         );
     }
 }

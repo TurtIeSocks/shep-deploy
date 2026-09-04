@@ -97,7 +97,7 @@ SHEP_BIN="$(command -v shep)" cargo test --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-392 unit tests and 7 integration as of 2026-09-04, ~23s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
+395 unit tests and 7 integration as of 2026-09-04, ~24s and ~31s. The number moves with every task; treat it as a shape, not a checksum.
 
 ## Architecture
 
