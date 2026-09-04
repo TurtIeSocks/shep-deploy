@@ -74,7 +74,7 @@ Each of these cost real time during plan one. They are inputs, not questions.
 
 ## Prerequisites in shep, which are NOT this plan's tasks
 
-Changes to `/Users/rin/GitHub/pm2-rs`. Name them, do not implement them.
+Changes to shep itself, then still called pm2-rs. Name them, do not implement them.
 
 **Numbered as the spec numbers them.** An earlier draft of this plan renumbered a subset from 1, which made "prerequisite 3" mean the smits work here and the CLI passthrough in the spec, in a document that referred to "prerequisite 3" twice. The spec's numbering is the shared one and this table keeps it.
 
