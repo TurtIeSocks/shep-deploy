@@ -1,33 +1,36 @@
 //! Reclaiming release worktrees once they are past the retention count.
 //!
-//! # Why this runs only after a VERIFIED deploy
+//! # What keeps this from deleting a directory something is running from
 //!
 //! A process's working directory is resolved when it is spawned, so an
 //! instance started before a swap goes on executing from the old release
 //! even after `current` moves. Removing that release out from under a
-//! running process is the hazard this module has to avoid, and it avoids
-//! it by when it runs rather than by checking: verification requires full
-//! turnover, every instance under a pid the pre-reload generation never
-//! had, so by the time this is called there is no instance left that was
-//! spawned from an older RELEASE. Move this call anywhere earlier in the
-//! sequence and that argument stops holding.
+//! running process is the hazard this module has to avoid. It runs after
+//! EVERY ending of a deploy, verified or not, so the argument has to hold
+//! for each of them, and it rests on three things rather than on timing:
+//!
+//! - The release `current` names is spared whatever its age.
+//! - The release `deploy.toml` names is spared too. The two agree except
+//!   for a deploy killed between its swap and its record write, which is
+//!   exactly the case where the record's release is what the next rollback
+//!   returns to, and that release is not always the newest by mtime.
+//! - A release that just failed is the newest by mtime, and `keep` is at
+//!   least two (`crate::config` refuses less), so it is never a candidate in
+//!   the cycle that follows its own failure. After a verified deploy every
+//!   instance has turned over, so nothing runs from anything older.
 //!
 //! "Retention could delete what something is running from" is the right
-//! worry to have about this module, so here is the whole of the answer:
-//! this reads `releases/` and nothing else. A sheep's pre-adoption
-//! instance runs from the operator's own checkout, which is not in there;
-//! `current` is spared explicitly whatever its age; and every other
-//! instance was spawned from a release this deploy just turned over. There
-//! is no path by which a running process's working directory is a
-//! candidate here.
+//! worry to have about this module, so here is the rest of the answer: this
+//! reads `releases/` and nothing else. A sheep's pre-adoption instance runs
+//! from the operator's own checkout, which is not in there.
 //!
 //! # Why a failure here never fails a deploy
 //!
-//! It runs after `deploy.toml` is written, at which point `current`, the
-//! record and the running process all agree and the deploy is genuinely
-//! over. A worktree that cannot be removed costs disk, not correctness,
-//! and reporting the deploy as failed because of it would report a failure
-//! that did not happen.
+//! It runs after the deploy's own outcome is decided and recorded, at which
+//! point `current`, the record and the running process agree with each
+//! other and the deploy is genuinely over. A worktree that cannot be removed
+//! costs disk, not correctness, and reporting the deploy as failed because
+//! of it would report a failure that did not happen.
 
 use std::fs;
 use std::path::Path;
@@ -35,23 +38,30 @@ use std::time::SystemTime;
 
 use crate::error::Error;
 use crate::paths::Tree;
+use crate::state::is_sha;
 use crate::{git, swap};
 
 /// Removes every release beyond the newest `keep`, and answers with the
 /// shas it removed.
 ///
-/// Never removes the release `current` names, whatever its age. That is
-/// belt and braces rather than the primary guard (the newest release is
-/// the one just deployed, so ordering alone would spare it), and it exists
-/// because the cost of being wrong is a sheep whose `cwd` resolves to
-/// nothing.
+/// Never removes the release `current` names, nor the one `recorded` names
+/// (the record's `deployed`), whatever their age. The first is what is
+/// serving; the second is what a rollback returns to when a deploy died
+/// between its swap and its record write. See the module doc for why both
+/// are needed.
+///
+/// A release's completion marker (see [`Tree::completion`]) goes with it,
+/// and so does any marker whose release is already gone by other means:
+/// nothing else ever removes one, so without this the tree gained a file
+/// per commit ever deployed, forever.
 ///
 /// # Errors
 /// [`Error::Io`], naming `releases/`, if it cannot be listed.
-/// [`Error::Git`] if a worktree cannot be removed or the bookkeeping
-/// cannot be pruned. A caller is expected to warn on these rather than
-/// fail the deploy that triggered them: see this module's own doc.
-pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
+/// [`Error::Git`] if a worktree cannot be removed or, when every removal
+/// went, if the bookkeeping cannot be pruned. A caller is expected to warn
+/// on these rather than fail the deploy that triggered them: see this
+/// module's own doc.
+pub fn prune(tree: &Tree, keep: usize, recorded: Option<&str>) -> Result<Vec<String>, Error> {
     let live = swap::resolve(&tree.current())?;
     let live = live.as_deref().and_then(sha_of);
 
@@ -94,11 +104,16 @@ pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
         found.push((name, modified));
     }
 
+    let git_dir = tree.git();
     let mut removed = Vec::new();
     let mut failure = None;
-    for sha in doomed(&found, keep, live.as_deref()) {
-        match git::worktree_remove(&tree.git(), &tree.release(&sha)) {
-            Ok(()) => removed.push(sha),
+    for sha in doomed(&found, keep, &[live.as_deref(), recorded]) {
+        match git::worktree_remove(&git_dir, &tree.release(&sha)) {
+            Ok(()) => {
+                // The marker vouched for a checkout that is gone now.
+                let _ = fs::remove_file(tree.completion(&sha));
+                removed.push(sha);
+            }
             // One release that will not go must not strand the rest, and
             // must not skip the prune below. A `?` here did both, and it
             // did them every cycle: whatever made the removal fail was
@@ -114,11 +129,33 @@ pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
     // stopped it running in exactly that case. A hand-removed release then
     // stayed registered, and redeploying that sha failed with "is a missing
     // but already registered worktree".
-    git::worktree_prune(&tree.git())?;
+    //
+    // Its failure is reported only when no removal failed: a `?` here threw
+    // away the removal failure the loop above went out of its way to keep,
+    // and `removed` with it.
+    let pruned = git::worktree_prune(&git_dir);
+    sweep_markers(tree, &releases);
 
-    match failure {
+    match failure.or(pruned.err()) {
         Some(err) => Err(err),
         None => Ok(removed),
+    }
+}
+
+/// Removes every completion marker whose release is no longer on disk.
+///
+/// Best effort throughout: a marker is a zero-byte file whose only reader
+/// is `deploy::checkout_release`, and one that cannot be removed costs a
+/// stale entry, which that reader already guards against by also requiring
+/// the directory.
+fn sweep_markers(tree: &Tree, releases: &Path) {
+    let Ok(markers) = fs::read_dir(tree.completions()) else {
+        return;
+    };
+    for marker in markers.flatten() {
+        if !releases.join(marker.file_name()).exists() {
+            let _ = fs::remove_file(marker.path());
+        }
     }
 }
 
@@ -132,28 +169,26 @@ pub fn prune(tree: &Tree, keep: usize) -> Result<Vec<String>, Error> {
 /// `file_type` does not follow symlinks, deliberately. A symlinked entry is
 /// not a worktree either.
 fn names_a_release(entry: &fs::DirEntry, name: &str) -> bool {
-    entry.file_type().is_ok_and(|kind| kind.is_dir())
-        && matches!(name.len(), 40 | 64)
-        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+    entry.file_type().is_ok_and(|kind| kind.is_dir()) && is_sha(name)
 }
 
 /// Which of `releases` to remove: everything past the newest `keep`, minus
-/// `live`.
+/// any of `spared`.
 ///
 /// Ordered by directory modification time rather than by commit date. A
 /// release's directory is created when its worktree is added and written
 /// into by its build, so its mtime is when this host last worked on it,
 /// which is the question retention is asking. Commit date is a fact about
 /// the repository and would put a redeployed older sha in the wrong place.
-fn doomed(releases: &[(String, SystemTime)], keep: usize, live: Option<&str>) -> Vec<String> {
+fn doomed(releases: &[(String, SystemTime)], keep: usize, spared: &[Option<&str>]) -> Vec<String> {
     let mut ordered: Vec<&(String, SystemTime)> = releases.iter().collect();
     ordered.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     ordered
         .into_iter()
         .skip(keep)
+        .filter(|(name, _)| !spared.contains(&Some(name.as_str())))
         .map(|(name, _)| name.clone())
-        .filter(|name| Some(name.as_str()) != live)
         .collect()
 }
 
@@ -212,7 +247,7 @@ mod tests {
         at_second(&tree.release(&shas[2]), 30);
         at_second(&stray, 40);
 
-        prune(&tree, 2).expect("prunes");
+        prune(&tree, 2, None).expect("prunes");
 
         assert!(
             tree.release(&shas[1]).is_dir(),
@@ -249,7 +284,7 @@ mod tests {
         at_second(&tree.release(&shas[2]), 40);
         at_second(&tree.release(&shas[3]), 50);
 
-        let err = prune(&tree, 2).expect_err("the failure must still be reported");
+        let err = prune(&tree, 2, None).expect_err("the failure must still be reported");
 
         assert!(
             !tree.release(&shas[0]).exists() && !tree.release(&shas[1]).exists(),
@@ -337,7 +372,7 @@ mod tests {
     #[test]
     fn the_newest_releases_survive() {
         let all = releases(&["new", "old", "older", "ancient"]);
-        assert_eq!(doomed(&all, 2, None), vec!["older", "ancient"]);
+        assert_eq!(doomed(&all, 2, &[None]), vec!["older", "ancient"]);
     }
 
     /// fails if `prune` only clears git's stale worktree bookkeeping on
@@ -355,7 +390,7 @@ mod tests {
 
         // keep is larger than the release count, so nothing is past it and
         // `removed` comes back empty. That is the case the gate broke.
-        let removed = prune(&tree, 5).expect("prune");
+        let removed = prune(&tree, 5, None).expect("prune");
         assert!(removed.is_empty(), "nothing was past the keep count");
 
         git::worktree_add(&tree.git(), &orphan, &shas[0])
@@ -370,13 +405,13 @@ mod tests {
     #[test]
     fn the_live_release_is_never_pruned_whatever_its_age() {
         let all = releases(&["new", "old", "older", "ancient"]);
-        assert_eq!(doomed(&all, 2, Some("ancient")), vec!["older"]);
+        assert_eq!(doomed(&all, 2, &[Some("ancient")]), vec!["older"]);
         // At keep = 1 the live release is the ONLY survivor besides the
         // newest, which is the "whatever its age" the name promises. Asserting
         // merely that `ancient` is absent restated `doomed`'s unconditional
         // live filter and would have passed at any keep, including a keep this
         // function does not honour.
-        assert_eq!(doomed(&all, 1, Some("ancient")), vec!["old", "older"]);
+        assert_eq!(doomed(&all, 1, &[Some("ancient")]), vec!["old", "older"]);
     }
 
     /// fails if the rollback target is pruned along with the rest. The
@@ -389,7 +424,7 @@ mod tests {
         let survivors: Vec<String> = all
             .iter()
             .map(|(name, _)| name.clone())
-            .filter(|name| !doomed(&all, 2, None).contains(name))
+            .filter(|name| !doomed(&all, 2, &[None]).contains(name))
             .collect();
         assert_eq!(survivors, vec!["new", "old"]);
     }
@@ -399,8 +434,8 @@ mod tests {
     /// case.
     #[test]
     fn a_young_tree_loses_nothing() {
-        assert!(doomed(&releases(&["new", "old"]), 5, None).is_empty());
-        assert!(doomed(&[], 5, None).is_empty());
+        assert!(doomed(&releases(&["new", "old"]), 5, &[None]).is_empty());
+        assert!(doomed(&[], 5, &[None]).is_empty());
     }
 
     /// fails if `prune` stops actually removing directories, or removes
@@ -410,7 +445,7 @@ mod tests {
     #[test]
     fn prune_removes_real_worktrees_and_leaves_the_live_one() {
         let (tree, shas) = fixture_tree_with_releases(4);
-        let removed = prune(&tree, 2).expect("prunes");
+        let removed = prune(&tree, 2, None).expect("prunes");
 
         assert_eq!(removed.len(), 2);
         assert!(tree.release(&shas[3]).exists(), "the newest survives");
@@ -419,5 +454,81 @@ mod tests {
             "so does the rollback target"
         );
         assert!(!tree.release(&shas[0]).exists(), "the oldest is gone");
+    }
+
+    /// fails if the release `deploy.toml` names can be reclaimed while
+    /// `current` names something else.
+    ///
+    /// The two disagree after a deploy killed between its swap and its record
+    /// write, which is exactly when the recorded release is what the next
+    /// rollback returns to, and that release need not be the newest by
+    /// mtime. Sparing `current` alone let a run of failed shas with fresh
+    /// mtimes push it out, and the next failure then had nothing to roll
+    /// back to.
+    #[test]
+    fn the_recorded_release_is_spared_like_the_live_one() {
+        let all = releases(&["newest", "recorded", "older", "ancient"]);
+        assert_eq!(
+            doomed(&all, 1, &[Some("newest"), Some("recorded")]),
+            vec!["older", "ancient"]
+        );
+    }
+
+    /// fails if a removed release leaves its completion marker behind, or a
+    /// marker whose release vanished by other means is never swept.
+    /// Nothing else removes one, so the tree used to gain a zero-byte file
+    /// per commit ever deployed, forever.
+    #[test]
+    fn a_reclaimed_release_takes_its_completion_marker_with_it() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "web");
+        let origin = fixtures::tempdir();
+        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
+        fixtures::run_git(
+            origin.path(),
+            &["config", "user.email", "t@example.invalid"],
+        );
+        fixtures::run_git(origin.path(), &["config", "user.name", "t"]);
+        fs::write(origin.path().join("f"), "x").expect("file");
+        fixtures::run_git(origin.path(), &["add", "."]);
+        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "one"]);
+        let sha = fixtures::head_of(origin.path());
+        git::init_bare(&tree.git()).expect("bare");
+        git::fetch(
+            &tree.git(),
+            origin.path().to_str().expect("utf-8"),
+            fixtures::TEST_BUDGET,
+        )
+        .expect("fetch");
+        fs::create_dir_all(tree.releases()).expect("releases");
+
+        // Three releases named by real-looking shas, the oldest being the
+        // one real worktree; the two newer ones are stand-ins that keep it
+        // out of the kept set.
+        let doomed_sha = sha.clone();
+        git::worktree_add(&tree.git(), &tree.release(&doomed_sha), &sha).expect("worktree");
+        at_second(&tree.release(&doomed_sha), 1);
+        for (n, stand_in) in ["1".repeat(40), "2".repeat(40)].iter().enumerate() {
+            fs::create_dir_all(tree.release(stand_in)).expect("stand-in");
+            at_second(&tree.release(stand_in), 10 + n as u64);
+        }
+        let markers = tree
+            .completion(&doomed_sha)
+            .parent()
+            .expect("complete/")
+            .to_owned();
+        fs::create_dir_all(&markers).expect("complete dir");
+        fs::write(tree.completion(&doomed_sha), b"").expect("marker");
+        let orphan = tree.completion(&"3".repeat(40));
+        fs::write(&orphan, b"").expect("a marker with no release");
+
+        let removed = prune(&tree, 2, None).expect("prunes");
+
+        assert_eq!(removed, vec![doomed_sha.clone()]);
+        assert!(
+            !tree.completion(&doomed_sha).exists(),
+            "the reclaimed release's marker must go with it"
+        );
+        assert!(!orphan.exists(), "a marker with no release must be swept");
     }
 }

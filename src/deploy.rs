@@ -200,7 +200,7 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// doc for why the poll loop needs to recognise it.
 ///
 /// Anything the steps before the swap return - see [`crate::git::fetch`],
-/// [`crate::shared::to_link`], [`crate::flockfile::app_config`] and
+/// [`crate::shared::to_link`], [`crate::flockfile::read`] and
 /// [`crate::build::run`] - in which case nothing has been disturbed and the
 /// old release is still serving. [`Error::Raced`] if `current` moved while
 /// this deploy was preparing, which is refused rather than swapped over.
@@ -236,14 +236,15 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// the same reason it wraps a failed `restore`: `current` is left naming a
 /// release nothing is running.
 ///
-/// One error here does NOT mean the deploy failed. [`Error::Io`] from
-/// writing `deploy.toml`, which happens only after a successful verify, is
-/// returned instead of [`Outcome::Deployed`] even though the new release is
-/// live and verified. Nothing is rolled back, deliberately: there is nothing
-/// to undo and undoing would take a working release out of service. Only the
-/// record lags, so the next deploy of the same sha repeats the work and
-/// writes it again. A caller that treats every error as "the old release is
-/// still serving" is wrong about this one.
+/// One failure past the swap is reported and NOT returned: `deploy.toml`
+/// refusing to be written after a successful verify. The new release is
+/// live and verified, there is nothing to undo and undoing would take a
+/// working release out of service, so the outcome is still
+/// [`Outcome::Deployed`] and the failure is printed. What lags is the
+/// record, and only on disk: `state.deployed` has advanced in this process,
+/// so the poll loop's next tick reads the target as up to date, while a
+/// restarted dog reads the old sha off disk and deploys the same one again.
+/// One rebuild, and it repairs itself.
 ///
 /// `keep` is the retention count: [`crate::retention`] reclaims every
 /// release beyond the newest `keep`, sparing whatever `current` names
@@ -448,9 +449,10 @@ async fn attempt<D: Daemon>(
     let shared_paths = shared::to_link(&state.checkout)?;
     shared::link_into(&release, &state.checkout, &shared_paths)?;
 
-    let app = flockfile::app_config(&release, sheep, &shared_paths)?;
+    let flockfiles = flockfile::read(&release, &shared_paths)?;
+    let app = flockfiles.app_config(sheep)?;
     refuse_ungated_verification(sheep, &app, state.verify)?;
-    let spec = flockfile::build_spec(&release, &shared_paths)?;
+    let spec = flockfiles.build_spec()?;
     build::run(
         sheep,
         &release,
@@ -489,13 +491,16 @@ async fn attempt<D: Daemon>(
         // that `land` does not own, and it is deliberate rather than a
         // leak. It runs only after a verify has SUCCEEDED, so the new
         // release is up and serving: there is nothing to undo, and undoing
-        // it would take a healthy release out of service. What its failure
-        // costs is a record that lags, which the next poll resolves by
-        // deploying the same sha again - wasteful, and safe. That is why it
-        // is a `?` here rather than a `Landed` variant.
+        // it would take a healthy release out of service. Its failure is
+        // printed and the outcome stays `Deployed`, because that is what
+        // happened. Returning the failure instead had `record` write the
+        // sha into `failed` next to the same sha in `deployed`: a record
+        // that said the release was serving and held at once.
         Landed::Verified => {
             state.deployed = Some(head.to_owned());
-            state.write(&tree.state_file())?;
+            if let Err(err) = state.write(&tree.state_file()) {
+                eprintln!("shep-deploy: {sheep}: deployed {head}, but could not record it: {err}");
+            }
             Ok(Outcome::Deployed {
                 sha: head.to_owned(),
             })
@@ -503,7 +508,7 @@ async fn attempt<D: Daemon>(
         // Nothing was ever started on the new release, so there is nothing
         // to reload onto the old one - only a symlink to put back.
         Landed::NotStarted(source) => {
-            undo_swap(tree, previous.as_deref(), &source)?;
+            undo_swap(tree, state, previous.as_deref(), head, &source)?;
             Err(source)
         }
         Landed::NotVerified { why, patience } => {
@@ -597,7 +602,7 @@ fn record(
         }
     }
 
-    if let Err(err) = retention::prune(tree, keep) {
+    if let Err(err) = retention::prune(tree, keep, state.deployed.as_deref()) {
         eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
     }
 }
@@ -782,9 +787,14 @@ fn never_reached_the_shepherd(err: &Error) -> bool {
 /// describe a machine that is not split - the variant reserved for what this
 /// crate cannot repair, spent on something it just did.
 ///
-/// `previous` of `None` is a target's first deploy: `current` names the new
-/// release and there is nothing earlier to name instead, so it is left
-/// where it is.
+/// Which release to put back is [`rollback_target`]'s decision, the same
+/// one a full rollback makes: `previous` first, then the record. `previous`
+/// is `None` only when `current` was absent at the start of the deploy,
+/// which no path in this crate produces once a cutover has landed, so it
+/// means an operator removed the link by hand. The record still names the
+/// release that was serving, and that is what goes back. Leaving `current`
+/// on the unverified release instead, as this once did, was a swap nothing
+/// had approved reported as an ordinary failure.
 ///
 /// # Residual, and it is the same one the module doc names for
 /// `current.tmp`
@@ -800,17 +810,30 @@ fn never_reached_the_shepherd(err: &Error) -> bool {
 ///
 /// # Errors
 /// [`Error::RollbackFailed`] carrying `why` if `current` cannot be put back,
-/// which is the one case here that does leave something for an operator:
-/// `current` naming a release nothing is running.
-fn undo_swap(tree: &Tree, previous: Option<&Path>, why: &Error) -> Result<(), Error> {
-    let Some(previous) = previous else {
-        return Ok(());
-    };
-
-    swap::point_at(&tree.current(), previous).map_err(|source| Error::RollbackFailed {
+/// or if there is nothing on disk to put it back to. Both leave the same
+/// thing for an operator: `current` naming a release nothing is running.
+fn undo_swap(
+    tree: &Tree,
+    state: &State,
+    previous: Option<&Path>,
+    attempted: &str,
+    why: &Error,
+) -> Result<(), Error> {
+    let wrap = |source| Error::RollbackFailed {
         why: why.to_string(),
         source: Box::new(source),
-    })
+    };
+
+    let Some(target) = rollback_target(tree, state, previous, attempted) else {
+        return Err(wrap(Error::Config(format!(
+            "current names {attempted}, which nothing verified, and neither the link it \
+             replaced nor deploy.toml names an earlier release that is still on disk. Point {} \
+             at a release by hand before deploying again",
+            tree.current().display()
+        ))));
+    };
+
+    swap::point_at(&tree.current(), &target).map_err(wrap)
 }
 
 /// Sets `watch` on the target and records it, without deploying.
@@ -1236,10 +1259,6 @@ mod tests {
         state: State,
     }
 
-    /// An origin repo with a Flockfile declaring one app named `web`, and
-    /// a bare clone fetched from it - but no release built and no
-    /// `current` at all, which is a target the moment before its first
-    /// deploy.
     /// A sha whose release directory is not on disk.
     ///
     /// What a record naming a release retention has already reclaimed looks
@@ -1249,6 +1268,10 @@ mod tests {
     /// longer can.
     const RECLAIMED: &str = "0000000000000000000000000000000000000000";
 
+    /// An origin repo with a Flockfile declaring one app named `web`, and
+    /// a bare clone fetched from it - but no release built and no
+    /// `current` at all, which is a target the moment before its first
+    /// deploy.
     fn fixture_before_any_release() -> Fixture {
         let home = tempfile::tempdir().expect("tempdir");
         let origin = tempfile::tempdir().expect("tempdir");
@@ -1474,8 +1497,9 @@ mod tests {
             shepherd
         }
 
-        /// As [`Self::never_ready`], but leaves a stale `current.tmp` at
-        /// `plant` on the way past.
+        /// As [`Self::never_ready`], but leaves a file in the way at `plant`
+        /// (the `current.tmp` path) on the way past, so the rollback's swap
+        /// back cannot land.
         fn planting(plant: PathBuf) -> Self {
             Self {
                 plant: Some(plant),
@@ -1601,7 +1625,10 @@ mod tests {
             if let Some(plant) = &self.plant
                 && plant.symlink_metadata().is_err()
             {
-                std::os::unix::fs::symlink("somewhere", plant).expect("plant a stale tmp link");
+                // A regular file, not a symlink: a stale tmp LINK is this
+                // dog's own leftover and `swap::point_at` replaces it, so
+                // only something that is not a link still refuses the swap.
+                std::fs::write(plant, b"in the way").expect("plant something at the tmp path");
             }
             self.describes.set(self.describes.get() + 1);
             if self
@@ -3067,7 +3094,7 @@ mod tests {
             &test_config(),
         )
         .await
-        .expect_err("the swap back collides with the stale tmp link");
+        .expect_err("the swap back collides with the file in the way");
 
         assert!(matches!(err, Error::RollbackFailed { .. }), "{err:?}");
         let shown = err.to_string();

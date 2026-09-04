@@ -37,6 +37,10 @@ use crate::error::Error;
 /// and a sibling of `current` is guaranteed to share its filesystem, which a
 /// path built any other way would not be.
 fn tmp_path(current: &Path) -> PathBuf {
+    debug_assert!(
+        current.file_name().is_some(),
+        "current is always Tree::current, which always ends in a file name"
+    );
     let mut name = current.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     current.with_file_name(name)
@@ -51,21 +55,59 @@ fn tmp_path(current: &Path) -> PathBuf {
 /// fresh: see the module doc for why that shape leaves a dangling window
 /// this one does not.
 ///
+/// A leftover `current.tmp` symlink from a swap that crashed after creating
+/// it but before the rename is removed first, with no message: `lock.rs`
+/// serialises deploys per tree, so nothing but an earlier crashed swap of
+/// this same tree could have put a symlink there, and it is not worth
+/// refusing over. If the rename below fails, the symlink this call just
+/// created is removed again on a best-effort basis, so one failed swap does
+/// not wedge every later one behind a leftover it caused.
+///
 /// # Errors
-/// [`Error::Io`], naming the temporary sibling, if it cannot be created -
-/// most commonly because a stale one from an interrupted swap is already
-/// there. [`Error::Io`], naming `current`, if the rename onto it fails.
+/// [`Error::Config`], naming the temporary sibling, if something other than
+/// a leftover symlink already occupies it - this dog did not leave it and
+/// will not remove it on its own. [`Error::Io`], naming the temporary
+/// sibling, if it cannot be inspected, if a leftover symlink there cannot be
+/// removed, or if the new symlink cannot be created. [`Error::Io`], naming
+/// `current`, if the rename onto it fails.
 pub fn point_at(current: &Path, release: &Path) -> Result<(), Error> {
     let tmp = tmp_path(current);
+
+    match fs::symlink_metadata(&tmp) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&tmp).map_err(|source| Error::Io {
+                path: tmp.clone(),
+                source,
+            })?;
+        }
+        Ok(_) => {
+            return Err(Error::Config(format!(
+                "{} is in the way of this swap and is not a symlink, so this dog did not leave \
+                 it. Move it aside by hand - `rm {}` if it is not wanted.",
+                tmp.display(),
+                tmp.display()
+            )));
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(Error::Io {
+                path: tmp.clone(),
+                source,
+            });
+        }
+    }
 
     symlink(release, &tmp).map_err(|source| Error::Io {
         path: tmp.clone(),
         source,
     })?;
 
-    fs::rename(&tmp, current).map_err(|source| Error::Io {
-        path: current.to_owned(),
-        source,
+    fs::rename(&tmp, current).map_err(|source| {
+        let _ = fs::remove_file(&tmp);
+        Error::Io {
+            path: current.to_owned(),
+            source,
+        }
     })
 }
 
@@ -93,12 +135,12 @@ pub fn resolve(current: &Path) -> Result<Option<PathBuf>, Error> {
 
 #[cfg(test)]
 mod tests {
-    /// fails if a leftover `current.tmp` stops being a refusal.
-    ///
-    /// `point_at` creates the symlink at a temporary path and then renames it
-    /// over `current`, because rename(2) is the only step that is atomic. If
-    /// something already occupies that temporary path the symlink cannot be
-    /// created, and the swap must fail there rather than proceeding.
+    /// fails if a leftover `current.tmp` that is not a symlink stops being a
+    /// refusal. A `current.tmp` that exists when `point_at` runs can only be
+    /// a leftover - `lock.rs` serialises deploys per tree - but one that is
+    /// not a symlink is not something this dog left behind, so it must be
+    /// refused rather than silently removed: an operator's own file could be
+    /// sitting there for a reason this dog cannot know.
     ///
     /// Its doc names this failure mode; until now the only test in this module
     /// exercised the success path, and the refusal was reached only
@@ -115,12 +157,67 @@ mod tests {
 
         let err = point_at(&current, &release).expect_err("an occupied tmp path must refuse");
         assert!(
-            matches!(&err, Error::Io { path, .. } if path.ends_with("current.tmp")),
-            "the refusal must name the path in the way, got: {err}"
+            matches!(&err, Error::Config(message)
+                if message.contains("current.tmp") && message.contains("rm")),
+            "the refusal must name the path in the way and say `rm`, got: {err}"
         );
         assert!(
             !current.exists(),
             "a refused swap must leave `current` exactly as it found it"
+        );
+    }
+
+    /// fails if a leftover `current.tmp` SYMLINK from a crashed swap stops
+    /// being self-healed. `lock.rs` serialises deploys per tree, so a
+    /// symlink already at the temporary path can only be this dog's own
+    /// leftover from an earlier swap that created it and then crashed
+    /// before the rename - nothing else could have put a symlink there
+    /// while a later swap of the same tree runs.
+    #[test]
+    fn a_leftover_tmp_symlink_is_replaced_and_the_swap_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old_release = dir.path().join("releases/old");
+        let release = dir.path().join("releases/new");
+        std::fs::create_dir_all(&old_release).expect("old release");
+        std::fs::create_dir_all(&release).expect("release");
+        let current = dir.path().join("current");
+        let tmp = dir.path().join("current.tmp");
+        symlink(&old_release, &tmp).expect("leftover symlink");
+
+        point_at(&current, &release).expect("a leftover symlink must self-heal");
+        assert_eq!(
+            resolve(&current).unwrap().as_deref(),
+            Some(release.as_path())
+        );
+        assert!(!tmp.exists(), "the swap must not leave current.tmp behind");
+    }
+
+    /// fails if a rename that fails leaves `current.tmp` behind to wedge
+    /// every later swap. `current` here is a non-empty real directory,
+    /// which `rename(2)` refuses to replace with a symlink - the same
+    /// failure shape a permissions problem or a full filesystem produces on
+    /// the real path. Without the cleanup this exercises, the very first
+    /// failed swap of a tree would leave a `current.tmp` that every later
+    /// deploy of the same sheep then refuses to run at all.
+    #[test]
+    fn a_failed_rename_leaves_no_tmp_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let release = dir.path().join("releases/abc");
+        std::fs::create_dir_all(&release).expect("release");
+        let current = dir.path().join("current");
+        std::fs::create_dir_all(&current).expect("current as a directory");
+        std::fs::write(current.join("keep"), b"not empty").expect("make it non-empty");
+
+        let err = point_at(&current, &release)
+            .expect_err("renaming a symlink onto a non-empty directory must fail");
+        assert!(
+            matches!(&err, Error::Io { path, .. } if path == &current),
+            "the failure must name current, got: {err}"
+        );
+        let tmp = dir.path().join("current.tmp");
+        assert!(
+            !tmp.exists(),
+            "a failed rename must not leave current.tmp behind"
         );
     }
 

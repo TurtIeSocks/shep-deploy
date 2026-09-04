@@ -244,6 +244,37 @@ fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8
     rx
 }
 
+/// `O_NOFOLLOW`, without a libc dependency or an unsafe block.
+///
+/// The value is fixed by each platform's ABI and cannot change without
+/// breaking every compiled program on it. Same "ask the host rather than
+/// reimplement its answer" spirit as `crate::build`'s use of `id`, except
+/// here the host's answer is a constant. Shared by the artifact copy and the
+/// Flockfile read, which both open a path the deployed repository chose.
+pub(crate) const fn o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0o400_000
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        0x0100
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        compile_error!("O_NOFOLLOW's value is not known for this target")
+    }
+}
+
+/// Whether `err` is `ELOOP`: the kernel refusing to follow a symlink, which
+/// is what an `O_NOFOLLOW` open answers when the last component is one.
+///
+/// By errno rather than `io::ErrorKind::FilesystemLoop`, which is not stable
+/// yet. `nix` already names the number for each platform.
+pub(crate) fn is_eloop(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32)
+}
+
 /// How often [`run_git_within`] asks whether the child has finished.
 ///
 /// Fifty milliseconds: short enough that a fetch finishing is not perceptibly

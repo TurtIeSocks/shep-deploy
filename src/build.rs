@@ -73,6 +73,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::error::Error;
+use crate::shared::{is_eloop, o_nofollow};
 
 /// The environment variables a build keeps from this process, by name.
 ///
@@ -97,7 +98,7 @@ const BASE_ENV: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ"];
 /// actually left its output.
 ///
 /// This is the `[dog.deploy.build]` block of a release's own Flockfile, parsed by
-/// [`crate::flockfile::build_spec`]:
+/// [`crate::flockfile::Merged::build_spec`]:
 ///
 /// ```toml
 /// [dog.deploy.build]
@@ -117,10 +118,11 @@ pub struct BuildSpec {
     /// The build command, run through `sh -c` inside the release. `None`
     /// is a no-op, not an error - see [`run`] for why.
     pub command: Option<String>,
-    /// Environment layered over the build's own on top of whatever it
-    /// inherits from the process running this dog. `CARGO_TARGET_DIR` is
-    /// the one entry this crate's design gives special meaning to - see
-    /// [`artifact_source`].
+    /// Environment for the build, layered over [`BASE_ENV`] and the
+    /// operator's `passthrough`. The build inherits nothing else from the
+    /// process running this dog: see [`run`]. `CARGO_TARGET_DIR` is the one
+    /// entry this crate's design gives special meaning to - see
+    /// [`artifact_source`], and it has to be absolute.
     pub env: BTreeMap<String, String>,
     /// Paths, relative to the release, to copy back in after a successful
     /// build. See the module doc for why this exists at all.
@@ -166,6 +168,12 @@ where
 
     let artifacts = Vec::<PathBuf>::deserialize(deserializer)?;
     for artifact in &artifacts {
+        if artifact.as_os_str().is_empty() {
+            return Err(D::Error::custom(
+                "build.artifacts has an empty entry, which names nothing; remove it or name a \
+                 path relative to the release",
+            ));
+        }
         if artifact.is_absolute() {
             return Err(D::Error::custom(format!(
                 "build.artifacts entry `{}` is an absolute path; artifacts are \
@@ -240,8 +248,9 @@ async fn resolve_id(release: &Path, user: &str, flag: &str, kind: &str) -> Resul
 
     if !output.status.success() {
         return Err(Error::Config(format!(
-            "as_user {user:?} does not resolve to a {kind} on this host (`id {flag} {user}` \
-             failed)"
+            "the app's `user = {user:?}` does not resolve to a {kind} on this host (`id {flag} \
+             {user}` failed); create that account, or pin a different one in \
+             Flockfile.override.toml"
         )));
     }
 
@@ -286,6 +295,12 @@ async fn effective_uid() -> Option<u32> {
 /// `-D warnings` refuses. That is weaker than a test and it is the reason
 /// this is one function rather than two lines inline.
 async fn root_warning(sheep: &str, as_user: Option<&str>) -> Option<String> {
+    // A build that drops to a user has nothing to warn about, so the `id`
+    // spawn is skipped rather than made and then thrown away, which it was
+    // on every deploy of every correctly configured app.
+    if as_user.is_some() {
+        return None;
+    }
     root_build_warning(sheep, effective_uid().await?, as_user)
 }
 
@@ -360,27 +375,6 @@ fn artifact_source(release: &Path, env: &BTreeMap<String, String>, artifact: &Pa
     release.join(artifact)
 }
 
-/// `O_NOFOLLOW`, without a libc dependency or an unsafe block.
-///
-/// The value is fixed by each platform's ABI and cannot change without
-/// breaking every compiled program on it. Same "ask the host rather than
-/// reimplement its answer" spirit as `build`'s use of `id`, except here the
-/// host's answer is a constant.
-const fn libc_o_nofollow() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        0o400_000
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        0x0100
-    }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        compile_error!("O_NOFOLLOW's value is not known for this target")
-    }
-}
-
 /// The deepest ancestor of `path` that exists, fully resolved.
 ///
 /// `canonicalize` fails on a path that does not exist yet, and an artifact's
@@ -438,7 +432,7 @@ fn lands_within(roots: &[PathBuf], candidate: &Path) -> bool {
 /// path as the release's filesystem rather than the cache's.
 fn copy_artifact(
     release: &Path,
-    cache: &Path,
+    roots: &[PathBuf; 2],
     env: &BTreeMap<String, String>,
     artifact: &Path,
 ) -> Result<(), Error> {
@@ -466,26 +460,10 @@ fn copy_artifact(
     // are spelled. The lexical refusal above catches `..` and an absolute
     // path; it cannot catch a committed symlink, and it says nothing at all
     // about the source, which `CARGO_TARGET_DIR` points wherever the
-    // repository's own Flockfile says.
-    //
-    // `cache` is passed in rather than read from `release/target`, which is
-    // exactly the entry an attacker controls: `link_cache` leaves a release's
-    // own `target` alone when it ships one.
-    //
-    // Two escapes measured 2026-08-28, both writing or reading at the dog's
-    // uid because this runs in the parent, after the build's own drop:
-    // `target -> /tmp/outside` wrote through the committed link, and
-    // `CARGO_TARGET_DIR = /any/path` with `artifacts = ["target/id_rsa"]`
-    // read an arbitrary file into the release, where a static-serving app
-    // then hands it out over HTTP.
-    let roots = [
-        release
-            .canonicalize()
-            .unwrap_or_else(|_| release.to_owned()),
-        cache.canonicalize().unwrap_or_else(|_| cache.to_owned()),
-    ];
+    // repository's own Flockfile says. See `artifact_roots` for what the
+    // two roots are and the escapes they were measured against.
     for (end, path) in [("destination", &to), ("source", &from)] {
-        if !lands_within(&roots, path) {
+        if !lands_within(roots, path) {
             return Err(Error::Config(format!(
                 "build.artifacts entry `{}` resolves its {end} to `{}`, which is \
                  outside the release and its build cache",
@@ -550,7 +528,7 @@ fn copy_artifact(
     let resolved = resolve_deepest(&from)
         .and_then(|real| fs::metadata(real).ok())
         .filter(|named| named.dev() == opened.dev() && named.ino() == opened.ino());
-    if resolved.is_none() || !lands_within(&roots, &from) {
+    if resolved.is_none() || !lands_within(roots, &from) {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
             artifact.display()
@@ -602,22 +580,56 @@ fn copy_artifact(
     // the whole chain. Refusing every symlinked component instead was tried
     // and is wrong: `shared::link_cache` makes `release/target` a link at the
     // dog's own cache, so that refusal broke the ordinary cargo arrangement.
-    if !lands_within(&roots, &to) {
+    if !lands_within(roots, &to) {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
             artifact.display()
         )));
     }
 
+    // Unlinked first, then created fresh with `create_new`, and the two
+    // together are the fix for a hard link. The checks above resolve names
+    // and compare inodes, and a hard link has neither a name to resolve nor
+    // an inode of its own: `release/dist/app.js` linked by the build to a
+    // file elsewhere on the same filesystem passes every one of them, and
+    // opening it for writing then truncates and rewrites the far file at the
+    // dog's uid. `remove_file` takes the link away without touching what it
+    // pointed at, and `create_new` refuses to open anything that appeared in
+    // between, symlink or otherwise. That also covers the `O_NOFOLLOW` case
+    // below on its own terms: a symlink here is gone before the open.
+    match fs::remove_file(&to) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(Error::Io {
+                path: to.clone(),
+                source: err,
+            });
+        }
+    }
     let mut sink = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc_o_nofollow())
+        .create_new(true)
+        .custom_flags(o_nofollow())
         .open(&to)
-        .map_err(|err| Error::Io {
-            path: to.clone(),
-            source: err,
+        .map_err(|err| {
+            // Something reappeared at the name between the unlink and the
+            // open. A backgrounded build job is the only thing that could,
+            // and the copy is refused rather than written through it. Said
+            // as a refusal, because the raw `File exists` or `Too many
+            // levels of symbolic links` reads as a broken host.
+            if err.kind() == io::ErrorKind::AlreadyExists || is_eloop(&err) {
+                Error::Config(format!(
+                    "build.artifacts entry `{}` had its destination replaced underneath the \
+                     copy; refusing to write through it",
+                    artifact.display()
+                ))
+            } else {
+                Error::Io {
+                    path: to.clone(),
+                    source: err,
+                }
+            }
         })?;
     io::copy(&mut source, &mut sink).map_err(|err| Error::Io {
         path: from.clone(),
@@ -668,8 +680,10 @@ fn copy_artifact(
 /// reading rather than a misconfiguration.
 ///
 /// The command runs through `sh -c`, with `release` as its working
-/// directory and `spec.env` layered on top of whatever this process itself
-/// inherited. Its stdout and stderr are inherited rather than captured, so
+/// directory and an environment built from scratch: [`BASE_ENV`], then
+/// whatever the operator's `passthrough` names, then `spec.env`, and
+/// nothing this process itself inherited beyond those. Its stdout and
+/// stderr are inherited rather than captured, so
 /// an operator watching a deploy sees the build's real output as it
 /// happens instead of a blob replayed after the fact.
 ///
@@ -763,6 +777,21 @@ pub async fn run(
         eprintln!("{warning}");
     }
 
+    // Refused before the build runs, not when its artifacts are copied: a
+    // relative `CARGO_TARGET_DIR` is resolved against wherever this dog
+    // happens to be running, so cargo would build somewhere no artifact
+    // path could name and the refusal at copy time printed a bare relative
+    // path the operator could not find on disk.
+    if let Some(target_dir) = spec.env.get("CARGO_TARGET_DIR")
+        && !Path::new(target_dir).is_absolute()
+    {
+        return Err(Error::Config(format!(
+            "[dog.deploy.build] env sets CARGO_TARGET_DIR = {target_dir:?}, which is not an \
+             absolute path; a relative one is resolved against whatever directory this dog \
+             is running in, not against the release. Name the directory in full"
+        )));
+    }
+
     let mut child = Command::new("sh");
     child.arg("-c").arg(command);
     child.current_dir(release);
@@ -777,16 +806,29 @@ pub async fn run(
     //
     // What survives is named in three places and nowhere else: BASE_ENV, the
     // operator's `passthrough` list, and the release's own `[dog.deploy.build] env`.
+    //
+    // `var_os` rather than `var`, because `var` reports a value that is not
+    // UTF-8 as absent and a `PATH` with one such component then vanished,
+    // leaving the build on `sh`'s built-in default path.
     child.env_clear();
-    for (key, value) in BASE_ENV
-        .iter()
-        .filter_map(|k| Some((*k, env::var(k).ok()?)))
-    {
-        child.env(key, value);
+    for key in BASE_ENV {
+        if let Some(value) = env::var_os(key) {
+            child.env(key, value);
+        }
     }
     for key in passthrough {
-        if let Ok(value) = env::var(key) {
-            child.env(key, value);
+        match env::var_os(key) {
+            Some(value) => {
+                child.env(key, value);
+            }
+            // Said, because `passthrough` is the only door for a registry
+            // token and a typo in it used to be a build that silently did
+            // not get the token. The config is checked at parse time; whether
+            // the variable is SET is only known here.
+            None => eprintln!(
+                "shep-deploy: {sheep}: passthrough names {key}, which is not set in this dog's \
+                 environment, so the build does not get it"
+            ),
         }
     }
     child.envs(&spec.env);
@@ -860,11 +902,36 @@ pub async fn run(
         });
     }
 
+    // Resolved once for every artifact rather than once per artifact:
+    // `canonicalize` walks the whole chain and the two roots do not change.
+    let roots = artifact_roots(release, cache);
     for artifact in &spec.artifacts {
-        copy_artifact(release, cache, &spec.env, artifact)?;
+        copy_artifact(release, &roots, &spec.env, artifact)?;
     }
 
     Ok(())
+}
+
+/// The two places an artifact may really land, resolved: the release and
+/// the dog's own build cache for this sheep.
+///
+/// `cache` is passed in rather than read from `release/target`, which is
+/// exactly the entry an attacker controls: `link_cache` leaves a release's
+/// own `target` alone when it ships one.
+///
+/// Two escapes measured 2026-08-28, both writing or reading at the dog's uid
+/// because the copy runs in the parent, after the build's own drop:
+/// `target -> /tmp/outside` wrote through the committed link, and
+/// `CARGO_TARGET_DIR = /any/path` with `artifacts = ["target/id_rsa"]` read
+/// an arbitrary file into the release, where a static-serving app then
+/// hands it out over HTTP.
+fn artifact_roots(release: &Path, cache: &Path) -> [PathBuf; 2] {
+    [
+        release
+            .canonicalize()
+            .unwrap_or_else(|_| release.to_owned()),
+        cache.canonicalize().unwrap_or_else(|_| cache.to_owned()),
+    ]
 }
 
 /// Kills an abandoned build's whole process group.
@@ -1430,6 +1497,42 @@ mod tests {
             leaked.trim().is_empty(),
             "the build saw CARGO_PKG_NAME = {leaked:?}, so the environment was inherited"
         );
+    }
+
+    /// fails if `BASE_ENV` stops reaching the build.
+    ///
+    /// Nothing else pins it: with the `BASE_ENV` loop deleted the suite
+    /// stayed green, because `sh` resolves `printenv` through its own
+    /// built-in default path when `PATH` is unset. A build with no `PATH`
+    /// and no `HOME` would find `cargo` and `npm` missing on a host where
+    /// both are installed, which reads as a broken host rather than a
+    /// dropped variable.
+    #[tokio::test]
+    async fn the_base_environment_reaches_the_build() {
+        let rel = fixtures::fixture_release(&[]);
+        let spec = BuildSpec {
+            command: Some("printenv PATH > path.txt; printenv HOME > home.txt; true".into()),
+            env: BTreeMap::new(),
+            artifacts: vec![],
+        };
+        run(
+            "web",
+            rel.path(),
+            &spec,
+            None,
+            &[],
+            tempdir_cache().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
+        .expect("builds");
+        for name in ["path.txt", "home.txt"] {
+            let value = std::fs::read_to_string(rel.path().join(name)).unwrap_or_default();
+            assert!(
+                !value.trim().is_empty(),
+                "{name} is empty, so a BASE_ENV variable did not reach the build"
+            );
+        }
     }
 
     /// fails if `passthrough` stops being the way a build gets a variable.

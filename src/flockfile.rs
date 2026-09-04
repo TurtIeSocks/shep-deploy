@@ -31,8 +31,10 @@
 //! "pin it so upstream can never change it" mechanism every other field
 //! already gets.
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use shep_client::shep_core::prelude::AppConfig;
@@ -40,6 +42,112 @@ use toml::{Table, Value};
 
 use crate::build::BuildSpec;
 use crate::error::Error;
+use crate::shared::{is_eloop, o_nofollow};
+
+/// The most a Flockfile may be, in bytes.
+///
+/// A mebibyte, which is a thousand times any real one. Both files are read
+/// whole and merged in memory, and both come from the deployed repository,
+/// so without a bound a commit could hand this dog a file large enough to
+/// hold the poll loop, and the tree's lock, for as long as it liked.
+const MAX_FLOCKFILE_BYTES: u64 = 1024 * 1024;
+
+/// The two Flockfiles of one release, read once and merged.
+///
+/// [`Merged::app_config`] and [`Merged::build_spec`] used to be free functions
+/// that each read and merged both files again; a deploy calls both, so every
+/// release was parsed twice. Reading
+/// through this type parses once and answers both questions from the same
+/// document, which is also the only way the two answers cannot disagree.
+#[derive(Debug)]
+pub struct Merged {
+    /// The committed document with the override merged over it.
+    doc: Value,
+    /// The release both were read from, for messages.
+    release: PathBuf,
+}
+
+/// Reads and merges `release`'s Flockfiles, refusing first if the committed
+/// one sets `user` or `group`.
+///
+/// # Errors
+/// [`Error::Io`], naming the failing path, if `Flockfile.toml` cannot be
+/// read or `Flockfile.override.toml` exists but cannot be read.
+/// [`Error::Config`] if either file is not valid TOML, is a symlink the
+/// repository committed, or is past [`MAX_FLOCKFILE_BYTES`], or if the
+/// committed file sets `user` or `group` on any app.
+pub fn read(release: &Path, shared: &[PathBuf]) -> Result<Merged, Error> {
+    Ok(Merged {
+        doc: merged_document(release, shared)?,
+        release: release.to_owned(),
+    })
+}
+
+impl Merged {
+    /// The [`AppConfig`] for `sheep`: the merged entry named `sheep`,
+    /// deserialised.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if no app named `sheep` exists after merging, or if
+    /// that app's table does not match [`AppConfig`]'s schema.
+    pub fn app_config(&self, sheep: &str) -> Result<AppConfig, Error> {
+        let app = select_app(&self.doc, sheep)?;
+        app.try_into().map_err(|source: toml::de::Error| {
+            Error::Config(format!(
+                "app {sheep:?} does not match shep's app schema: {}",
+                source.message()
+            ))
+        })
+    }
+
+    /// The `[dog.deploy.build]` block, or the default (no command, which
+    /// [`crate::build::run`] treats as a no-op) if neither file declares
+    /// one.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if the block does not match [`BuildSpec`]'s schema -
+    /// an unknown key, or a value of the wrong type - or if either file still
+    /// carries a top-level `[build]`.
+    pub fn build_spec(&self) -> Result<BuildSpec, Error> {
+        let doc = self.doc.as_table();
+
+        // Refused rather than ignored, because ignoring it builds nothing and
+        // says nothing: a release whose build never ran, swapped in and
+        // reported as deployed. The old spelling is in this crate's own
+        // published README, so whoever meets this message is following
+        // instructions that were right at the time. Both files are named
+        // because the key can be in either: the override merges over the
+        // committed file before this looks.
+        if doc.is_some_and(|doc| doc.contains_key("build")) {
+            return Err(Error::Config(format!(
+                "{}: `[build]` moved to `[dog.deploy.build]`, in Flockfile.toml or \
+                 Flockfile.override.toml, whichever carries it. shep refuses a Flockfile with \
+                 a top-level `build` key, so the old spelling could not be registered with \
+                 `shep start` at all; `[dog]` is the table shep keeps for a dog's own config. \
+                 Rename the block.",
+                self.release.display()
+            )));
+        }
+
+        let Some(build) = doc
+            .and_then(|doc| doc.get("dog"))
+            .and_then(Value::as_table)
+            .and_then(|dogs| dogs.get("deploy"))
+            .and_then(Value::as_table)
+            .and_then(|deploy| deploy.get("build"))
+        else {
+            return Ok(BuildSpec::default());
+        };
+
+        build.clone().try_into().map_err(|source: toml::de::Error| {
+            Error::Config(format!(
+                "{}: `[dog.deploy.build]` does not match the build schema: {}",
+                self.release.display(),
+                source.message()
+            ))
+        })
+    }
+}
 
 /// The [`AppConfig`] for `sheep`, built from `release`'s own Flockfile.
 ///
@@ -57,15 +165,12 @@ use crate::error::Error;
 /// file sets `user` or `group` on any app, if no app named `sheep` exists
 /// after merging, or if that app's table does not match [`AppConfig`]'s
 /// schema.
+///
+/// The deploy and the cutover read through [`read`] and ask both questions
+/// of one document; this one-question form is what the tests drive.
+#[cfg(test)]
 pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<AppConfig, Error> {
-    let merged = merged_document(release, shared)?;
-
-    let app = select_app(&merged, sheep)?;
-    app.try_into().map_err(|source: toml::de::Error| {
-        Error::Config(format!(
-            "app {sheep:?} does not match shep's app schema: {source}"
-        ))
-    })
+    read(release, shared)?.app_config(sheep)
 }
 
 /// The release's `[dog.deploy.build]` block, or the default (no command, which
@@ -97,41 +202,11 @@ pub fn app_config(release: &Path, sheep: &str, shared: &[PathBuf]) -> Result<App
 /// [`Error::Config`] if the block does not match [`BuildSpec`]'s schema - an
 /// unknown key, or a value of the wrong type - or if the Flockfile still
 /// carries a top-level `[build]`.
+///
+/// As [`app_config`]: the one-question form, for the tests.
+#[cfg(test)]
 pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error> {
-    let merged = merged_document(release, shared)?;
-    let doc = merged.as_table();
-
-    // Refused rather than ignored, because ignoring it builds nothing and says
-    // nothing: a release whose build never ran, swapped in and reported as
-    // deployed. The old spelling is in this crate's own published README, so
-    // whoever meets this message is following instructions that were right at
-    // the time.
-    if doc.is_some_and(|doc| doc.contains_key("build")) {
-        return Err(Error::Config(format!(
-            "{}: `[build]` moved to `[dog.deploy.build]`. shep refuses a Flockfile with a \
-             top-level `build` key, so the old spelling could not be registered with \
-             `shep start` at all; `[dog]` is the table shep keeps for a dog's own \
-             config. Rename the block.",
-            release.display()
-        )));
-    }
-
-    let Some(build) = doc
-        .and_then(|doc| doc.get("dog"))
-        .and_then(Value::as_table)
-        .and_then(|dogs| dogs.get("deploy"))
-        .and_then(Value::as_table)
-        .and_then(|deploy| deploy.get("build"))
-    else {
-        return Ok(BuildSpec::default());
-    };
-
-    build.clone().try_into().map_err(|source: toml::de::Error| {
-        Error::Config(format!(
-            "{}: `[dog.deploy.build]` does not match the build schema: {source}",
-            release.display()
-        ))
-    })
+    read(release, shared)?.build_spec()
 }
 
 /// The committed Flockfile with the operator's override merged over it,
@@ -141,13 +216,13 @@ pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error
 /// one was called and neither can see a document the other could not.
 ///
 /// # Errors
-/// As [`app_config`], minus the app-selection failures.
+/// As [`read`].
 fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
-    let committed = read_required(&release.join("Flockfile.toml"))?;
+    // The committed file is never followed through a symlink: it is the
+    // repository's, and the repository does not get to choose which file on
+    // this host the dog reads. See `read_flockfile`.
+    let committed = read_required(&release.join("Flockfile.toml"), Follow::Never)?;
     refuse_repo_privilege(&committed)?;
-
-    let override_path = release.join(OVERRIDE);
-    let override_doc = read_optional(&override_path)?;
 
     // The override is exempt from the privilege refusal only because it is the
     // OPERATOR's file, and that has to be established rather than assumed. A
@@ -159,7 +234,21 @@ fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
     // operator's checkout, because that is the only record of where a file
     // came from. See `is_operators` for the two filesystem-based versions of
     // this check that came before, and why neither could work.
-    if !is_operators(shared) {
+    //
+    // Decided BEFORE the read, because it also decides whether the read may
+    // follow a symlink: the operator's override IS one, into their checkout,
+    // and a committed one must not be.
+    let operators = is_operators(shared);
+    let override_path = release.join(OVERRIDE);
+    let override_doc = read_optional(
+        &override_path,
+        if operators {
+            Follow::Operators
+        } else {
+            Follow::Never
+        },
+    )?;
+    if !operators {
         refuse_repo_privilege(&override_doc)?;
     }
 
@@ -199,16 +288,25 @@ fn is_operators(shared: &[PathBuf]) -> bool {
 /// module then treats as proof of provenance.
 pub(crate) const OVERRIDE: &str = "Flockfile.override.toml";
 
+/// Whether a Flockfile read may follow a symlink.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Follow {
+    /// The file is the operator's, linked in from their checkout, so the
+    /// link is the whole point.
+    Operators,
+    /// The file is the repository's, and a link is refused: see
+    /// [`read_flockfile`].
+    Never,
+}
+
 /// Reads and parses a Flockfile that must exist.
 ///
 /// # Errors
 /// [`Error::Io`] if `path` cannot be read at all. [`Error::Config`] if its
-/// contents are not valid TOML.
-fn read_required(path: &Path) -> Result<Value, Error> {
-    let text = fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_owned(),
-        source,
-    })?;
+/// contents are not valid TOML, if it is a symlink and `follow` says not to
+/// follow one, or if it is past [`MAX_FLOCKFILE_BYTES`].
+fn read_required(path: &Path, follow: Follow) -> Result<Value, Error> {
+    let text = read_flockfile(path, follow)?;
     parse(path, &text)
 }
 
@@ -218,23 +316,97 @@ fn read_required(path: &Path) -> Result<Value, Error> {
 /// `.shepignore`. `Flockfile.override.toml` is optional by design.
 ///
 /// # Errors
-/// [`Error::Io`] if `path` exists but cannot be read. [`Error::Config`] if
-/// its contents are not valid TOML.
-fn read_optional(path: &Path) -> Result<Value, Error> {
-    match fs::read_to_string(path) {
+/// As [`read_required`], except that an absent file is an empty document.
+fn read_optional(path: &Path, follow: Follow) -> Result<Value, Error> {
+    match read_flockfile(path, follow) {
         Ok(text) => parse(path, &text),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Value::Table(Table::new())),
-        Err(source) => Err(Error::Io {
-            path: path.to_owned(),
-            source,
-        }),
+        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(Value::Table(Table::new()))
+        }
+        Err(err) => Err(err),
     }
 }
 
-/// Parses `text` as a generic TOML document, naming `path` in the error if
-/// it does not parse.
+/// Reads one Flockfile whole, bounded, and without following a symlink
+/// unless the file is the operator's.
+///
+/// The symlink refusal is a security boundary rather than tidiness. This
+/// read runs in the dog's own process at its own uid, which under the
+/// arrangement shep's docs recommend is root, and it runs BEFORE any build
+/// drops to `user`. `git worktree add` materialises a committed symlink
+/// exactly as committed, so `Flockfile.toml -> /root/.ssh/id_rsa` in the
+/// tracked branch had this read the key, fail to parse it, and print its
+/// first line into the log through the parser's own error. `user` is the
+/// one bound this crate names as covering what a build can READ, and a
+/// commit walked around it without running a build at all. Found in review
+/// on 2026-09-03.
+///
+/// `O_NOFOLLOW` makes the kernel refuse the open when the last component is
+/// a link. A component above it is not this function's concern: those are
+/// the release directory and the tree, which only this dog writes.
+///
+/// # Errors
+/// [`Error::Config`] naming `path` if it is a symlink this read may not
+/// follow, or if it is larger than [`MAX_FLOCKFILE_BYTES`]. [`Error::Io`]
+/// naming `path` for anything else, `NotFound` included.
+fn read_flockfile(path: &Path, follow: Follow) -> Result<String, Error> {
+    let at = |source| Error::Io {
+        path: path.to_owned(),
+        source,
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    if follow == Follow::Never {
+        options.custom_flags(o_nofollow());
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if is_eloop(&source) => {
+            return Err(Error::Config(format!(
+                "{} is a symlink, and a Flockfile the repository commits has to be a regular \
+                 file: this dog reads it at its own uid before any build drops privilege, so a \
+                 link could point it at any file on the host. Commit the file itself.",
+                path.display()
+            )));
+        }
+        Err(source) => return Err(at(source)),
+    };
+
+    let len = file.metadata().map_err(at)?.len();
+    if len > MAX_FLOCKFILE_BYTES {
+        return Err(Error::Config(format!(
+            "{} is {len} bytes, past the {MAX_FLOCKFILE_BYTES}-byte limit for a Flockfile. A \
+             real one is a few hundred bytes; this dog reads and merges both files in memory \
+             on every deploy.",
+            path.display()
+        )));
+    }
+
+    let mut text = String::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.read_to_string(&mut text).map_err(at)?;
+    Ok(text)
+}
+
+/// Parses `text` as a generic TOML document, naming `path` and the line in
+/// the error if it does not parse.
+///
+/// The parser's own `Display` quotes the offending line back, which is
+/// right for a file the reader wrote and wrong for one the repository did:
+/// the read above refuses a symlink so that no file on the host can reach
+/// this parser, and this keeps the text out of the log in case one ever
+/// does. The message and the line number are what an operator needs; the
+/// line's text is in the file.
 fn parse(path: &Path, text: &str) -> Result<Value, Error> {
-    toml::from_str(text).map_err(|source| Error::Config(format!("{}: {source}", path.display())))
+    toml::from_str(text).map_err(|source| {
+        let line = source
+            .span()
+            .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
+        Error::Config(match line {
+            Some(line) => format!("{}: {}, at line {line}", path.display(), source.message()),
+            None => format!("{}: {}", path.display(), source.message()),
+        })
+    })
 }
 
 /// The one real boundary this module enforces: refuses if any app declared
@@ -344,18 +516,29 @@ fn merge_apps(base: Value, over: Value) -> Value {
         _ => Vec::new(),
     };
 
+    // Indexed once rather than scanned per override entry. Both arrays come
+    // from the repository, and a scan per entry made the merge quadratic in
+    // files nothing else bounds the length of.
+    let mut by_name: BTreeMap<String, usize> = base_apps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, app)| Some((app_name(app)?.to_owned(), index)))
+        .collect();
+
     for over_app in over_apps {
-        let name = app_name(&over_app).map(str::to_owned);
-        let existing = name
-            .as_deref()
-            .and_then(|name| base_apps.iter().position(|app| app_name(app) == Some(name)));
+        let existing = app_name(&over_app).and_then(|name| by_name.get(name).copied());
 
         match existing {
             Some(index) => {
-                let base_app = base_apps.remove(index);
-                base_apps.insert(index, deep_merge(base_app, over_app));
+                let base_app = std::mem::replace(&mut base_apps[index], Value::Table(Table::new()));
+                base_apps[index] = deep_merge(base_app, over_app);
             }
-            None => base_apps.push(over_app),
+            None => {
+                if let Some(name) = app_name(&over_app) {
+                    by_name.insert(name.to_owned(), base_apps.len());
+                }
+                base_apps.push(over_app);
+            }
         }
     }
 
@@ -381,6 +564,95 @@ fn select_app(merged: &Value, sheep: &str) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+    /// fails if a committed Flockfile that is a symlink is read at all.
+    ///
+    /// `git worktree add` materialises a committed symlink exactly as
+    /// committed, and this read runs at the dog's own uid before any build
+    /// drops privilege. `Flockfile.toml -> <any file root can read>` then had
+    /// the parser fail on that file and quote its first line into the log.
+    /// The assertion is on the secret NOT being in the message: an error
+    /// alone is what the vulnerable version returned too, after reading it.
+    #[test]
+    fn a_committed_flockfile_that_is_a_symlink_is_refused_unread() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let secret = rel.path().join("outside.txt");
+        std::fs::write(&secret, "-----BEGIN SECRET-----\nnot toml\n").expect("secret");
+        std::os::unix::fs::symlink(&secret, rel.path().join("Flockfile.toml")).expect("link");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("a link must be refused");
+
+        let shown = err.to_string();
+        assert!(matches!(err, Error::Config(_)), "{shown}");
+        assert!(shown.contains("symlink"), "must say why: {shown}");
+        assert!(
+            !shown.contains("SECRET"),
+            "must not quote the file: {shown}"
+        );
+    }
+
+    /// fails if the operator's own override stops resolving through the
+    /// symlink `shared::link_into` made for it. Refusing every link would
+    /// have broken the one legitimate case, which is the whole mechanism.
+    #[test]
+    fn the_operators_override_is_still_followed() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./run\"\n",
+        )
+        .expect("committed");
+        std::fs::write(
+            checkout.path().join(OVERRIDE),
+            "[[app]]\nname = \"web\"\nuser = \"svc\"\n",
+        )
+        .expect("the operator's override");
+        std::os::unix::fs::symlink(checkout.path().join(OVERRIDE), rel.path().join(OVERRIDE))
+            .expect("linked in, as link_into does");
+
+        let app = app_config(rel.path(), "web", &[PathBuf::from(OVERRIDE)])
+            .expect("the operator's link resolves");
+        assert_eq!(app.user.as_deref(), Some("svc"));
+    }
+
+    /// fails if a parse error quotes the offending line. The read refuses a
+    /// symlink so no file on the host can reach the parser, and this is the
+    /// second wall: even a file that does reach it is described by line
+    /// number, not by content.
+    #[test]
+    fn a_parse_error_names_the_line_and_not_its_text() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\n-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("not toml");
+
+        let shown = err.to_string();
+        assert!(shown.contains("line 3"), "must name the line: {shown}");
+        assert!(!shown.contains("OPENSSH"), "must not quote it: {shown}");
+    }
+
+    /// fails if a Flockfile of any size is read whole. Both files come from
+    /// the repository and are merged in memory on every deploy, with the
+    /// tree's lock held.
+    #[test]
+    fn a_flockfile_past_the_size_limit_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        let mut big = String::from("[[app]]\nname = \"web\"\nscript = \"./run\"\n");
+        big.push_str(&"# padding\n".repeat(120_000));
+        assert!(
+            big.len() as u64 > MAX_FLOCKFILE_BYTES,
+            "the fixture must exceed the limit"
+        );
+        std::fs::write(rel.path().join("Flockfile.toml"), big).expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("too big");
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
+
     /// fails if a committed override can grant a unix user.
     ///
     /// The override is exempt from `refuse_repo_privilege` because it is the
@@ -428,6 +700,10 @@ mod tests {
     ///
     /// It is the reason provenance now comes from the share list rather than
     /// from the filesystem: whoever can write the tree can write the evidence.
+    /// Since 2026-09-03 the link is refused before its target is read at all,
+    /// because a committed override is read without following symlinks; the
+    /// privilege refusal behind it is pinned by
+    /// `a_committed_override_cannot_grant_a_user`.
     #[test]
     fn a_committed_symlink_out_of_the_release_buys_no_exemption() {
         let tree = tempfile::tempdir().expect("tempdir");
@@ -457,9 +733,14 @@ mod tests {
         // Nothing was shared, so nothing is the operator's.
         let err =
             app_config(&b, "web", &[]).expect_err("a committed symlink must not buy the exemption");
+        let shown = format!("{err}");
         assert!(
-            format!("{err}").contains("user"),
-            "the refusal must name the field: {err}"
+            shown.contains("symlink"),
+            "the link is refused before it is followed: {shown}"
+        );
+        assert!(
+            !shown.contains("root"),
+            "and nothing of the payload is read: {shown}"
         );
     }
 
