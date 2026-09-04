@@ -102,6 +102,7 @@ pub fn state() -> State {
         origin_cwd: None,
         origin_script: None,
         checkout: PathBuf::from("/srv/x"),
+        origin: None,
     }
 }
 

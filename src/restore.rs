@@ -231,6 +231,7 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
         // touch it.
         // Read before the origin fields move out below.
         let never_moved = state.deployed.is_none();
+        let origin = state.origin;
         let (Some(cwd), Some(script)) = (state.origin_cwd, state.origin_script) else {
             results.push(Restored::LeftRunning {
                 sheep,
@@ -264,9 +265,16 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
             continue;
         }
 
+        // The report names where the sheep went: the origin's own cwd when
+        // the record carries one, the legacy field otherwise, which is the
+        // same choice `put_back` makes.
+        let to = origin
+            .as_ref()
+            .and_then(|origin| origin.cwd.as_deref())
+            .map_or_else(|| cwd.clone(), PathBuf::from);
         results.push(
-            match put_back(daemon, &sheep, registered, &cwd, &script).await {
-                PutBack::Done => Restored::Returned { sheep, to: cwd },
+            match put_back(daemon, &sheep, registered, origin.as_ref(), &cwd, &script).await {
+                PutBack::Done => Restored::Returned { sheep, to },
                 PutBack::Untouched(err) => Restored::Failed {
                     sheep,
                     why: err.to_string(),
@@ -322,8 +330,9 @@ enum PutBack {
     Deleted(Error),
 }
 
-/// Re-registers one sheep against the `cwd` and `script` it ran with
-/// before this dog took over.
+/// Re-registers one sheep as it was before this dog took over: the whole
+/// definition when the record carries one, or the `cwd` and `script` it ran
+/// with over the shepherd's current definition when it does not.
 ///
 /// Delete THEN start, and the order is tested. `Request::Start` on an
 /// already-registered name adds an instance rather than re-registering it,
@@ -345,6 +354,7 @@ async fn put_back<D: Daemon>(
     daemon: &D,
     sheep: &str,
     registered: &BTreeMap<String, AppConfig>,
+    origin: Option<&AppConfig>,
     cwd: &Path,
     script: &str,
 ) -> PutBack {
@@ -354,9 +364,23 @@ async fn put_back<D: Daemon>(
         )));
     };
 
-    let mut restored = current.clone();
-    restored.cwd = Some(cwd.display().to_string());
-    restored.script = script.to_owned();
+    // The whole pre-adoption definition when the record has it, so `env`,
+    // `instances`, the probes and the rest go back too. A record from before
+    // that field carries only `cwd` and `script`, and those go over whatever
+    // the shepherd has now, which is the deployed repository's definition.
+    let restored = match origin {
+        Some(origin) => {
+            let mut restored = origin.clone();
+            restored.name = sheep.to_owned();
+            restored
+        }
+        None => {
+            let mut restored = current.clone();
+            restored.cwd = Some(cwd.display().to_string());
+            restored.script = script.to_owned();
+            restored
+        }
+    };
 
     let live = match daemon.describe(sheep).await {
         Ok(live) => live,
@@ -561,6 +585,92 @@ mod tests {
             ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
+    }
+
+    /// Writes a `deploy.toml` for `sheep` carrying the whole pre-adoption
+    /// definition, as `prepare` writes since 2026-09-04.
+    fn write_target_with_full_origin(home: &Path, sheep: &str, origin: &AppConfig) {
+        let tree = Tree::for_sheep(home, sheep);
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let cwd = origin.cwd.clone().expect("an origin with a cwd");
+        let state = State {
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
+            origin_cwd: Some(PathBuf::from(&cwd)),
+            origin_script: Some(origin.script.clone()),
+            checkout: PathBuf::from(&cwd),
+            origin: Some(origin.clone()),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("write state");
+    }
+
+    /// fails if removal puts back only `cwd` and `script`. The record
+    /// carries the app as the shepherd had it before adoption; a restore
+    /// from the shepherd's current definition kept the deployed
+    /// repository's `env`, `instances` and probes past the dog's removal.
+    #[tokio::test]
+    async fn a_sheep_is_restored_to_its_whole_pre_adoption_definition() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin: AppConfig = toml::from_str(
+            "name = \"web\"\nscript = \"server.js\"\ncwd = \"/srv/web\"\ninstances = 3\n\
+             [env]\nPORT = \"8080\"\n",
+        )
+        .expect("an app");
+        write_target_with_full_origin(home.path(), "web", &origin);
+        let daemon = Recording::new(&["web"], Refuse::Never);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(&results[0], Restored::Returned { .. }),
+            "{results:?}"
+        );
+        let started = daemon.started();
+        let put_back = started.first().expect("one Start");
+        assert_eq!(put_back.instances, 3, "instances come back");
+        assert_eq!(
+            put_back.env.get("PORT").map(String::as_str),
+            Some("8080"),
+            "env comes back"
+        );
+        assert_eq!(put_back.cwd.as_deref(), Some("/srv/web"));
+        assert_eq!(put_back.script, "server.js");
+    }
+
+    /// fails if the report names a directory the sheep was not put back in.
+    /// `put_back` starts the origin's own `cwd` when the record carries an
+    /// origin, and `origin_cwd` is a hand-editable legacy field that can
+    /// disagree with it; the report has to follow the same choice.
+    #[tokio::test]
+    async fn the_report_names_the_origins_cwd_when_the_record_carries_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"server.js\"\ncwd = \"/srv/web\"\n")
+                .expect("an app");
+        let tree = Tree::for_sheep(home.path(), "web");
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let state = State {
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
+            origin_cwd: Some(PathBuf::from("/srv/stale")),
+            origin_script: Some("stale.js".to_owned()),
+            checkout: PathBuf::from("/srv/web"),
+            origin: Some(origin),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("write state");
+        let daemon = Recording::new(&["web"], Refuse::Never);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(&results[0], Restored::Returned { to, .. } if to == Path::new("/srv/web")),
+            "{results:?}"
+        );
+        let started = daemon.started();
+        assert_eq!(started[0].cwd.as_deref(), Some("/srv/web"));
+        assert_eq!(started[0].script, "server.js");
     }
 
     /// Writes a `deploy.toml` for `sheep` with no `origin_cwd` or

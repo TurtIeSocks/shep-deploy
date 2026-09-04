@@ -288,6 +288,10 @@ pub async fn prepare<D: Daemon>(
         origin_cwd: Some(checkout.clone()),
         origin_script: Some(previous_config.script.clone()),
         checkout,
+        // The whole definition, so removal puts back `env`, `instances`,
+        // the probes and everything else the operator had, not the two
+        // fields above alone.
+        origin: Some(previous_config.clone()),
     };
     // Checked here, before the fetch, the worktree and the build, rather
     // than found out by the record write at the very end. Neither value was
@@ -1781,6 +1785,26 @@ mod tests {
             died(&with_pid),
             "with a pid the status decides the same way"
         );
+    }
+
+    /// fails if the record stops carrying the app as the shepherd had it
+    /// before adoption. Removal restores from this; `cwd` and `script` alone
+    /// left the deployed repository's `env`, instances and probes in place.
+    #[tokio::test]
+    async fn the_record_carries_the_whole_pre_adoption_definition() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let checkout = checkout_with_commit();
+        let entries = [("bpm", checkout.path())];
+        let daemon = RollOf(&entries);
+
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
+            .await
+            .expect("prepares");
+
+        let origin = prepared.state.origin.as_ref().expect("recorded");
+        assert_eq!(origin, &prepared.previous_config);
+        let on_disk = State::read(&prepared.tree.state_file()).expect("reads");
+        assert_eq!(on_disk.origin.as_ref(), Some(&prepared.previous_config));
     }
 
     /// fails if a sheep the shepherd already runs from `current` is treated

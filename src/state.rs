@@ -15,9 +15,11 @@
 
 use std::fs;
 use std::io::{self, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shep_client::shep_core::config::AppConfig;
 
 use crate::error::Error;
 
@@ -54,6 +56,10 @@ pub enum Watch {
     Manual,
 }
 
+/// The record's file mode: owner only, because [`State::origin`] carries
+/// the app's `env` verbatim.
+const RECORD_MODE: u32 = 0o600;
+
 /// `deploy.toml`'s full contents.
 ///
 /// Every field here is load-bearing for restoring the sheep if the dog is
@@ -62,12 +68,14 @@ pub enum Watch {
 /// left running from a path under `$SHEP_HOME` they have no reason to know
 /// about.
 ///
-/// `Debug` is derived deliberately: nothing here is a secret. `remote` is a
-/// git URL an operator already has in their own checkout, `origin_script` is
-/// a shell command line their own `shep.toml`/process manager already ran in
-/// plaintext, and every other field is a path, a sha, or one of the two
-/// small enums above. This dog does no credential handling of its own (see
-/// `error::Error`'s own doc comment), so nothing here carries one either.
+/// `Debug` is derived, and since 2026-09-04 that rests on one thing:
+/// [`Self::origin`] carries the app's `env` verbatim, and `AppConfig`'s own
+/// hand-written `Debug` prints that as `<N vars>` (shep-core, IR-41). Every
+/// other field is a git URL an operator already has in their checkout, a
+/// path, a sha, a shell command line their own `shep.toml` already held in
+/// plaintext, or one of the two small enums above. A field added here that
+/// could carry a secret needs its own redaction; the derive is not a
+/// blanket exemption.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
@@ -114,6 +122,21 @@ pub struct State {
     /// the dog clones from it once at opt-in and never restructures, moves,
     /// or writes to it again.
     pub checkout: PathBuf,
+    /// The whole app definition as the shepherd had it BEFORE adoption, so
+    /// removal can put back everything and not only `cwd` and `script`.
+    ///
+    /// `origin_cwd` and `origin_script` predate this field and are kept for
+    /// the records that carry only them; a record with both is restored
+    /// from this one. It is what makes `deploy.toml` hold the app's `env`
+    /// verbatim, which is why the file is written owner-only, the same
+    /// mode shep's own roll uses for the same reason.
+    ///
+    /// It serialises as `[origin]` with `[origin.env]` and the probe tables
+    /// under it, at the END of the file whatever this field's position:
+    /// this crate's `toml` hoists every scalar above every table. So the
+    /// record an operator opens still starts with the lines they edit.
+    #[serde(default)]
+    pub origin: Option<AppConfig>,
 }
 
 impl State {
@@ -238,6 +261,12 @@ impl State {
     /// A failed rename removes the temporary file it leaves behind, so one
     /// failure does not sit next to the record forever, unread by anything.
     ///
+    /// The file is created owner-only. Since 2026-09-04 it can carry the
+    /// app's `env` verbatim in [`Self::origin`], and shep writes its own
+    /// roll at the same mode for the same reason. A record left at a wider
+    /// mode by an earlier version is tightened on the next write, because
+    /// the rename replaces it with the fresh file.
+    ///
     /// # Errors
     /// [`Error::Config`] if the record fails [`Self::validate`]: nothing is
     /// written. [`Error::Io`], naming whichever of `path` or `<path>.<pid>.tmp` the
@@ -270,7 +299,12 @@ impl State {
             source,
         };
 
-        let written = fs::File::create(&tmp)
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(RECORD_MODE)
+            .open(&tmp)
             .and_then(|mut file| {
                 file.write_all(text.as_bytes())?;
                 file.sync_all()
@@ -374,6 +408,7 @@ verfiy = "alive"
             origin_cwd: Some(PathBuf::from("/srv/reactmap")),
             origin_script: Some("bun .".into()),
             checkout: PathBuf::from("/srv/reactmap"),
+            origin: None,
         };
         let text = toml::to_string(&original).expect("serialises");
         let back: State = toml::from_str(&text).expect("parses");
@@ -480,6 +515,45 @@ verfiy = "alive"
         let err = read_text("").expect_err("nothing to read");
         assert!(matches!(err, Error::Config(_)), "{err}");
         assert!(err.to_string().contains("deploy.toml"), "{err}");
+    }
+
+    /// fails if the pre-adoption app definition does not survive a
+    /// write-then-read, `env` and probe included, or if a record written
+    /// before the field existed stops reading. The first is what removal
+    /// restores from; the second is every record on disk today.
+    #[test]
+    fn the_origin_round_trips_and_an_older_record_still_reads() {
+        let origin: AppConfig = toml::from_str(
+            "name = \"web\"\nscript = \"server.js\"\ninstances = 2\n[env]\nTOKEN = \"s3cret\"\n\
+             [readiness_probe]\nkind = \"http\"\ntarget = \"http://127.0.0.1:3000/health\"\n",
+        )
+        .expect("an app");
+        let mut with = sample(None);
+        with.origin = Some(origin.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        with.write(&path).expect("writes");
+        let back = State::read(&path).expect("reads");
+        assert_eq!(back.origin.as_ref(), Some(&origin));
+
+        let older = read_text(
+            "remote = \"https://example.com/x\"\nbranch = \"main\"\ncheckout = \"/srv/x\"\n",
+        )
+        .expect("a record from before the field");
+        assert_eq!(older.origin, None);
+    }
+
+    /// fails if the record is readable by anyone but its owner. It carries
+    /// the app's `env` verbatim once an origin is recorded, and shep's own
+    /// roll is owner-only for the same reason.
+    #[test]
+    fn the_record_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("deploy.toml");
+        sample(None).write(&path).expect("writes");
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, RECORD_MODE);
     }
 
     /// fails if a rename that cannot land leaves its temporary file behind.

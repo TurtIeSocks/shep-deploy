@@ -179,6 +179,30 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
     verify::bounded(per_instance.saturating_mul(instances.max(1)))
 }
 
+/// How long a verified flock is watched after its turnover.
+///
+/// [`verify::DWELL`] for most apps. Longer for a probed app that sets
+/// `reuse_port`: shep reloads such an app with the two instances overlapping
+/// and re-runs the readiness probe AFTER the old instance has drained, with
+/// the app's own `listen_timeout` as the deadline, because the old instance
+/// may have been the one that answered the first probe. A replacement that
+/// fails that second probe is demoted to `Starting` and left there, and that
+/// can land anywhere inside the deadline, so a ten-second dwell would record
+/// a release deployed and have shep demote it a minute later. Read out of
+/// shep-daemon's `finish_swap` and `spawn_verify_task` on 2026-09-04.
+fn dwell_for(app: &AppConfig) -> Duration {
+    if app.reuse_port && app.readiness_probe.is_some() {
+        verify::bounded(
+            app.listen_timeout
+                .as_duration()
+                .saturating_add(RELOAD_DEADLINE_SLACK),
+        )
+        .max(verify::DWELL)
+    } else {
+        verify::DWELL
+    }
+}
+
 /// Deploys the head of `state.branch` to the tree's sheep, rolling back if
 /// it does not come up.
 ///
@@ -620,6 +644,12 @@ async fn record(
 ) {
     let sheep = tree.sheep();
     let landed = matches!(outcome, Ok(Outcome::Deployed { .. }));
+    // `Raced` is held like any other ending. It was nearly exempted on
+    // 2026-09-04 as "transient", and it is not: the tree lock means no rival
+    // deploy can move `current` under this one any more, so what is left
+    // moving it is an operator's hand or the release's own build command,
+    // and a build that repoints `current` on every run would otherwise be
+    // rebuilt every tick forever, the exact loop `failed` exists to stop.
     let failed = (!landed).then(|| head.to_owned());
 
     if state.failed != failed {
@@ -803,7 +833,7 @@ async fn land<D: Daemon>(daemon: &D, sheep: &str, app: &AppConfig, mode: Verify)
     // the reload rather than from a request before it.
     let reloaded_at = Instant::now();
 
-    match verify::wait(daemon, sheep, mode, &before, patience).await {
+    match verify::wait(daemon, sheep, mode, &before, patience, dwell_for(app)).await {
         Ok(true) => Landed::Verified,
         // What actually elapsed, not the budget. An `Alive` verdict takes
         // its turnover wait PLUS the dwell, so quoting the budget
@@ -1059,8 +1089,8 @@ fn refuse_ungated_verification(sheep: &str, app: &AppConfig, mode: Verify) -> Re
              there is nothing for a deploy to wait on: shep reports a sheep with no readiness \
              gate Online as soon as it has not died, which would verify every release, including \
              a broken one. Add a [readiness_probe] to its Flockfile, or set wait_ready if the app \
-             announces itself on the channel, or set verify = \"alive\" in deploy.toml to accept \
-             the weaker check deliberately."
+             announces itself on the channel, or change the verify line in deploy.toml to \
+             \"alive\" to accept the weaker check deliberately."
         )));
     }
     Ok(())
@@ -1840,7 +1870,7 @@ mod tests {
     /// deployed. `state.deployed` is what the next poll compares against,
     /// so a deploy that succeeds without advancing it would redeploy the
     /// same sha on every tick forever.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_release_that_comes_up_is_deployed_and_recorded() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
@@ -1926,7 +1956,7 @@ mod tests {
     /// The damage is not just a wrong line in a file. `go` refuses to retry a
     /// sha that `state.failed` names, so a record saying the running release
     /// failed freezes auto-deploy for that target until somebody notices.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_straggler_cannot_fail_a_sha_another_process_deployed() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
@@ -1975,7 +2005,7 @@ mod tests {
     /// The marker lives under the tree's own root now, keyed by sha, where
     /// only this dog writes. A repository can still commit a file by that name
     /// and it means nothing.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_completion_marker_committed_by_the_repository_is_not_trusted() {
         let mut fixture = fixture_with_previous_release();
         // The name the marker used to have, which is the point: it is not
@@ -2036,7 +2066,7 @@ mod tests {
     /// Checking out here needs its own fetch: the bare clone does not have
     /// `second` until `deploy` fetches, and this has to place the directory
     /// BEFORE deploy runs.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_release_whose_checkout_did_not_finish_is_checked_out_again() {
         let mut fixture = fixture_with_previous_release();
         let second = commit_on_origin(&fixture, "second.txt");
@@ -2336,6 +2366,39 @@ mod tests {
         // reload that can replace nothing fails at a sensible moment
         // instead of instantly.
         assert_eq!(budget(&app, 0), budget(&app, 1));
+    }
+
+    /// fails if the dwell stops following the app. A probed `reuse_port`
+    /// app is re-probed by shep after the old instance drains, with its own
+    /// `listen_timeout` as the deadline, and a demotion can land anywhere
+    /// inside it; every other app gets the plain dwell.
+    #[test]
+    fn the_dwell_is_sized_to_the_apps_post_drain_probe() {
+        let mut app: AppConfig = toml::from_str(
+            "name = 'web'\nscript = './run.sh'\nlisten_timeout = '60s'\n\
+             [readiness_probe]\nkind = 'http'\ntarget = 'http://127.0.0.1:1/'",
+        )
+        .expect("parses");
+        assert_eq!(dwell_for(&app), verify::DWELL, "no reuse_port: plain dwell");
+
+        app.reuse_port = true;
+        assert_eq!(
+            dwell_for(&app),
+            Duration::from_secs(65),
+            "listen_timeout plus the shepherd's own slack"
+        );
+
+        // Never shorter than the plain dwell, however quick the probe.
+        app.listen_timeout = UpDuration::from_millis(1_000);
+        assert_eq!(dwell_for(&app), verify::DWELL);
+
+        // And never past what `verify` is willing to wait at all.
+        app.listen_timeout = UpDuration::from_millis(u64::MAX);
+        assert_eq!(dwell_for(&app), verify::bounded(Duration::MAX));
+
+        // A `reuse_port` app with no probe is not re-probed.
+        app.readiness_probe = None;
+        assert_eq!(dwell_for(&app), verify::DWELL);
     }
 
     /// fails if the reload window is sized from the Flockfile's instance
@@ -2730,6 +2793,32 @@ mod tests {
             swap::resolve(&fixture.tree.current()).unwrap(),
             Some(fixture.tree.release(&previous)),
             "current goes back to the release the record names"
+        );
+    }
+
+    /// fails if a race stops being held. With the tree lock, `current`
+    /// moving under a deploy means an operator's hand or the release's own
+    /// build command did it, and a build that repoints `current` on every
+    /// run would be rebuilt every tick forever if its sha were not held.
+    #[tokio::test]
+    async fn a_raced_deploy_is_held_like_any_other_failure() {
+        let fixture = fixture_with_previous_release();
+        let mut state = fixture.state.clone();
+        let raced: Result<Outcome, Error> = Err(Error::Raced {
+            sheep: "web".to_owned(),
+            started: "a".to_owned(),
+            found: "b".to_owned(),
+        });
+
+        record(&fixture.tree, &mut state, fixtures::OTHER_SHA, &raced, 5).await;
+
+        assert_eq!(state.failed.as_deref(), Some(fixtures::OTHER_SHA));
+        assert_eq!(
+            State::read(&fixture.tree.state_file())
+                .expect("reads")
+                .failed
+                .as_deref(),
+            Some(fixtures::OTHER_SHA)
         );
     }
 
@@ -3614,7 +3703,7 @@ mod tests {
     /// --force` on the directory that is still sitting there answers
     /// "is not a working tree" - the same failure an operator's own `rm -rf`
     /// on a release directory would leave behind.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_prune_failure_does_not_fail_the_deploy() {
         let mut fixture = fixture_with_previous_release();
         let first = fixture.state.deployed.clone().expect("a previous release");

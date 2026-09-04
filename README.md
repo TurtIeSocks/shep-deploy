@@ -95,7 +95,8 @@ Everything lives under `$SHEP_HOME/deploy/<sheep>/`:
 git/                 one bare clone, shared by every release
 releases/<sha>/      a worktree per release
 current -> releases/<sha>
-deploy.toml          remote, branch, deployed sha, held sha, verify mode, watch mode
+deploy.toml          remote, branch, deployed sha, held sha, verify mode, watch mode,
+                     and the app as it was before adoption (owner-only: it holds env)
 ```
 
 The sheep's `cwd` is `current`, permanently. Set it explicitly when you
@@ -287,6 +288,18 @@ yet, so there is nothing to verify against and the deploy is refused.
 `verify = "alive"` is the deliberate downgrade: a new process, still running
 ten seconds later.
 
+Both modes watch the flock after the turnover. `probed` requires the same
+processes, all `Online`, at every look for ten seconds; `alive` sleeps ten
+seconds and then polls for `Online` until the reload budget runs out, or one
+more ten seconds, whichever is longer. `Online` is a verdict shep gives once:
+a replacement that passes its probe and dies moments later is respawned under
+a new pid with the reload already committed, and a replacement whose second
+probe fails is put back to `starting` and left there. The pid and the status
+are the evidence of either, and only inside the dwell. An app that sets
+`reuse_port` with a probe gets a longer one, its own `listen_timeout`, because
+shep re-runs its probe after the old instance drains and can demote it any
+time up to that.
+
 The first cutover is also the one deploy that is not verified against the
 readiness probe. shep reports a freshly started process `Online` once its
 `listen_timeout` elapses, whatever the probe said, and only aborts a *reload*
@@ -326,7 +339,10 @@ serving. Both are caught.
 ## Removing it
 
 `shep-deploy on-remove` is the lifecycle hook: shep runs it before forgetting
-the dog, and it puts every sheep back where it ran before the dog took over. A
+the dog, and it puts every sheep back as it ran before the dog took over: the
+whole definition `setup` recorded, `env`, instances and probes included. A
+record written before 2026-09-04 carries only the old `cwd` and script, and
+those go back over the shepherd's current definition. A
 sheep the dog bootstrapped has nowhere to go back to, so it is left running
 from `current` and the report says exactly that, with the path.
 
@@ -362,6 +378,14 @@ a dog, this process is the shepherd's child and shares its uid, and shep's own
 docs recommend running the shepherd as root so it can drop privileges per app.
 So the default arrangement is a repository's build script running as root, once
 per deploy.
+
+A committed Flockfile is refused for setting anything the shepherd acts on at
+its own uid: `user` and `group`, an `exec` probe (the daemon runs it through
+`sh -c`, forever, ignoring `user`), `out_file` and `err_file` (the daemon
+opens and `shep flush` truncates them), an `http` or `tcp` probe whose target
+is not loopback (the daemon makes the connection), and `watch` (the daemon
+walks the working directory as itself, following symlinks). Every one of them
+stays available in `Flockfile.override.toml`, which is yours.
 
 Set `user` on the app and the build drops to that user's uid and primary group,
 with the shepherd's supplementary groups cleared, before it runs anything. A

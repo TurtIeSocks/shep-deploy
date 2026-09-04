@@ -163,6 +163,30 @@ class rather than the instances.
   written that way removed `current`. `Tree::completions()` is the directory.
 - **`io::ErrorKind::FilesystemLoop` is unstable.** An `O_NOFOLLOW` open that
   meets a link answers `ELOOP`; test it with `shared::is_eloop`.
+- **`deploy.toml` carries the pre-adoption `AppConfig` as `origin`.** It
+  serialises as `[origin]` plus its sub-tables at the END of the file
+  whatever the field's position, because this crate's `toml` hoists every
+  scalar above every table. It holds `env` verbatim, so the file is written
+  0o600. Two compatibility edges, both
+  accepted by Rin on 2026-09-04: a shep-deploy older than that refuses a
+  record with the field (`deny_unknown_fields`), and `AppConfig` itself is
+  `deny_unknown_fields` in shep-core, so a record written against a newer
+  shep-core than the reader's refuses too.
+- **A committed Flockfile is refused for more than `user`/`group`.** `exec`
+  probes, `out_file`/`err_file`, non-loopback probe targets, and `watch`,
+  because the daemon acts on all of them at its own uid (read out of
+  shep-daemon on 2026-09-04; `flockfile::refuse_repo_privilege` says why per
+  field). Presence is checked before shape: serde builds a probe from a
+  TOML array too, and a walk that read only tables let one through.
+- **`Online` is a one-time verdict in shep.** A crash after it respawns under
+  a new pid with the reload committed; a failed post-drain re-probe demotes
+  to `Starting` under the same pid. Both verify modes dwell and re-check pids
+  and status; `deploy::dwell_for` lengthens the probed dwell to
+  `listen_timeout` for a `reuse_port` app, whose re-probe can land that late.
+- **`Error::Raced` is held like any other ending.** The tree lock makes a
+  rival deploy impossible, so `current` moving under a deploy is a hand or
+  the release's build command, and an unheld build that repoints `current`
+  would be rebuilt every tick.
 - **The Flockfile is parsed once per deploy, through `flockfile::read`.** The
   free `app_config` and `build_spec` are `#[cfg(test)]` wrappers; production
   code asks both questions of one `Merged`.

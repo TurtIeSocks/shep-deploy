@@ -178,10 +178,10 @@ impl Generation {
         // compared the survivor against itself. A sheep that came back at half
         // strength verified.
         //
-        // Checked here rather than at the dwell, though the dwell is where it
-        // was found. `Verify::Probed` returns as soon as the turnover lands and
-        // never reaches a dwell, so a check placed there would leave the
-        // stricter of the two modes the blind one.
+        // Checked here rather than only at the dwell, though the dwell is
+        // where it was found: this is where `settled` is frozen, and both
+        // modes then re-check the count at their dwell against
+        // `settled.instances()`.
         //
         // Skipped when nothing was running before, because then there is no
         // count to hold to and `!flock.is_empty()` is the whole of what can be
@@ -245,12 +245,19 @@ pub(crate) fn bounded(budget: Duration) -> Duration {
 /// shepherd reports running under a pid `before` never had. They differ only
 /// in what they then accept, and in what they do afterwards.
 ///
-/// `Probed` returns as soon as the turned-over flock is all
-/// [`ProcStatus::Online`]. That can only mean anything for a sheep whose
-/// readiness is gated - a probe, or `wait_ready` on the channel - since
-/// otherwise shep reports `Online` for a process that merely has not died;
-/// `deploy` refuses a `Probed` target with neither before it touches
-/// anything.
+/// `Probed` waits for the turned-over flock to be all
+/// [`ProcStatus::Online`], then watches it for `dwell`, requiring the same
+/// pids and every one `Online` at every look. The wait can only mean
+/// anything for a sheep whose readiness is gated - a probe, or
+/// `wait_ready` on the channel - since otherwise shep reports `Online` for
+/// a process that merely has not died; `deploy` refuses a `Probed` target
+/// with neither before it touches anything. The dwell is there because
+/// `Online` is a verdict given once: a replacement that passes its probe
+/// and dies moments later is respawned under a new pid with the reload
+/// already committed, and one whose post-drain re-probe fails is demoted to
+/// `Starting` under the same pid; the pid and the status are the only
+/// things that say so. `dwell` is [`DWELL`] for most apps and longer for one
+/// whose post-drain re-probe can take longer: see `deploy::land`.
 ///
 /// `Alive` accepts `Starting` as well, because a sheep with no gate is
 /// exactly what it exists for, and then dwells: it sleeps [`DWELL`], then
@@ -285,6 +292,7 @@ pub async fn wait<D: Daemon>(
     mode: Verify,
     before: &Generation,
     budget: Duration,
+    dwell: Duration,
 ) -> Result<bool, Error> {
     let accept = match mode {
         Verify::Probed => is_online,
@@ -297,7 +305,34 @@ pub async fn wait<D: Daemon>(
     };
 
     if mode == Verify::Probed {
-        return Ok(true);
+        // `Online` is a one-time verdict. Read out of shep-daemon on
+        // 2026-09-04: once a probed replacement has answered its probe and
+        // the old instance has drained, the reload is committed and nothing
+        // re-checks it. A replacement that dies two seconds later is
+        // restarted under a NEW pid, re-enters `Online` when its probe
+        // passes again (or on the ordinary path even when it does not), and
+        // no event retracts the reload. A replacement whose post-drain
+        // re-probe fails is DEMOTED to `Starting` under the same pid and
+        // left there. So a probed release used to be recorded deployed on
+        // a process that was already gone. The dwell watches for `dwell`,
+        // which the caller sizes to the app (see `deploy::land`): the same
+        // pids, every one of them `Online`, at every look. A pid that
+        // changed or a status that fell is a verdict at once.
+        let deadline = Instant::now() + dwell;
+        loop {
+            sleep(POLL).await;
+            let flock = describe_within(daemon, sheep, dwell).await?;
+            let still = u32::try_from(flock.len()).is_ok_and(|n| n == settled.instances())
+                && flock
+                    .iter()
+                    .all(|info| settled.holds(info) && is_online(info));
+            if !still {
+                return Ok(false);
+            }
+            if Instant::now() >= deadline {
+                return Ok(true);
+            }
+        }
     }
 
     sleep(DWELL).await;
@@ -634,6 +669,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -657,6 +693,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -682,7 +719,8 @@ mod tests {
                 "web",
                 Verify::Probed,
                 &serving(12835),
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                DWELL
             )
             .await
             .unwrap()
@@ -705,6 +743,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -724,10 +763,95 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
         assert!(!ok);
+    }
+
+    /// fails if `Probed` believes a replacement that passed its probe and
+    /// died moments later. shep restarts it under a new pid and the reload
+    /// stays committed, so the only evidence is the pid at the dwell.
+    #[tokio::test(start_paused = true)]
+    async fn probed_rejects_a_replacement_that_dies_after_its_probe_passed() {
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Online, 13002)],
+            // Respawned by the dwell: same id, new pid, Online again.
+            vec![instance(2, ProcStatus::Online, 13099)],
+        ]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            DWELL,
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "a new pid at the dwell is a process that died");
+    }
+
+    /// fails if `Probed` believes a replacement shep demoted. A failed
+    /// post-drain re-probe puts the replacement back to `Starting` under
+    /// the same pid and leaves it there; status is the only evidence.
+    #[tokio::test(start_paused = true)]
+    async fn probed_rejects_a_replacement_demoted_after_the_drain() {
+        let daemon = Listings::new(vec![
+            vec![instance(2, ProcStatus::Online, 13002)],
+            vec![instance(2, ProcStatus::Starting, 13002)],
+        ]);
+        let ok = wait(
+            &daemon,
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            DWELL,
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "demoted out of Online is not deployed");
+    }
+
+    /// fails if the probed dwell stops at ten seconds when the caller asked
+    /// for more. A `reuse_port` app's post-drain re-probe can demote it any
+    /// time up to its `listen_timeout`, which `deploy::dwell_for` passes in
+    /// here; a demotion fifteen seconds after the turnover has to be seen.
+    #[tokio::test(start_paused = true)]
+    async fn probed_watches_for_the_whole_dwell_it_was_given() {
+        // Turnover, then `Online` for 150 polls (fifteen seconds at `POLL`),
+        // then demoted for good.
+        let demoted_late = || {
+            let mut sequence = vec![vec![instance(2, ProcStatus::Online, 13002)]; 151];
+            sequence.push(vec![instance(2, ProcStatus::Starting, 13002)]);
+            Listings::new(sequence)
+        };
+
+        let ok = wait(
+            &demoted_late(),
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(!ok, "a demotion inside a thirty-second dwell is seen");
+
+        let ok = wait(
+            &demoted_late(),
+            "web",
+            Verify::Probed,
+            &serving(12835),
+            Duration::from_secs(5),
+            DWELL,
+        )
+        .await
+        .unwrap();
+        assert!(ok, "the plain dwell has already returned by then");
     }
 
     /// fails if `Verify::Alive` starts demanding a prompt probe. Alive is the
@@ -753,7 +877,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_millis(50)
+                Duration::from_millis(50),
+                DWELL
             )
             .await
             .unwrap()
@@ -773,6 +898,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -793,6 +919,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -825,7 +952,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_secs(120)
+                Duration::from_secs(120),
+                DWELL
             )
             .await
             .unwrap()
@@ -854,6 +982,7 @@ mod tests {
             Verify::Probed,
             &before,
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -891,6 +1020,7 @@ mod tests {
             Verify::Alive,
             &before,
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -923,6 +1053,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -950,6 +1081,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -993,6 +1125,7 @@ mod tests {
             Verify::Alive,
             &before,
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1019,6 +1152,7 @@ mod tests {
             Verify::Alive,
             &serving(12835),
             Duration::from_secs(120),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1041,6 +1175,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(50),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1059,7 +1194,8 @@ mod tests {
                 "web",
                 Verify::Probed,
                 &serving(12835),
-                Duration::from_millis(50)
+                Duration::from_millis(50),
+                DWELL
             )
             .await
             .unwrap()
@@ -1071,7 +1207,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_millis(50)
+                Duration::from_millis(50),
+                DWELL
             )
             .await
             .unwrap()
@@ -1096,6 +1233,7 @@ mod tests {
             Verify::Probed,
             &serving(12835),
             Duration::from_millis(350),
+            DWELL,
         )
         .await
         .unwrap();
@@ -1150,7 +1288,8 @@ mod tests {
                 "web",
                 Verify::Probed,
                 &before,
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                DWELL
             )
             .await
             .unwrap(),
@@ -1187,7 +1326,8 @@ mod tests {
                 "web",
                 Verify::Alive,
                 &serving(12835),
-                Duration::from_secs(60)
+                Duration::from_secs(60),
+                DWELL
             )
             .await
             .unwrap(),
