@@ -212,6 +212,11 @@ class rather than the instances.
   `CARGO_TARGET_DIR` set.** Without it, source and destination collapse to the
   same path and the self-copy guard returns `Ok` before reaching anything the
   test is about. The test says so in its own doc; do not simplify it.
+- **A build's process group is led by a holder, not by the build.** `sh -c
+  'read _'` on a pipe the dog holds, so the group id stays reserved after the
+  build is reaped and `killpg` cannot land on a recycled pid. Never signal a
+  pid after reaping it; `shared::abandon` kills before it waits for the same
+  reason.
 - **`git::fetch` is the only git call that touches a network**, and the only
   one using `run_git_within`. The other ten `run_git` callers are local.
 

@@ -69,6 +69,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use std::os::unix::process::CommandExt as _;
+
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -845,13 +847,48 @@ pub async fn run(
     // it started rather than the shell itself, so killing only the shell would
     // leave the real process running while the deploy reports a failure. Same
     // shape and same reason as `crate::shared::run_git_within`.
-    child.process_group(0);
+    //
+    // The group's leader is not the build but a holder: a shell that reads
+    // one line from a pipe this dog keeps the write end of, so it sits
+    // there until the group is killed. A process group's id is its leader's
+    // pid, and the system does not reuse a pid while a group with that id
+    // exists. The build is reaped before the group is signalled below,
+    // and a reaped leader's pid is free to be handed to whatever forks
+    // next; with the build as leader, `killpg` after the wait could in
+    // principle reach an unrelated process that had taken the pid and
+    // started a group of its own, as root. With the holder as leader the
+    // id is reserved for as long as the holder lives, and the holder lives
+    // until this function kills it.
+    let mut holder = std::process::Command::new("sh");
+    holder
+        .args(["-c", "read _"])
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    if let Some(path) = env::var_os("PATH") {
+        holder.env("PATH", path);
+    }
+    let mut holder = holder.spawn().map_err(Error::at(release))?;
+    let group = holder.id();
+    let group_id = i32::try_from(group).map_err(|_| Error::Io {
+        path: release.to_owned(),
+        source: std::io::Error::other("the group holder's pid does not fit a pid_t"),
+    })?;
+    child.process_group(group_id);
 
-    let mut child = child.spawn().map_err(Error::at(release))?;
-
-    // Captured before the wait, because `Child::id` answers `None` once the
-    // child has been reaped and the group is named after the leader's pid.
-    let group = child.id();
+    let mut child = match child.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            crate::shared::kill_group(group);
+            let _ = holder.wait();
+            return Err(Error::Io {
+                path: release.to_owned(),
+                source,
+            });
+        }
+    };
 
     // Bounded, because an unbounded wait here does not stop one target, it
     // stops the dog. `crate::poll::tick` deploys targets one at a time, so a
@@ -866,9 +903,10 @@ pub async fn run(
     // idle, so the budget expires at once whatever it is set to. See
     // `crate::deploy`'s `a_current_that_moved_during_the_build_is_not_swapped_over`.
     let status = match timeout(budget, child.wait()).await {
-        Ok(waited) => waited.map_err(Error::at(release))?,
+        Ok(waited) => waited,
         Err(_) => {
-            abandon(&mut child).await;
+            abandon(&mut child, group).await;
+            let _ = holder.wait();
             return Err(Error::BuildTimedOut { after: budget });
         }
     };
@@ -888,9 +926,12 @@ pub async fn run(
     // A process that genuinely means to persist calls `setsid` and leaves the
     // group, so a compiler daemon survives this and a stray `&` does not. That
     // is the right split: one asked to outlive its parent, the other just did.
-    if let Some(pid) = group {
-        crate::shared::kill_group(pid);
-    }
+    //
+    // Safe after the wait because the group is the holder's, not the build's:
+    // see where it is spawned. The holder goes with the group, and is reaped.
+    crate::shared::kill_group(group);
+    let _ = holder.wait();
+    let status = status.map_err(Error::at(release))?;
 
     if !status.success() {
         return Err(Error::Build {
@@ -937,7 +978,8 @@ fn artifact_roots(release: &Path, cache: &Path) -> [PathBuf; 2] {
     ]
 }
 
-/// Kills an abandoned build's whole process group.
+/// Kills an abandoned build's whole process group, `group` being the pid of
+/// the holder that leads it (see `run`).
 ///
 /// The group, not the child: `run` spawns `sh -c`, and a hung build is
 /// normally something the shell started. Killing the shell alone leaves that
@@ -947,12 +989,10 @@ fn artifact_roots(release: &Path, cache: &Path) -> [PathBuf; 2] {
 /// already been given up on, and a kill that cannot be delivered leaves
 /// nothing this function can do about it that the caller has not already
 /// decided.
-async fn abandon(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        crate::shared::kill_group(pid);
-    }
-    // The group signal is the one that matters; this covers a host whose
-    // `kill` refuses the group form.
+async fn abandon(child: &mut tokio::process::Child, group: u32) {
+    crate::shared::kill_group(group);
+    // The group signal is the one that matters; this covers a build that
+    // left its group before the signal landed.
     let _ = child.kill().await;
 }
 
