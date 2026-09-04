@@ -498,7 +498,6 @@ mod tests {
     use std::cell::Cell;
 
     use shep_client::RequestError;
-    use shep_client::shep_core::config::AppConfig;
 
     use super::*;
 
@@ -557,12 +556,6 @@ mod tests {
     }
 
     impl Daemon for Blips {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let n = self.calls.get();
             self.calls.set(n + 1);
@@ -573,24 +566,10 @@ mod tests {
             }
             Ok(self.after.clone())
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if one transient `describe` failure costs a live reload.
@@ -625,12 +604,6 @@ mod tests {
     }
 
     impl Daemon for Listings {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let Some(last) = self.sequence.len().checked_sub(1) else {
                 return Ok(Vec::new());
@@ -639,24 +612,10 @@ mod tests {
             self.next.set((index + 1).min(last));
             Ok(self.sequence[index].clone())
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if the process that was already serving passes for the one the

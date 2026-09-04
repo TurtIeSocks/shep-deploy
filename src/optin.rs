@@ -792,17 +792,6 @@ async fn drain<D: Daemon>(daemon: &D, flock: &[ProcessInfo], previous: &[u32]) -
 mod tests {
     use crate::fixtures;
 
-    /// The config every test that is not about a config value runs on.
-    fn test_config() -> crate::config::DogConfig {
-        crate::config::DogConfig {
-            interval: std::time::Duration::from_secs(30),
-            retention: 5,
-            git_timeout: std::time::Duration::from_secs(60),
-            build_timeout: std::time::Duration::from_secs(60),
-            passthrough: Vec::new(),
-        }
-    }
-
     // For `Error::source` on the variant the quiet-shepherd path returns.
     use core::error::Error as _;
     use std::cell::{Cell, RefCell};
@@ -822,32 +811,6 @@ mod tests {
     struct RollOf<'a>(&'a [(&'a str, &'a Path)]);
 
     impl Daemon for RollOf<'_> {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(
-            &self,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn describe(
-            &self,
-            _sheep: &str,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
             let apps: Vec<String> = self
                 .0
@@ -870,9 +833,10 @@ mod tests {
                 .expect("write roll");
             Ok(path)
         }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, describe, start, delete, reload, restart, set_smit,
+        );
     }
 
     /// A tempdir that is a git checkout, on branch `main`, with an `origin`
@@ -884,10 +848,14 @@ mod tests {
     /// reads, and a checkout is a perfectly fetchable remote for its own
     /// history.
     fn checkout_with_commit() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
+        let dir = fixtures::checkout(&[
+            (
+                "Flockfile.toml",
+                "[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\n",
+            ),
+            ("run.sh", "#!/bin/sh\necho hi\n"),
+        ]);
+        // Itself, so `git::remote_url` has an answer. Nothing fetches from it.
         fixtures::run_git(
             dir.path(),
             &[
@@ -897,14 +865,6 @@ mod tests {
                 dir.path().to_str().expect("utf-8 tempdir path"),
             ],
         );
-        std::fs::write(
-            dir.path().join("Flockfile.toml"),
-            "[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\n",
-        )
-        .expect("write Flockfile");
-        std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho hi\n").expect("write run.sh");
-        fixtures::run_git(dir.path(), &["add", "."]);
-        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "initial"]);
         dir
     }
 
@@ -915,15 +875,9 @@ mod tests {
         std::fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
             deployed: sha.map(str::to_owned),
-            failed: None,
-            verify: Verify::default(),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: PathBuf::from("/srv/x"),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -946,7 +900,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
         let shown = err.to_string();
@@ -966,7 +920,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
 
@@ -988,7 +942,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
         assert_eq!(prepared.state.branch, "stable");
@@ -1014,7 +968,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let first = prepare(&daemon, home.path(), "bpm", &test_config())
+        let first = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
         let (first_sha, state_file) = (first.sha.clone(), first.tree.state_file());
@@ -1024,7 +978,7 @@ mod tests {
         drop(first);
         std::fs::remove_file(&state_file).expect("the record a kill never wrote");
 
-        let again = prepare(&daemon, home.path(), "bpm", &test_config())
+        let again = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("a tree with no record must be resumable, as the doc says");
         assert_eq!(again.sha, first_sha);
@@ -1046,7 +1000,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let prepared = prepare(&daemon, home.path(), "bpm", &test_config())
+        let prepared = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
 
@@ -1072,7 +1026,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
         assert!(err.to_string().contains("detached"), "{err}");
@@ -1286,12 +1240,6 @@ mod tests {
     }
 
     impl Daemon for CutOverDouble {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let mut flock = Vec::new();
             // Before the `Start` the originals are read at zero, which is
@@ -1394,18 +1342,10 @@ mod tests {
             self.deletes.borrow_mut().push(id);
             Ok(())
         }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// The tempdirs a fixture has to keep alive. `Prepared` names paths
@@ -1425,7 +1365,7 @@ mod tests {
         let checkout = checkout_with_commit();
         let entries = [("bpm", checkout.path())];
         let roll = RollOf(&entries);
-        let prepared = prepare(&roll, home.path(), "bpm", &test_config())
+        let prepared = prepare(&roll, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect("prepares");
 
@@ -1849,7 +1789,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
 
@@ -1885,7 +1825,7 @@ mod tests {
         let entries = [("bpm", checkout.path())];
         let daemon = RollOf(&entries);
 
-        let err = prepare(&daemon, home.path(), "bpm", &test_config())
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
             .await
             .expect_err("refuses");
 

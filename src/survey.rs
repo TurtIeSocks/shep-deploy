@@ -288,6 +288,7 @@ fn rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures;
 
     /// fails if a target whose record cannot be read is offered `setup`.
     ///
@@ -357,35 +358,15 @@ mod tests {
         app
     }
 
-    /// A tempdir with `git init -q` already run in it, plus the given files.
+    /// A git checkout holding `files` and NOT committing them.
+    ///
+    /// Uncommitted on purpose: two tests here pass no files at all, and a
+    /// repository with nothing staged cannot be committed. Nothing this
+    /// module classifies reads a commit, only whether `.git` is there and
+    /// what the working tree holds.
     fn checkout_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let status = std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(dir.path())
-            .status()
-            .expect("git is on PATH");
-        assert!(status.success(), "git init failed");
-        // An identity, because a commit without one fails. A developer's
-        // machine has a global `user.email` and a CI runner does not, so
-        // leaving this out makes the fixture pass locally and fail only on
-        // CI, which is where this test failed on the repository's very first
-        // push. `deploy.rs` and `optin.rs`'s own fixtures already set one.
-        for (key, value) in [("user.email", "test@example.com"), ("user.name", "test")] {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .arg("config")
-                .arg(key)
-                .arg(value)
-                .status()
-                .expect("git is on PATH");
-            assert!(status.success(), "git config {key} failed");
-        }
-        for (name, contents) in files {
-            std::fs::write(dir.path().join(name), contents).expect("write fixture file");
-        }
+        let dir = fixtures::empty_checkout();
+        fixtures::write_files(dir.path(), files);
         dir
     }
 
@@ -403,15 +384,10 @@ mod tests {
         std::fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
             deployed: sha.map(str::to_owned),
             failed: failed.map(str::to_owned),
-            verify: crate::state::Verify::default(),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: std::path::PathBuf::from("/srv/x"),
+            ..crate::fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }

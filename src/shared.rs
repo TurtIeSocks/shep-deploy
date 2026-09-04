@@ -804,30 +804,15 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Builds a throwaway git repo for one test: `entries` are (path,
-    /// contents) pairs written to disk, then `git add .` and committed.
-    /// `git add` silently skips anything matched by `.gitignore`, so an
-    /// entry meant to be "ignored and present" - `config/local.json` in the
+    /// [`fixtures::checkout`] under the name every test here calls it by.
+    ///
+    /// `git add` silently skips anything matched by `.gitignore`, so an entry
+    /// meant to be "ignored and present" - `config/local.json` in the
     /// fixtures below - simply stays untracked while a `.gitignore` or
     /// `tracked.txt` entry lands in the commit. That is exactly the split
     /// every test here needs: something tracked, something ignored.
     fn fixture_repo(entries: &[(&str, &str)]) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(dir.path(), &["init", "-q"]);
-        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
-
-        for (path, contents) in entries {
-            let full = dir.path().join(path);
-            if let Some(parent) = full.parent() {
-                fs::create_dir_all(parent).expect("mkdir fixture parent");
-            }
-            fs::write(&full, contents).expect("write fixture file");
-        }
-
-        fixtures::run_git(dir.path(), &["add", "."]);
-        fixtures::run_git(dir.path(), &["commit", "-q", "-m", "seed"]);
-        dir
+        fixtures::checkout(entries)
     }
 
     /// Guards `link_into_resolves_even_when_checkout_is_relative`, the one

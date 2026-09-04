@@ -420,33 +420,13 @@ mod tests {
     struct Flock(Vec<ProcessInfo>);
 
     impl Daemon for Flock {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
         async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
             Ok(self.0.clone())
         }
-        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, describe, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// A [`Daemon`] that cannot be reached at all - every method answers
@@ -455,33 +435,10 @@ mod tests {
     struct Unreachable;
 
     impl Daemon for Unreachable {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            Err(Error::Protocol("no session".to_owned()))
-        }
+        crate::fixtures::daemon_methods!(
+            answering Err(Error::Protocol("no session".to_owned()));
+            dog_config, list_flock, describe, start, delete, reload, restart, save_roll, set_smit,
+        );
     }
 
     /// fails if `named` starts printing a `DogSection`'s body. That

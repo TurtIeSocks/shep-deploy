@@ -311,17 +311,10 @@ mod tests {
     /// Returns the shas in commit order, oldest first, so `shas[n - 1]` is
     /// always the one `current` names.
     fn fixture_tree_with_releases(n: u32) -> (Tree, Vec<String>) {
-        let origin = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
+        let origin = fixtures::empty_checkout();
         for i in 0..n {
-            fs::write(origin.path().join(format!("file-{i}.txt")), "x").expect("write");
-            fixtures::run_git(origin.path(), &["add", "."]);
-            fixtures::run_git(
-                origin.path(),
-                &["commit", "-q", "-m", &format!("commit {i}")],
-            );
+            let name = format!("file-{i}.txt");
+            fixtures::commit(origin.path(), &[(&name, "x")], &format!("commit {i}"));
         }
 
         let home = tempfile::tempdir().expect("tempdir");
@@ -479,16 +472,7 @@ mod tests {
     fn a_reclaimed_release_takes_its_completion_marker_with_it() {
         let home = tempfile::tempdir().expect("tempdir");
         let tree = Tree::for_sheep(home.path(), "web");
-        let origin = fixtures::tempdir();
-        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(
-            origin.path(),
-            &["config", "user.email", "t@example.invalid"],
-        );
-        fixtures::run_git(origin.path(), &["config", "user.name", "t"]);
-        fs::write(origin.path().join("f"), "x").expect("file");
-        fixtures::run_git(origin.path(), &["add", "."]);
-        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "one"]);
+        let origin = fixtures::checkout(&[("f", "x")]);
         let sha = fixtures::head_of(origin.path());
         git::init_bare(&tree.git()).expect("bare");
         git::fetch(

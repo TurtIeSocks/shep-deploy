@@ -517,7 +517,7 @@ mod tests {
     use shep_client::shep_core::status::ProcStatus;
 
     use super::*;
-    use crate::state::{Verify, Watch};
+    use crate::fixtures;
 
     /// Writes a `deploy.toml` for `sheep` recording `origin_cwd` and
     /// `origin_script`, as opt-in would have.
@@ -526,15 +526,11 @@ mod tests {
         fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".to_owned()),
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
             origin_cwd: Some(PathBuf::from(origin_cwd)),
             origin_script: Some(origin_script.to_owned()),
             checkout: PathBuf::from(origin_cwd),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -546,15 +542,9 @@ mod tests {
         fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".to_owned()),
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
-            origin_cwd: None,
-            origin_script: None,
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
             checkout: PathBuf::from("/srv/deploy-tree"),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }
@@ -697,12 +687,6 @@ mod tests {
     }
 
     impl Daemon for Recording {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             if self.describe_fails {
                 return Err(Error::Request(RequestError::Rpc(RpcError {
@@ -756,12 +740,6 @@ mod tests {
             self.calls.borrow_mut().push("delete");
             Ok(())
         }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn save_roll(&self) -> Result<PathBuf, Error> {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.keep().join("flock.json");
@@ -794,9 +772,10 @@ mod tests {
             fs::write(&path, format!("{{\"apps\":[{}]}}", apps.join(","))).expect("write roll");
             Ok(path)
         }
-        async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, reload, restart, set_smit,
+        );
     }
 
     /// fails if a sheep that pre-existed the dog is not put back where its
@@ -927,15 +906,10 @@ mod tests {
         fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
             .expect("create target dir");
         let state = State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: None,
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
             origin_cwd: Some(PathBuf::from(origin_cwd)),
             origin_script: Some(script.to_owned()),
             checkout: PathBuf::from(origin_cwd),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write state");
     }

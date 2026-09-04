@@ -101,15 +101,9 @@ mod tests {
 
     fn target(watch: Watch, deployed: Option<&str>) -> State {
         State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
             deployed: deployed.map(str::to_owned),
-            failed: None,
-            verify: crate::state::Verify::default(),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: std::path::PathBuf::from("/srv/x"),
+            ..crate::fixtures::state()
         }
     }
 
@@ -202,44 +196,16 @@ mod tests {
     struct Recording(std::cell::RefCell<Vec<(String, String)>>);
 
     impl Daemon for Recording {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(
-            &self,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn describe(
-            &self,
-            _sheep: &str,
-        ) -> Result<Vec<shep_client::shep_core::protocol::ProcessInfo>, Error> {
-            unimplemented!()
-        }
-        async fn start(
-            &self,
-            _apps: Vec<shep_client::shep_core::config::AppConfig>,
-        ) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<std::path::PathBuf, Error> {
-            unimplemented!()
-        }
         async fn set_smit(&self, sheep: &str, text: &str) -> Result<(), Error> {
             self.0
                 .borrow_mut()
                 .push((sheep.to_owned(), text.to_owned()));
             Ok(())
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, describe, start, delete, reload, restart, save_roll,
+        );
     }
 
     /// fails if `publish` asks the daemon for the wrong sheep, or for text

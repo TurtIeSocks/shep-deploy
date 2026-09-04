@@ -954,17 +954,7 @@ mod tests {
             artifacts: vec![],
         };
 
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("this build exits 0");
+        build(rel.path(), &spec).await.expect("this build exits 0");
 
         let pid = std::fs::read_to_string(rel.path().join("bg.pid"))
             .expect("the build wrote its background job's pid");
@@ -1010,7 +1000,7 @@ mod tests {
             &spec,
             None,
             &[],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             // Two seconds, not 250ms, for the reason `shep`'s own
             // `run_bounded` test learned the hard way: a budget this small is
             // shared with process startup, and on a loaded runner the shell
@@ -1066,17 +1056,9 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
         };
 
-        let err = run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect_err("a declared artifact that is not there must fail the build");
+        let err = build(rel.path(), &spec)
+            .await
+            .expect_err("a declared artifact that is not there must fail the build");
 
         assert!(
             format!("{err}").contains("did not leave there"),
@@ -1226,17 +1208,27 @@ mod tests {
     /// cold build of a real workspace legitimately runs tens of minutes.
     const TEST_BUILD_BUDGET: Duration = Duration::from_secs(60);
 
-    /// A throwaway stand-in for the dog's own build cache.
+    /// Runs a build with every knob at its default: sheep `"web"`, no
+    /// `as_user`, no passthrough, a fresh cache tempdir, and
+    /// `TEST_BUILD_BUDGET`.
     ///
-    /// Its own directory, never `release/target`, because that entry is the
-    /// one a repository can ship and therefore the one `copy_artifact` must
-    /// not trust.
-    ///
-    /// Returns the `TempDir` so it is cleaned up. An earlier version forgot it
-    /// to dodge a lifetime, which left a directory behind per call for the
-    /// life of the process and after it.
-    fn tempdir_cache() -> tempfile::TempDir {
-        fixtures::tempdir()
+    /// Exists because this module's own `run` calls had started to drift the
+    /// way `fixtures.rs`'s module doc describes for `run_git` and
+    /// `head_of`: one nine-line block, copied a couple dozen times, one
+    /// budget or one cache dir away from its neighbor by accident rather
+    /// than intent. A test that needs a specific cache, user, passthrough or
+    /// budget still calls `run` directly instead of going through this.
+    async fn build(rel: &Path, spec: &BuildSpec) -> Result<(), Error> {
+        run(
+            "web",
+            rel,
+            spec,
+            None,
+            &[],
+            fixtures::tempdir().path(),
+            TEST_BUILD_BUDGET,
+        )
+        .await
     }
 
     use crate::fixtures;
@@ -1358,19 +1350,7 @@ mod tests {
             command: Some("exit 3".into()),
             ..Default::default()
         };
-        assert!(
-            run(
-                "web",
-                rel.path(),
-                &spec,
-                None,
-                &[],
-                tempdir_cache().path(),
-                TEST_BUILD_BUDGET
-            )
-            .await
-            .is_err()
-        );
+        assert!(build(rel.path(), &spec).await.is_err());
     }
 
     /// fails if an absent build command is an error rather than a no-op.
@@ -1380,19 +1360,7 @@ mod tests {
     async fn an_absent_build_command_is_not_an_error() {
         let rel = fixtures::fixture_release(&[]);
         let spec = BuildSpec::default();
-        assert!(
-            run(
-                "web",
-                rel.path(),
-                &spec,
-                None,
-                &[],
-                tempdir_cache().path(),
-                TEST_BUILD_BUDGET
-            )
-            .await
-            .is_ok()
-        );
+        assert!(build(rel.path(), &spec).await.is_ok());
     }
 
     /// fails if declared artifacts are not copied into the release. With
@@ -1457,17 +1425,7 @@ mod tests {
             env: BTreeMap::new(),
             artifacts: vec![],
         };
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("builds");
+        build(rel.path(), &spec).await.expect("builds");
         let leaked = std::fs::read_to_string(rel.path().join("leaked.txt")).unwrap_or_default();
         assert!(
             leaked.trim().is_empty(),
@@ -1491,17 +1449,7 @@ mod tests {
             env: BTreeMap::new(),
             artifacts: vec![],
         };
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("builds");
+        build(rel.path(), &spec).await.expect("builds");
         for name in ["path.txt", "home.txt"] {
             let value = std::fs::read_to_string(rel.path().join(name)).unwrap_or_default();
             assert!(
@@ -1530,7 +1478,7 @@ mod tests {
             &spec,
             None,
             &["CARGO_PKG_NAME".to_owned()],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             TEST_BUILD_BUDGET,
         )
         .await
@@ -1557,7 +1505,7 @@ mod tests {
     #[tokio::test]
     async fn an_artifact_that_is_already_where_it_belongs_is_not_truncated() {
         let rel = fixtures::fixture_release(&[]);
-        let cache = tempdir_cache();
+        let cache = fixtures::tempdir();
         std::fs::create_dir_all(cache.path().join("release")).expect("cache");
         std::fs::write(cache.path().join("release/koji"), b"binary").expect("built");
         // Exactly what `link_cache` does.
@@ -1617,17 +1565,9 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/id_rsa")],
         };
-        let err = run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect_err("a source outside the tree must be refused");
+        let err = build(rel.path(), &spec)
+            .await
+            .expect_err("a source outside the tree must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "must say why: {err}"
@@ -1780,17 +1720,9 @@ mod tests {
             artifacts: vec![PathBuf::from("target/../../../deploy.toml")],
         };
 
-        let err = run(
-            "web",
-            &release,
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect_err("an escaping artifact must be refused");
+        let err = build(&release, &spec)
+            .await
+            .expect_err("an escaping artifact must be refused");
         assert!(
             format!("{err}").contains("outside the release"),
             "the refusal must say why, got: {err}"
@@ -1869,19 +1801,7 @@ mod tests {
             .into(),
             artifacts: vec![PathBuf::from("target/release/nothing-built-this")],
         };
-        assert!(
-            run(
-                "web",
-                rel.path(),
-                &spec,
-                None,
-                &[],
-                tempdir_cache().path(),
-                TEST_BUILD_BUDGET
-            )
-            .await
-            .is_ok()
-        );
+        assert!(build(rel.path(), &spec).await.is_ok());
     }
 
     /// fails if `as_user` is silently ignored on the accept side of the
@@ -1905,7 +1825,7 @@ mod tests {
             &spec,
             Some(&user),
             &[],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             TEST_BUILD_BUDGET,
         )
         .await
@@ -1942,7 +1862,7 @@ mod tests {
             &spec,
             Some("shep-deploy-test-no-such-user"),
             &[],
-            tempdir_cache().path(),
+            fixtures::tempdir().path(),
             TEST_BUILD_BUDGET,
         )
         .await
@@ -2016,17 +1936,7 @@ mod tests {
             artifacts: vec![PathBuf::from("dist/app.js")],
             ..Default::default()
         };
-        run(
-            "web",
-            rel.path(),
-            &spec,
-            None,
-            &[],
-            tempdir_cache().path(),
-            TEST_BUILD_BUDGET,
-        )
-        .await
-        .expect("builds");
+        build(rel.path(), &spec).await.expect("builds");
         let contents = fs::read_to_string(rel.path().join("dist/app.js")).expect("reads");
         assert_eq!(contents, "hello");
     }

@@ -487,29 +487,12 @@ mod tests {
         )
     }
 
-    /// The config every test that is not about the interval runs on.
-    const fn config() -> DogConfig {
-        DogConfig {
-            interval: Duration::from_secs(30),
-            retention: 5,
-            git_timeout: std::time::Duration::from_secs(60),
-            build_timeout: std::time::Duration::from_secs(60),
-            passthrough: Vec::new(),
-        }
-    }
-
     /// A target's record, for the one function that reads nothing else.
     fn target(watch: Watch) -> State {
         State {
-            remote: "https://example.com/x".to_owned(),
-            branch: "main".to_owned(),
-            deployed: Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2".to_owned()),
-            failed: None,
-            verify: Verify::default(),
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
             watch,
-            origin_cwd: None,
-            origin_script: None,
-            checkout: PathBuf::from("/srv/x"),
+            ..fixtures::state()
         }
     }
 
@@ -530,13 +513,7 @@ mod tests {
     /// The returned [`TempDir`] is the origin, and dropping it deletes the
     /// repository the deploy fetches from, so tests hold it.
     fn write_target_ready(home: &Path, sheep: &str, watch: Watch) -> TempDir {
-        let origin = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(origin.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(origin.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(origin.path(), &["config", "user.name", "test"]);
-        fs::write(origin.path().join("Flockfile.toml"), flockfile(sheep)).expect("Flockfile");
-        fixtures::run_git(origin.path(), &["add", "."]);
-        fixtures::run_git(origin.path(), &["commit", "-q", "-m", "first"]);
+        let origin = fixtures::checkout(&[("Flockfile.toml", &flockfile(sheep))]);
 
         let tree = Tree::for_sheep(home, sheep);
         fs::create_dir_all(tree.git()).expect("create the git dir");
@@ -550,14 +527,11 @@ mod tests {
 
         let state = State {
             remote,
-            branch: "main".to_owned(),
             deployed: Some(first),
-            failed: None,
             verify: Verify::Probed,
             watch,
-            origin_cwd: None,
-            origin_script: None,
             checkout: origin.path().to_owned(),
+            ..fixtures::state()
         };
         state.write(&tree.state_file()).expect("write deploy.toml");
 
@@ -595,12 +569,6 @@ mod tests {
     }
 
     impl Daemon for Ready {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             Ok(vec![
                 ProcessInfo::builder(0, sheep, ProcStatus::Online)
@@ -608,25 +576,17 @@ mod tests {
                     .build(),
             ])
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             self.reloads.set(self.reloads.get() + 1);
             Ok(())
         }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
         async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Ok(())
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, restart, save_roll,
+        );
     }
 
     /// A shepherd that has gone quiet, counting the times it was asked, on
@@ -668,12 +628,6 @@ mod tests {
     }
 
     impl Daemon for Counting {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, _sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             let asked = self.describes.get() + 1;
             self.describes.set(asked);
@@ -686,24 +640,13 @@ mod tests {
             fixtures::run_git(&self.origin, &["commit", "-q", "-m", "another"]);
             Err(Error::Protocol("the shepherd stopped answering".to_owned()))
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn reload(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
-        }
         async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Ok(())
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, reload, restart, save_roll,
+        );
     }
 
     /// fails if a manual target is polled. This is the switch an operator
@@ -730,7 +673,7 @@ mod tests {
             .deployed;
 
         assert!(
-            tick(&Ready::new(), home.path(), &config())
+            tick(&Ready::new(), home.path(), &fixtures::dog_config())
                 .await
                 .results
                 .is_empty()
@@ -757,7 +700,9 @@ mod tests {
         write_target(home.path(), "broken", Watch::Auto, Some("old"));
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
 
-        let results = tick(&Ready::new(), home.path(), &config()).await.results;
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "broken");
@@ -785,7 +730,9 @@ mod tests {
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = Ready::new();
-        let results = tick(&daemon, home.path(), &config()).await.results;
+        let results = tick(&daemon, home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert_eq!(results.len(), 1);
         assert!(
@@ -803,7 +750,7 @@ mod tests {
     async fn a_dog_with_no_targets_ticks_quietly() {
         let home = tempfile::tempdir().expect("tempdir");
         assert!(
-            tick(&Ready::new(), home.path(), &config())
+            tick(&Ready::new(), home.path(), &fixtures::dog_config())
                 .await
                 .results
                 .is_empty()
@@ -827,7 +774,9 @@ mod tests {
         // Listable again on drop or not, this test never reads it back.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let results = tick(&Ready::new(), home.path(), &config()).await.results;
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         let listable = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
         assert_eq!(results.len(), 1);
@@ -848,7 +797,9 @@ mod tests {
         fs::create_dir_all(tree.root()).expect("create the tree");
         fs::write(tree.state_file(), "this is not toml").expect("write deploy.toml");
 
-        let results = tick(&Ready::new(), home.path(), &config()).await.results;
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "garbled");
@@ -879,10 +830,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(150),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
             ),
         )
@@ -909,10 +857,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(600),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
             ),
         )
@@ -1042,10 +987,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(600),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
                 &mut out,
                 &mut err,
@@ -1078,10 +1020,7 @@ mod tests {
                 home.path(),
                 &DogConfig {
                     interval: Duration::from_secs(150),
-                    retention: 5,
-                    git_timeout: std::time::Duration::from_secs(60),
-                    build_timeout: std::time::Duration::from_secs(60),
-                    passthrough: Vec::new(),
+                    ..fixtures::dog_config()
                 },
                 &mut out,
                 &mut err,
@@ -1157,12 +1096,6 @@ mod tests {
     struct RefusingSmits;
 
     impl Daemon for RefusingSmits {
-        async fn dog_config(&self, _name: &str) -> Result<String, Error> {
-            unimplemented!()
-        }
-        async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-            unimplemented!()
-        }
         async fn describe(&self, sheep: &str) -> Result<Vec<ProcessInfo>, Error> {
             Ok(vec![
                 ProcessInfo::builder(0, sheep, ProcStatus::Online)
@@ -1170,20 +1103,8 @@ mod tests {
                     .build(),
             ])
         }
-        async fn start(&self, _apps: Vec<AppConfig>) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn delete(&self, _id: u32) -> Result<(), Error> {
-            unimplemented!()
-        }
         async fn reload(&self, _sheep: &str) -> Result<(), Error> {
             Ok(())
-        }
-        async fn restart(&self, _sheep: &str) -> Result<(), Error> {
-            unimplemented!()
-        }
-        async fn save_roll(&self) -> Result<PathBuf, Error> {
-            unimplemented!()
         }
         async fn set_smit(&self, _sheep: &str, _text: &str) -> Result<(), Error> {
             Err(Error::Request(RequestError::Rpc(RpcError {
@@ -1192,6 +1113,10 @@ mod tests {
                 daemon_version: None,
             })))
         }
+
+        crate::fixtures::daemon_methods!(unimplemented;
+            dog_config, list_flock, start, delete, restart, save_roll,
+        );
     }
 
     /// fails if the smit stops being republished every tick. The daemon
@@ -1216,8 +1141,8 @@ mod tests {
         );
         let daemon = SmitRecording::default();
 
-        tick(&daemon, home.path(), &config()).await;
-        tick(&daemon, home.path(), &config()).await;
+        tick(&daemon, home.path(), &fixtures::dog_config()).await;
+        tick(&daemon, home.path(), &fixtures::dog_config()).await;
 
         assert_eq!(
             daemon.smits(),
@@ -1244,7 +1169,7 @@ mod tests {
             Some("f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5"),
         );
         let daemon = SmitRecording::default();
-        tick(&daemon, home.path(), &config()).await;
+        tick(&daemon, home.path(), &fixtures::dog_config()).await;
         assert_eq!(daemon.smits().len(), 1);
     }
 
@@ -1260,7 +1185,9 @@ mod tests {
         // with the smit refusal this test exists to pin - see every other
         // `write_target_ready` caller in this file for the pattern.
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
-        let results = tick(&RefusingSmits, home.path(), &config()).await.results;
+        let results = tick(&RefusingSmits, home.path(), &fixtures::dog_config())
+            .await
+            .results;
         let row = |name: &str| {
             results
                 .iter()
@@ -1296,7 +1223,9 @@ mod tests {
         state.write(&tree.state_file()).expect("writes");
 
         let daemon = SmitRecording::default();
-        let results = tick(&daemon, home.path(), &config()).await.results;
+        let results = tick(&daemon, home.path(), &fixtures::dog_config())
+            .await
+            .results;
 
         assert!(
             !daemon.smits().is_empty(),

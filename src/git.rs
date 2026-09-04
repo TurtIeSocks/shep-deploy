@@ -279,22 +279,16 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    /// A throwaway non-bare repo with `commits` commits on its initial
-    /// branch, named `main` explicitly - `init.defaultBranch` is a user
-    /// setting this test cannot assume, so every fixture pins the name
-    /// itself rather than trusting whatever a host happens to default to.
+    /// A throwaway non-bare repo with `commits` commits on `main`, one file
+    /// per commit. The branch name is pinned by
+    /// [`fixtures::empty_checkout`] rather than left to a host's
+    /// `init.defaultBranch`, which several tests here read back by name.
     fn fixture_repo_with_commits(commits: u32) -> TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fixtures::run_git(dir.path(), &["init", "-q", "-b", "main"]);
-        fixtures::run_git(dir.path(), &["config", "user.email", "test@example.com"]);
-        fixtures::run_git(dir.path(), &["config", "user.name", "test"]);
-
+        let dir = fixtures::empty_checkout();
         for n in 0..commits {
-            fs::write(dir.path().join(format!("file-{n}.txt")), "x").expect("write fixture file");
-            fixtures::run_git(dir.path(), &["add", "."]);
-            fixtures::run_git(dir.path(), &["commit", "-q", "-m", &format!("commit {n}")]);
+            let name = format!("file-{n}.txt");
+            fixtures::commit(dir.path(), &[(&name, "x")], &format!("commit {n}"));
         }
-
         dir
     }
 

@@ -299,6 +299,7 @@ pub fn is_sha(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{self, SHA};
 
     /// fails if a typo in `deploy.toml` is silently dropped.
     ///
@@ -363,9 +364,6 @@ verfiy = "alive"
         let back: State = toml::from_str(&text).expect("parses");
         assert_eq!(back, original);
     }
-
-    /// A full sha, as `git rev-parse` prints one.
-    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     /// Writes `text` as a record and reads it back through `State::read`,
     /// so the validation runs the way it does in production.
@@ -524,15 +522,8 @@ verfiy = "alive"
     /// values don't matter - only that they change between the two writes.
     fn sample(deployed: Option<&str>) -> State {
         State {
-            remote: "https://example.com/x".into(),
-            branch: "main".into(),
             deployed: deployed.map(str::to_owned),
-            failed: None,
-            verify: Verify::default(),
-            watch: Watch::default(),
-            origin_cwd: None,
-            origin_script: None,
-            checkout: PathBuf::from("/srv/x"),
+            ..fixtures::state()
         }
     }
 
@@ -558,7 +549,7 @@ verfiy = "alive"
             "a completed write must not leave a .tmp file"
         );
 
-        let second = sample(Some("a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2c3a1b2"));
+        let second = sample(Some(fixtures::OTHER_SHA));
         second.write(&path).expect("second write");
         assert!(
             !tmp.exists(),
