@@ -15,10 +15,10 @@
 
 use std::fs;
 use std::io::{self, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use shep_client::shep_core::atomic_file::{create_staging_file, sync_dir};
 use shep_client::shep_core::config::AppConfig;
 
 use crate::error::Error;
@@ -55,10 +55,6 @@ pub enum Watch {
     /// changes.
     Manual,
 }
-
-/// The record's file mode: owner only, because [`State::origin`] carries
-/// the app's `env` verbatim.
-const RECORD_MODE: u32 = 0o600;
 
 /// `deploy.toml`'s full contents.
 ///
@@ -229,6 +225,15 @@ impl State {
             ));
         }
 
+        if self.origin.is_some() && (self.origin_cwd.is_none() || self.origin_script.is_none()) {
+            return Err(refuse(
+                "origin",
+                "is set while origin_cwd or origin_script is missing. All three are written \
+                 together at setup, and removal needs the pair to say where the sheep goes \
+                 back to; set the pair or remove `origin`",
+            ));
+        }
+
         if self.origin_cwd.is_some() != self.origin_script.is_some() {
             let missing = if self.origin_cwd.is_none() {
                 "origin_cwd"
@@ -247,9 +252,10 @@ impl State {
 
     /// Serialise to TOML and write to `path` atomically and durably.
     ///
-    /// The write lands at `<path>.<pid>.tmp` in the same directory first, is
-    /// flushed to disk, then `rename(2)`d over `path`, and the directory is
-    /// flushed after that. `rename(2)` within one directory is a single
+    /// The write lands in a uniquely named staging file beside `path` first
+    /// (shep-core's `atomic_file::create_staging_file`, created exclusively
+    /// and owner-only at the `open` itself), is flushed to disk, then
+    /// `rename(2)`d over `path`, and the directory is flushed after that. `rename(2)` within one directory is a single
     /// atomic syscall, so a process killed mid-write leaves either the old
     /// `deploy.toml` intact or the new one in full - never a truncated file.
     /// The two flushes extend that from a killed process to a lost power
@@ -258,8 +264,12 @@ impl State {
     /// specifically because this file is the only record of how to restore
     /// the sheep once the dog is removed.
     ///
-    /// A failed rename removes the temporary file it leaves behind, so one
-    /// failure does not sit next to the record forever, unread by anything.
+    /// A failed write or rename removes the staging file it leaves behind,
+    /// so one failure does not sit next to the record forever, unread by
+    /// anything. Exclusive creation with a name nothing else can predict is
+    /// also what keeps a link planted at a staging name from being written
+    /// through: the open never follows one, and a `rename` over `path`
+    /// replaces a link there rather than writing through it.
     ///
     /// The file is created owner-only. Since 2026-09-04 it can carry the
     /// app's `env` verbatim in [`Self::origin`], and shep writes its own
@@ -269,8 +279,11 @@ impl State {
     ///
     /// # Errors
     /// [`Error::Config`] if the record fails [`Self::validate`]: nothing is
-    /// written. [`Error::Io`], naming whichever of `path` or `<path>.<pid>.tmp` the
-    /// failing operation touched. This includes the (practically
+    /// written. [`Error::Io`], naming whichever of `path`, the staging file
+    /// or the directory the failing operation touched, and a directory that
+    /// cannot be flushed is a failure: the rename has landed, and what did
+    /// not happen is the durability this doc promises. This includes the
+    /// (practically
     /// unreachable, but not impossible) case of a `checkout` or
     /// `origin_cwd` containing non-UTF-8 bytes, which TOML cannot represent
     /// as a string; that failure is reported against `path` before any
@@ -286,51 +299,48 @@ impl State {
             source: io::Error::other(source),
         })?;
 
-        // The pid in the name, because `set_watch` writes without the tree
-        // lock (see its doc for why) and two processes staging into one
-        // `<path>.tmp` would truncate each other's file: the second rename
-        // then fails, and a rename landing between the other's truncate and
-        // write exposes an empty record.
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(format!(".{}.tmp", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        let at_tmp = |source| Error::Io {
-            path: tmp.clone(),
-            source,
+        // A unique name, because `set_watch` writes without the tree lock
+        // (see its doc for why) and two processes staging into one fixed
+        // name would truncate each other's file: the second rename then
+        // fails, and a rename landing between the other's truncate and
+        // write exposes an empty record. Created exclusively, so a link
+        // planted at the name is never followed, and owner-only at the
+        // open, so the `env` inside is never briefly wider.
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
         };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("deploy.toml");
+        let mut staged =
+            create_staging_file(dir, &format!("{name}."), ".tmp").map_err(Error::at(dir))?;
 
-        let written = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(RECORD_MODE)
-            .open(&tmp)
-            .and_then(|mut file| {
-                file.write_all(text.as_bytes())?;
-                file.sync_all()
-            })
-            .map_err(at_tmp);
-        if let Err(err) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
-        }
-
-        if let Err(source) = fs::rename(&tmp, path) {
-            let _ = fs::remove_file(&tmp);
+        let written = staged
+            .as_file_mut()
+            .write_all(text.as_bytes())
+            .and_then(|()| staged.as_file().sync_all());
+        if let Err(source) = written {
+            // Dropping `staged` removes it.
             return Err(Error::Io {
-                path: path.to_owned(),
+                path: staged.path().to_owned(),
                 source,
             });
         }
 
+        // `persist` is the rename; a refusal hands the staging file back,
+        // and dropping it removes it.
+        staged.persist(path).map_err(|failed| Error::Io {
+            path: path.to_owned(),
+            source: failed.error,
+        })?;
+
         // The directory entry, so the rename itself survives a power loss.
-        // Best effort: a filesystem that refuses to sync a directory has
-        // already accepted the data, and failing the deploy over the entry
-        // would be the worse outcome.
-        if let Some(dir) = path.parent() {
-            let _ = fs::File::open(dir).and_then(|dir| dir.sync_all());
-        }
-        Ok(())
+        // Not best effort: the helper already forgives the one answer
+        // (`EINVAL`) that means "no such step here", so what reaches this
+        // is a flush that did not happen.
+        sync_dir(dir).map_err(Error::at(dir))
     }
 }
 
@@ -530,6 +540,8 @@ verfiy = "alive"
         .expect("an app");
         let mut with = sample(None);
         with.origin = Some(origin.clone());
+        with.origin_cwd = Some(PathBuf::from("/srv/web"));
+        with.origin_script = Some("server.js".to_owned());
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("deploy.toml");
         with.write(&path).expect("writes");
@@ -543,17 +555,89 @@ verfiy = "alive"
         assert_eq!(older.origin, None);
     }
 
+    /// fails if a `State` printed with `{:?}` shows an `env` value. The
+    /// record carries the app's `env` verbatim in `origin`, and the derive
+    /// is safe only because `AppConfig`'s own `Debug` prints the map as a
+    /// count; this pins that exact shape so a change to either side shows
+    /// up here rather than in a log.
+    #[test]
+    fn debug_output_redacts_the_origins_env() {
+        let origin: AppConfig = toml::from_str(
+            "name = \"web\"\nscript = \"server.js\"\n[env]\nTOKEN = \"hunter2-distinctive\"\n",
+        )
+        .expect("an app");
+        let state = State {
+            origin: Some(origin),
+            ..fixtures::state()
+        };
+
+        let shown = format!("{state:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("TOKEN"), "{shown}");
+        assert!(shown.contains("env: <1 vars>"), "{shown}");
+    }
+
+    /// fails if a record carrying `origin` without the legacy pair reads.
+    /// Removal puts the sheep back through both, and a record with one and
+    /// not the other was accepted and then skipped as a dog-bootstrapped
+    /// sheep, leaving it under the tree with its origin unread.
+    #[test]
+    fn an_origin_without_the_legacy_pair_is_refused_by_name() {
+        let origin: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"server.js\"\ncwd = \"/srv/web\"\n")
+                .expect("an app");
+        let state = State {
+            origin: Some(origin),
+            origin_cwd: None,
+            origin_script: None,
+            ..fixtures::state()
+        };
+
+        let err = state
+            .validate(Path::new("/x/deploy.toml"))
+            .expect_err("origin without the pair");
+        let shown = err.to_string();
+        assert!(shown.contains("origin"), "{shown}");
+        assert!(shown.contains("origin_cwd"), "{shown}");
+    }
+
+    /// fails if a write follows a link planted where the record goes. The
+    /// rename replaces the link with the real file; the file the link named
+    /// is never opened, let alone written with the record's `env`.
+    #[test]
+    fn a_link_at_the_record_path_is_replaced_not_written_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "untouched").expect("victim");
+        let path = dir.path().join("deploy.toml");
+        std::os::unix::fs::symlink(&victim, &path).expect("a planted link");
+
+        sample(None).write(&path).expect("writes");
+
+        assert_eq!(fs::read_to_string(&victim).expect("victim"), "untouched");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .expect("record")
+                .file_type()
+                .is_symlink(),
+            "the record is a real file now"
+        );
+        assert!(State::read(&path).is_ok());
+    }
+
     /// fails if the record is readable by anyone but its owner. It carries
     /// the app's `env` verbatim once an origin is recorded, and shep's own
     /// roll is owner-only for the same reason.
     #[test]
     fn the_record_is_written_owner_only() {
         use std::os::unix::fs::PermissionsExt;
+
+        use shep_client::shep_core::atomic_file::OWNER_ONLY_FILE_MODE;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("deploy.toml");
         sample(None).write(&path).expect("writes");
         let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, RECORD_MODE);
+        assert_eq!(mode, OWNER_ONLY_FILE_MODE);
     }
 
     /// fails if a rename that cannot land leaves its temporary file behind.

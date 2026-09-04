@@ -84,7 +84,8 @@ the build command is one you would hand your agent to.
 Flockfile is refused for setting any of them.** Read out of shep-daemon on
 2026-09-04. A `readiness_probe` or `liveness_probe` of kind `exec` is run by
 the daemon through `sh -c` on the probe's interval, forever, with no uid drop
-and no regard for `user`: committed, it is a root shell every ten seconds.
+and no regard for `user`: committed, it is a shell at the daemon's uid every
+ten seconds, and root's under the arrangement this crate assumes.
 `out_file` and `err_file` are opened, created and appended to by the daemon's
 log pump and truncated by `shep flush`, at the daemon's uid, with a symlink
 check on the final component and nothing on where the path points. An `http`

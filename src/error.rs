@@ -672,6 +672,23 @@ mod tests {
 
     use shep_client::shep_core::protocol::{RpcError, RpcErrorCode};
 
+    /// fails if the message for a panic stops naming all four things an
+    /// operator needs from it: which sheep, what the panic said, that the
+    /// bug is this dog's, and what to compare before deploying again.
+    #[test]
+    fn a_panic_names_the_sheep_the_text_and_the_way_out() {
+        let err = Error::Panicked {
+            sheep: "web".to_owned(),
+            what: "index out of bounds".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "the deploy of web panicked partway: index out of bounds. That is a bug in \
+             shep-deploy rather than in web. Compare `current`, deploy.toml and `shep describe \
+             web` against each other before deploying again, and please report the panic"
+        );
+    }
+
     /// fails if an Io error stops naming the path it failed on. A deploy
     /// touches many paths and "permission denied" without one is unactionable.
     #[test]
