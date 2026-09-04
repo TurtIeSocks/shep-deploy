@@ -323,7 +323,8 @@ fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str
         if seen.muted < RESAY {
             return None;
         }
-        swallowed = seen.muted;
+        // The occurrence being said now is not one that was swallowed.
+        swallowed = seen.muted - 1;
     }
 
     previous.insert(
@@ -970,6 +971,26 @@ mod tests {
         assert!(worth_saying(&mut previous, "web", broken).is_none());
         assert!(worth_saying(&mut previous, "web", "web deployed abc1234").is_some());
         assert!(worth_saying(&mut previous, "web", broken).is_some());
+    }
+
+    /// fails if the count a re-said line carries is off by one. The
+    /// occurrence that lifts the mute is the one being printed, so it is
+    /// not among the swallowed; `RESAY` occurrences after the first say,
+    /// `RESAY - 1` were swallowed.
+    #[test]
+    fn a_line_said_again_counts_only_what_was_swallowed() {
+        let mut previous = BTreeMap::new();
+        let line = "web: the remote is gone";
+
+        assert_eq!(worth_saying(&mut previous, "web", line), Some(0), "new");
+        for _ in 1..RESAY {
+            assert_eq!(worth_saying(&mut previous, "web", line), None);
+        }
+        assert_eq!(
+            worth_saying(&mut previous, "web", line),
+            Some(RESAY - 1),
+            "the one being said is not swallowed"
+        );
     }
 
     /// fails if a muted line is muted forever. A dog runs for months, and a

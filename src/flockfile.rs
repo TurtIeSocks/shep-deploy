@@ -70,14 +70,17 @@ pub struct Merged {
 }
 
 /// Reads and merges `release`'s Flockfiles, refusing first if the committed
-/// one sets `user` or `group`.
+/// one sets anything the shepherd acts on at its own uid.
 ///
 /// # Errors
 /// [`Error::Io`], naming the failing path, if `Flockfile.toml` cannot be
 /// read or `Flockfile.override.toml` exists but cannot be read.
 /// [`Error::Config`] if either file is not valid TOML, is a symlink the
-/// repository committed, or is past [`MAX_FLOCKFILE_BYTES`], or if the
-/// committed file sets `user` or `group` on any app.
+/// repository committed, or is past [`MAX_FLOCKFILE_BYTES`]; if the
+/// committed file names one app twice; or if it sets, on any app, `user`,
+/// `group`, `out_file`, `err_file`, `watch`, an `exec` probe, a probe whose
+/// target is off loopback, or a probe spelled as anything but a table. See
+/// [`refuse_repo_privilege`] for why each is on the list.
 pub fn read(release: &Path, shared: &FromCheckout) -> Result<Merged, Error> {
     Ok(Merged {
         doc: merged_document(release, shared)?,
@@ -212,7 +215,8 @@ pub fn build_spec(release: &Path, shared: &[PathBuf]) -> Result<BuildSpec, Error
 }
 
 /// The committed Flockfile with the operator's override merged over it,
-/// refusing first if the committed file sets `user` or `group`.
+/// refusing first if the committed file sets anything the shepherd acts on
+/// at its own uid (see [`refuse_repo_privilege`]).
 ///
 /// Both public readers go through here, so the refusal applies whichever
 /// one was called and neither can see a document the other could not.

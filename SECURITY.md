@@ -80,7 +80,7 @@ the key, on purpose, because an operator who writes it has said what they mean.
 What it costs is the whole of the paragraph above, so it is worth being sure
 the build command is one you would hand your agent to.
 
-**Four more fields make the shepherd act at its own uid, and a committed
+**Five more fields make the shepherd act at its own uid, and a committed
 Flockfile is refused for setting any of them.** Read out of shep-daemon on
 2026-09-04. A `readiness_probe` or `liveness_probe` of kind `exec` is run by
 the daemon through `sh -c` on the probe's interval, forever, with no uid drop

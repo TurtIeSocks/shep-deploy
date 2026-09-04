@@ -85,6 +85,18 @@ pub enum Standing {
     /// the record refuses unknown fields, so one written by a newer
     /// shep-deploy reads this way to an older binary.
     Unreadable(String),
+    /// The deploy directory itself could not be listed, and what listing it
+    /// said. Every target is under it, so no row alongside is complete.
+    Unlisted(String),
+    /// A registered sheep whose name cannot be a deploy tree's directory
+    /// name, so nothing here can be built for it.
+    ///
+    /// Not [`Self::NotEligible`]: that names a checkout problem the
+    /// operator fixes in place, and this one is fixed by renaming the
+    /// sheep. Caught here because the name comes from the shepherd's roll,
+    /// which this dog does not get to validate, and `Tree::for_sheep` is
+    /// only for names that passed.
+    BadName,
 }
 
 /// Where `app` stands, without touching anything.
@@ -192,6 +204,8 @@ impl Standing {
             Self::Orphaned => "orphaned",
             Self::Unnamed => "unnamed",
             Self::Unreadable(_) => "unreadable",
+            Self::Unlisted(_) => "unlisted",
+            Self::BadName => "bad name",
         }
     }
 
@@ -240,6 +254,15 @@ impl Standing {
                  before deploying; do not run setup against it, the sheep may be running from \
                  inside that tree"
             ),
+            Self::Unlisted(why) => format!(
+                "is the deploy directory and could not be listed: {why}. Every target is \
+                 under it, so no other row here is complete; fix the directory before \
+                 trusting this survey"
+            ),
+            Self::BadName => "is registered under a name this dog cannot use as a directory \
+                              name: one path component, nothing that forges a log line. \
+                              Rename the sheep before setup"
+                .to_owned(),
         }
     }
 }
@@ -279,7 +302,7 @@ pub async fn survey<D: Daemon>(daemon: &D, shep_home: &Path) -> Result<String, E
     };
     let mut rows = rows(shep_home, &apps, &targets);
     if let Some((dir, why)) = unlisted {
-        rows.push((dir.display().to_string(), Standing::Unreadable(why)));
+        rows.push((dir.display().to_string(), Standing::Unlisted(why)));
     }
     Ok(render(&rows))
 }
@@ -298,7 +321,16 @@ fn rows(
 ) -> Vec<(String, Standing)> {
     let mut rows: Vec<(String, Standing)> = apps
         .values()
-        .map(|app| (app.name.clone(), classify(shep_home, app)))
+        .map(|app| {
+            // The roll's names are the shepherd's, and shep's own rule for
+            // a name is not this dog's: a name with a separator in it would
+            // build a tree outside the deploy directory.
+            if paths::is_sheep_name(&app.name) {
+                (app.name.clone(), classify(shep_home, app))
+            } else {
+                (crate::shared::printable(&app.name), Standing::BadName)
+            }
+        })
         .collect();
     rows.extend(
         targets
@@ -320,6 +352,63 @@ fn rows(
 mod tests {
     use super::*;
     use crate::fixtures;
+
+    /// fails if the deploy directory failing to list is described as a
+    /// record that cannot be read. It holds no record and holds every
+    /// target, and "repair the record" sends the operator looking for a
+    /// file that does not exist.
+    #[test]
+    fn a_deploy_directory_that_cannot_be_listed_is_its_own_row() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::write(home.path().join("deploy"), b"not a directory").expect("a file");
+        let apps = std::collections::BTreeMap::new();
+
+        let (targets, unlisted) = match paths::targets(home.path()) {
+            Ok(targets) => (targets, None),
+            Err(err) => (paths::Targets::default(), Some(err.to_string())),
+        };
+        let why = unlisted.expect("a file where a directory belongs cannot be listed");
+        let mut rows = rows(home.path(), &apps, &targets);
+        rows.push((
+            home.path().join("deploy").display().to_string(),
+            Standing::Unlisted(why),
+        ));
+
+        let shown = render(&rows);
+        assert!(shown.contains("unlisted"), "{shown}");
+        assert!(shown.contains("could not be listed"), "{shown}");
+        assert!(!shown.contains("record"), "{shown}");
+    }
+
+    /// fails if a registered name that cannot be a directory name reaches
+    /// `Tree::for_sheep`. The roll's names are the shepherd's, and one with
+    /// a separator in it would name a tree outside the deploy directory;
+    /// a control character in it would forge the row.
+    #[test]
+    fn a_registered_sheep_with_an_impossible_name_is_a_row_not_a_path() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let mut apps = std::collections::BTreeMap::new();
+        for name in ["../x", "a\nb"] {
+            apps.insert(name.to_owned(), app(name, Some("/srv/x")));
+        }
+
+        let rows = rows(home.path(), &apps, &paths::Targets::default());
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for (name, standing) in &rows {
+            assert!(
+                matches!(standing, Standing::BadName),
+                "{name}: {standing:?}"
+            );
+            assert!(
+                !name.contains('\n'),
+                "the row must not forge a line: {name:?}"
+            );
+        }
+        let shown = render(&rows);
+        assert!(shown.contains("bad name"), "{shown}");
+        assert!(shown.contains("Rename the sheep"), "{shown}");
+    }
 
     /// fails if a target whose record cannot be read is offered `setup`.
     ///

@@ -642,6 +642,44 @@ fn pattern_matches(path: &Path, pattern: &Pattern) -> bool {
     }
 }
 
+/// `path` with every symlink and `..` resolved as far as the filesystem
+/// allows, for comparing two spellings of one place.
+///
+/// The dog and the daemon can resolve `$SHEP_HOME` to different spellings
+/// of the same directory (one through a symlinked home, say), and the
+/// daemon hands back the spelling it registered. A literal comparison then
+/// calls two names for one directory different, and both places that
+/// compare a registered `cwd` with a tree's `current` decide something
+/// irreversible on the answer: whether a sheep is already running from the
+/// tree (`optin::prepare`, which otherwise tells the operator to remove
+/// it), and whether the cutover registered it (`restore`, which otherwise
+/// leaves it there).
+///
+/// Three rungs, each taken only when the one above cannot be. The whole
+/// path canonicalised; failing that, the parent canonicalised with the
+/// last component kept as written, which is what a `current` that dangles
+/// needs, since the link itself is real even when its target is gone; and
+/// failing that too, the path as given. Never an error: a path that cannot
+/// be resolved at all is compared as spelled, the way it always was.
+#[must_use]
+pub fn resolved(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name())
+        && let Ok(real_parent) = fs::canonicalize(parent)
+    {
+        return real_parent.join(name);
+    }
+    path.to_path_buf()
+}
+
+/// Whether `a` and `b` name the same place, by [`resolved`].
+#[must_use]
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    resolved(a) == resolved(b)
+}
+
 /// The relative paths a release shares from the operator's own checkout.
 ///
 /// Only [`to_link`] builds one, and that is the whole point of the type.
@@ -1100,6 +1138,41 @@ mod tests {
         let found = ignored_present(repo.path()).expect("enumerates");
         assert!(found.iter().any(|p| p.ends_with("dist")));
         assert!(!found.iter().any(|p| p.ends_with("scratch.txt")));
+    }
+
+    /// fails if two spellings of one place compare unequal, or if a
+    /// `current` whose release is gone stops comparing at all. The dog and
+    /// the daemon can spell `$SHEP_HOME` differently, and both comparisons
+    /// that use this decide something irreversible on the answer.
+    #[test]
+    fn two_spellings_of_one_path_resolve_alike_even_when_the_target_is_gone() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("deploy/web")).expect("tree");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("a second spelling");
+
+        let current = home.join("deploy/web/current");
+        let through_link = link.join("deploy/web/current");
+        // Dangling: the link exists, what it names does not.
+        std::os::unix::fs::symlink(home.join("deploy/web/releases/gone"), &current)
+            .expect("current");
+        assert!(
+            same_path(&current, &through_link),
+            "parent resolves, name kept"
+        );
+
+        fs::remove_file(&current).expect("unlink");
+        assert!(
+            same_path(&current, &through_link),
+            "nothing exists but the parent"
+        );
+        assert!(!same_path(&current, &home.join("deploy/web/previous")));
+        assert_eq!(
+            resolved(Path::new("/nonexistent/anywhere/x")),
+            PathBuf::from("/nonexistent/anywhere/x"),
+            "unresolvable stays as spelled"
+        );
     }
 
     /// fails if the provenance answer stops following the list. The

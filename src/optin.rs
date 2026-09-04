@@ -146,7 +146,7 @@ pub async fn prepare<D: Daemon>(
     // would take a running service's cwd with it. The record is repaired
     // from what `current` names instead, and the sheep is then what it is:
     // a deploy target, refused here like any other.
-    if checkout == tree.current()
+    if shared::same_path(&checkout, &tree.current())
         && let Some(release) = swap::resolve(&tree.current())?
         && let Some(sha) = release.file_name().and_then(|name| name.to_str())
         && crate::state::is_sha(sha)
@@ -203,7 +203,7 @@ pub async fn prepare<D: Daemon>(
     // the sheep back INTO the tree. Refused by name rather than left to
     // `current_branch`, which happened to refuse it only because releases
     // are detached worktrees.
-    if checkout.starts_with(tree.root()) {
+    if shared::resolved(&checkout).starts_with(shared::resolved(tree.root())) {
         return Err(Error::Config(format!(
             "{sheep} is registered with its working directory inside its own deploy tree ({}), \
              so there is no operator checkout to take it over from. That is what an abandoned \
@@ -1877,6 +1877,40 @@ mod tests {
                 .as_deref(),
             Some(fixtures::SHA),
             "the record now names what current names"
+        );
+    }
+
+    /// fails if a second spelling of the tree's `current` is not recognised
+    /// as the tree's `current`. The daemon hands back the cwd as it was
+    /// registered, and it can spell `$SHEP_HOME` through a symlink the dog
+    /// does not use. A literal comparison then skipped this branch, found
+    /// the record with no `deployed`, and told the operator to remove the
+    /// tree a running service was serving from.
+    #[tokio::test]
+    async fn a_sheep_running_from_current_spelled_through_a_link_is_still_recognised() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("a second spelling");
+        let tree = Tree::for_sheep(&home, "bpm");
+        let release = tree.release(fixtures::SHA);
+        std::fs::create_dir_all(&release).expect("a release directory");
+        swap::point_at(&tree.current(), &release).expect("current");
+        write_target(&home, "bpm", Watch::Manual, None);
+        let spelled_through_link = link.join("deploy/bpm/current");
+        let entries = [("bpm", spelled_through_link.as_path())];
+        let daemon = RollOf(&entries);
+
+        let err = prepare(&daemon, &home, "bpm", &fixtures::dog_config())
+            .await
+            .expect_err("already a target");
+
+        let shown = err.to_string();
+        assert!(shown.contains("already a deploy target"), "{shown}");
+        assert!(
+            !shown.contains("Remove"),
+            "must never say to remove the tree: {shown}"
         );
     }
 

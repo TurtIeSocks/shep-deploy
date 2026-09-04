@@ -372,6 +372,13 @@ async fn put_back<D: Daemon>(
         Some(origin) => {
             let mut restored = origin.clone();
             restored.name = sheep.to_owned();
+            // `prepare` refuses a sheep with no cwd, so an origin without
+            // one is a hand-edited record. The legacy field is the next
+            // best witness, and using it here is what keeps the report,
+            // which names the same field, truthful.
+            restored
+                .cwd
+                .get_or_insert_with(|| cwd.display().to_string());
             restored
         }
         None => {
@@ -509,24 +516,11 @@ fn registered_against(registered: &BTreeMap<String, AppConfig>, sheep: &str, tre
     registered
         .get(sheep)
         .and_then(|app| app.cwd.as_deref())
-        .is_some_and(|cwd| {
-            // The dog and the daemon can resolve $SHEP_HOME to different
-            // spellings of the same directory (see daemon.rs:141), so a
-            // literal path comparison can call a sheep the cutover DID
-            // register "never moved" and leave it running from the tree.
-            // Canonicalise both sides before comparing; if either side
-            // cannot be canonicalised (for example it no longer exists),
-            // fall back to the literal comparison rather than failing open.
-            let registered_path = Path::new(cwd);
-            let current = tree.current();
-            match (
-                std::fs::canonicalize(registered_path),
-                std::fs::canonicalize(&current),
-            ) {
-                (Ok(registered_real), Ok(current_real)) => registered_real == current_real,
-                _ => registered_path == current,
-            }
-        })
+        // Two spellings of one directory compare equal, and a `current`
+        // whose release is already gone still compares by its parent: see
+        // `shared::resolved` for why a literal comparison here left a
+        // sheep the cutover DID register running from the tree.
+        .is_some_and(|cwd| crate::shared::same_path(Path::new(cwd), &tree.current()))
 }
 
 #[cfg(test)]
@@ -671,6 +665,39 @@ mod tests {
         let started = daemon.started();
         assert_eq!(started[0].cwd.as_deref(), Some("/srv/web"));
         assert_eq!(started[0].script, "server.js");
+    }
+
+    /// fails if an origin with no `cwd` is put back with none while the
+    /// report names the legacy field. `prepare` refuses a sheep without a
+    /// cwd, so this is a hand-edited record; the legacy field is the next
+    /// witness, and what is started and what is reported have to agree.
+    #[tokio::test]
+    async fn an_origin_without_a_cwd_is_put_back_at_the_legacy_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let origin: AppConfig =
+            toml::from_str("name = \"web\"\nscript = \"server.js\"\n").expect("an app");
+        assert!(origin.cwd.is_none());
+        let tree = Tree::for_sheep(home.path(), "web");
+        fs::create_dir_all(tree.state_file().parent().expect("has a parent"))
+            .expect("create target dir");
+        let state = State {
+            deployed: Some(fixtures::OTHER_SHA.to_owned()),
+            origin_cwd: Some(PathBuf::from("/srv/web")),
+            origin_script: Some("server.js".to_owned()),
+            checkout: PathBuf::from("/srv/web"),
+            origin: Some(origin),
+            ..fixtures::state()
+        };
+        state.write(&tree.state_file()).expect("write state");
+        let daemon = Recording::new(&["web"], Refuse::Never);
+
+        let results = all(&daemon, home.path()).await;
+
+        assert!(
+            matches!(&results[0], Restored::Returned { to, .. } if to == Path::new("/srv/web")),
+            "{results:?}"
+        );
+        assert_eq!(daemon.started()[0].cwd.as_deref(), Some("/srv/web"));
     }
 
     /// Writes a `deploy.toml` for `sheep` with no `origin_cwd` or
@@ -1393,5 +1420,33 @@ mod tests {
             !daemon.calls().is_empty(),
             "it must actually be put back, not merely reported"
         );
+    }
+
+    /// fails if the same recognition breaks once the release `current`
+    /// pointed at is gone. Both full canonicalisations fail on a dangling
+    /// link, and a fallback to the literal spellings called the two names
+    /// for one `current` different, so the sheep read as never moved and
+    /// stayed registered against the tree.
+    #[tokio::test]
+    async fn a_registration_through_a_symlinked_parent_is_recognised_when_current_dangles() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("create home");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).expect("symlink parent");
+
+        let tree = Tree::for_sheep(&home, "ctm");
+        fs::create_dir_all(tree.root()).expect("create tree");
+        std::os::unix::fs::symlink(tree.release("gone"), tree.current()).expect("dangling current");
+
+        write_target_never_cut_over(&home, "ctm", "/srv/ctm", "./run.sh");
+        let cwd_through_link = link.join("deploy").join("ctm").join("current");
+        let daemon = Recording::with_registered(&["ctm"]).registered_at(&cwd_through_link);
+
+        let results = all(&daemon, &home).await;
+
+        let text = report(&results);
+        assert!(!text.contains("never moved"), "{text}");
+        assert!(!daemon.calls().is_empty(), "put back, not merely reported");
     }
 }
