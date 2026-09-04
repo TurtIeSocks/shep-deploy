@@ -60,18 +60,25 @@ pub fn text(state: &State) -> String {
     format!("{mark} {}@{sha}", state.branch)
 }
 
-/// Shorten `text` to [`Smit::MAX_CHARS`], if it is already not that short.
+/// Shorten `text` to [`Smit::MAX_CHARS`] and drop any control character, so
+/// what is published is something the shepherd's own
+/// [`Smit::from_str`](core::str::FromStr::from_str) accepts.
 ///
 /// A branch name is the only variable-length part of a smit, and a branch
 /// name long enough to matter is a real thing an operator can name, not a
 /// mistake to refuse over. Publishing is cosmetic: showing a shortened mark
-/// beats showing nothing at all because [`Smit::from_str`](core::str::FromStr::from_str)
-/// would have refused the full one.
+/// beats showing nothing at all because the daemon would have refused the
+/// full one.
+///
+/// Control characters get the same treatment for the same reason. git
+/// refuses them in a ref name, so nothing this crate writes produces one,
+/// but `deploy.toml` is hand-edited and a smit the daemon refuses is
+/// refused on every tick for as long as the record says so.
 fn fit(text: String) -> String {
-    if text.chars().count() <= Smit::MAX_CHARS {
-        return text;
-    }
-    text.chars().take(Smit::MAX_CHARS).collect()
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(Smit::MAX_CHARS)
+        .collect()
 }
 
 /// Publish `sheep`'s smit, built from `state`, to the shepherd.
