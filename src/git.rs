@@ -174,13 +174,27 @@ pub fn current_branch(checkout: &Path) -> Result<String, Error> {
 /// an operator needs to be told that, not left to infer it from a target
 /// that silently never updates again.
 ///
+/// `--` before `remote`, so it is only ever read as a URL. Without it a
+/// `remote` beginning with `-` is an option, and `--upload-pack=<command>` is
+/// one git honours: it runs the command. `remote` comes out of `deploy.toml`,
+/// which an operator edits by hand, and out of their checkout's own `origin`,
+/// so nothing hostile is expected there; the separator costs nothing and
+/// closes the door anyway. Measured 2026-09-03: `git fetch -- <url> <refspec>`
+/// behaves exactly as the form without it.
+///
 /// # Errors
 /// [`Error::Git`] if `remote` cannot be reached or refuses the fetch.
 /// [`Error::Io`] if `git` itself cannot be launched.
 pub fn fetch(git_dir: &Path, remote: &str, budget: Duration) -> Result<(), Error> {
     run_git_within(
         git_dir,
-        &["fetch", "--prune", remote, "+refs/heads/*:refs/heads/*"],
+        &[
+            "fetch",
+            "--prune",
+            "--",
+            remote,
+            "+refs/heads/*:refs/heads/*",
+        ],
         budget,
     )
     .map(|_| ())
@@ -208,7 +222,11 @@ pub fn remote_head(git_dir: &Path, branch: &str) -> Result<String, Error> {
 ///
 /// `sha` is a commit, not a branch, so the new worktree is always detached -
 /// nothing here ever checks out a branch that might already be checked out
-/// elsewhere, which `git worktree add` would refuse.
+/// elsewhere, which `git worktree add` would refuse. `--detach` says so
+/// explicitly rather than relying on `sha` never being a branch name: a
+/// hand-edited record naming `main` would otherwise check the branch out,
+/// succeed once, and refuse every release after it with `'main' is already
+/// used by worktree`. Measured 2026-09-03.
 ///
 /// # Errors
 /// [`Error::Git`] if `sha` does not resolve in `git_dir`, or `at` already
@@ -216,7 +234,7 @@ pub fn remote_head(git_dir: &Path, branch: &str) -> Result<String, Error> {
 /// not valid UTF-8.
 pub fn worktree_add(git_dir: &Path, at: &Path, sha: &str) -> Result<(), Error> {
     let at = path_str(at)?;
-    run_git(git_dir, &["worktree", "add", at, sha]).map(|_| ())
+    run_git(git_dir, &["worktree", "add", "--detach", "--", at, sha]).map(|_| ())
 }
 
 /// Removes the worktree at `at`, forcibly.
@@ -234,7 +252,7 @@ pub fn worktree_add(git_dir: &Path, at: &Path, sha: &str) -> Result<(), Error> {
 /// `git` itself cannot be launched, or if `at` is not valid UTF-8.
 pub fn worktree_remove(git_dir: &Path, at: &Path) -> Result<(), Error> {
     let at = path_str(at)?;
-    run_git(git_dir, &["worktree", "remove", "--force", at]).map(|_| ())
+    run_git(git_dir, &["worktree", "remove", "--force", "--", at]).map(|_| ())
 }
 
 /// Cleans up `git_dir`'s worktree bookkeeping for any worktree whose
@@ -431,6 +449,49 @@ mod tests {
         let err =
             remote_head(git_dir.path(), "feature").expect_err("a deleted branch must not resolve");
         assert!(matches!(err, Error::Git { .. }));
+    }
+
+    /// fails if a `remote` beginning with `-` is read as an option.
+    ///
+    /// `--upload-pack=<command>` is one git runs. Measured 2026-09-03 before
+    /// the `--` separator was added: `git fetch --prune "--upload-pack=echo
+    /// INJECTED >&2; false" <refspec>` printed INJECTED. The marker file is
+    /// the whole assertion: an `Err` alone is what the vulnerable version
+    /// returned too, after running the command.
+    #[test]
+    fn a_remote_beginning_with_a_dash_is_a_url_not_an_option() {
+        let git_dir = bare_git_dir();
+        let marker = git_dir.path().join("injected");
+        let remote = format!("--upload-pack=touch {}", marker.display());
+
+        let err =
+            fetch(git_dir.path(), &remote, fixtures::TEST_BUDGET).expect_err("no such repository");
+
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+        assert!(
+            !marker.exists(),
+            "the remote must never be run as a command"
+        );
+    }
+
+    /// fails if a worktree stops being added detached.
+    ///
+    /// `sha` is always a commit in practice, but a hand-edited record can name
+    /// a branch, and `git worktree add <path> main` checks the branch out. The
+    /// first one succeeds; every one after it fails with `'main' is already
+    /// used by worktree`, and the deploy that meets it has no idea why.
+    /// `--detach` makes the second add succeed too.
+    #[test]
+    fn a_worktree_is_added_detached_even_when_given_a_branch_name() {
+        let repo = fixture_repo_with_commits(1);
+        let first = repo.path().join("wt-first");
+        let second = repo.path().join("wt-second");
+
+        worktree_add(repo.path(), &first, "main").expect("first add");
+        worktree_add(repo.path(), &second, "main").expect("a second add of the same branch");
+
+        worktree_remove(repo.path(), &first).expect("cleans up");
+        worktree_remove(repo.path(), &second).expect("cleans up");
     }
 
     /// fails if `remote_head` stops refusing a branch `git_dir` has never
