@@ -32,9 +32,9 @@
 //! tree before anything else and holds it to the end, so two PROCESSES
 //! cannot both be inside a deploy of one sheep: the second is refused in one
 //! sentence rather than colliding somewhere inside git. See [`crate::lock`]
-//! for what that collision did before the lock existed. [`set_watch`] takes
-//! the same lock for its one write, so a `--watch` typed mid-tick cannot
-//! clobber what the tick is about to record.
+//! for what that collision did before the lock existed. [`set_watch`] does
+//! NOT take it, on purpose, and its own doc says how a `--watch` typed
+//! mid-tick and the tick's record write stay out of each other's way.
 //!
 //! Behind the lock there is still one cheap guard: `current` is read when a
 //! deploy starts and read again immediately before the swap, and a deploy
@@ -500,6 +500,9 @@ async fn attempt<D: Daemon>(
         // that said the release was serving and held at once.
         Landed::Verified => {
             state.deployed = Some(head.to_owned());
+            // The operator's fields from disk, not this deploy's copy of
+            // them: see `adopt_operator_fields`.
+            adopt_operator_fields(tree, state);
             if let Err(err) = state.write(&tree.state_file()) {
                 eprintln!("shep-deploy: {sheep}: deployed {head}, but could not record it: {err}");
             }
@@ -589,7 +592,7 @@ fn record(
 
     if state.failed != failed {
         // Re-read before writing, because this process may not be the only
-        // one deploying this sheep. `state` here is whatever THIS process
+        // one writing this record. `state` here is whatever THIS process
         // read at its own start, and `State::write` replaces the whole
         // record, so writing it blind is last-writer-wins over a record
         // somebody else may have advanced since.
@@ -597,6 +600,7 @@ fn record(
             Some(fresher) => *state = fresher,
             None => {
                 state.failed = failed;
+                adopt_operator_fields(tree, state);
                 if let Err(err) = state.write(&tree.state_file()) {
                     eprintln!("shep-deploy: {sheep}: could not record what {head} came to: {err}");
                 }
@@ -619,6 +623,26 @@ fn record(
         .collect();
     if let Err(err) = retention::prune(tree, keep, &spared) {
         eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
+    }
+}
+
+/// Takes `watch` and `verify` from the record on disk into `state`, so a
+/// deploy's own write of the record does not put back a setting the
+/// operator changed while it ran.
+///
+/// Those two fields are the operator's: `set_watch` writes one and a hand
+/// edit writes the other, and both are documented as things to change in
+/// the middle of an incident. A deploy holds this `State` from its first
+/// read to its last write, which can be a build's worth of time, and writing
+/// it whole put the operator's `manual` back to `auto` at the end of the
+/// very deploy they were trying to stop the next one of. Called before
+/// every whole-record write a deploy makes: the verified arm's, the
+/// rollback's, and `record`'s. A record that cannot be read leaves `state`
+/// as it is: there is nothing to adopt.
+fn adopt_operator_fields(tree: &Tree, state: &mut State) {
+    if let Ok(on_disk) = State::read(&tree.state_file()) {
+        state.watch = on_disk.watch;
+        state.verify = on_disk.verify;
     }
 }
 
@@ -648,9 +672,10 @@ fn record(
 ///
 /// Kept anyway, because the lock is per tree and taken by `go`, and this guard
 /// is not. Anything writing the record WITHOUT going through `go` still races:
-/// `set_watch` does, and so would any later writer reaching for `State::write`
-/// directly. One read that refuses to overwrite a fresher record is cheap
-/// enough to keep for those.
+/// `set_watch` does, by design, so that `--watch manual` lands during a deploy
+/// rather than waiting an hour for its lock; see [`adopt_operator_fields`] for
+/// the other half of that arrangement. One read that refuses to overwrite a
+/// fresher record is cheap enough to keep for those.
 fn landed_elsewhere(tree: &Tree, head: &str, failing: Option<&str>) -> Option<State> {
     failing?;
     let on_disk = State::read(&tree.state_file()).ok()?;
@@ -866,19 +891,32 @@ fn undo_swap(
 /// the setting that asks for that deploy unattended, once an interval,
 /// forever.
 ///
+/// # Why this does NOT take the deploy lock
+///
+/// `manual` is what somebody sets in the middle of an incident, and a
+/// deploy holds the tree's lock from its fetch through its build, which the
+/// default `build_timeout` allows an hour for. A `--watch manual` refused as
+/// `AlreadyDeploying` for that hour is the opposite of what the setting is
+/// for. So this writes without the lock, and the two things that could go
+/// wrong are handled the other way round: the record is re-read immediately
+/// before the write, so a `failed` or `deployed` the tick has recorded since
+/// the caller's read is kept; and every whole-record write a deploy makes
+/// takes `watch` and `verify` from the disk rather than from its own stale
+/// copy, see `adopt_operator_fields`, so the setting lands whichever of the
+/// two writes last. What is left is a window the width of one read and one
+/// write.
+///
 /// # Errors
 /// [`Error::Config`] if `watch` is `auto` and the target's record names no
-/// released sha. [`Error::Io`] if `deploy.toml` cannot be written - see
-/// [`State::write`]. `state` is left alone when the refusal fires, and
-/// updated in memory whether or not the write succeeds.
-pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Error> {
-    // Under the same lock a deploy takes, and re-read under it. The caller's
-    // `state` was read before the lock, so a tick that recorded a `failed`
-    // sha in between would be written over with the caller's older copy,
-    // and the poll loop would rebuild that sha every interval: the one harm
-    // `failed` exists to stop.
-    let _deploying = lock::hold(tree)?;
-    *state = State::read(&tree.state_file())?;
+/// released sha. [`Error::Io`] or [`Error::Config`] if `deploy.toml` cannot
+/// be read or written - see [`State::read`] and [`State::write`].
+///
+/// Answers the `watch` the record carried before, and the record as it is
+/// after: the read is this function's, so a caller has nothing older to
+/// print from.
+pub fn set_watch(tree: &Tree, watch: Watch) -> Result<(Watch, State), Error> {
+    let mut state = State::read(&tree.state_file())?;
+    let was = state.watch;
 
     if watch == Watch::Auto && state.deployed.is_none() {
         return Err(Error::Config(format!(
@@ -894,7 +932,8 @@ pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Err
     }
 
     state.watch = watch;
-    state.write(&tree.state_file())
+    state.write(&tree.state_file())?;
+    Ok((was, state))
 }
 
 /// The sha `branch` points at in the tree's bare clone, with the one
@@ -1153,6 +1192,7 @@ async fn restore<D: Daemon>(
 
     if state.deployed.as_deref() != Some(to.as_str()) {
         state.deployed = Some(to.clone());
+        adopt_operator_fields(tree, state);
         state.write(&tree.state_file())?;
     }
 
@@ -1396,6 +1436,10 @@ mod tests {
         /// before the rollback. A regular file, because a stale symlink there
         /// is this dog's own leftover and the swap replaces it.
         plant: Option<PathBuf>,
+        /// A record to set `watch = manual` in when the first reload
+        /// arrives, standing in for an operator running `--watch manual`
+        /// while the deploy is past its build and inside its reload.
+        flip_watch: Option<PathBuf>,
         /// How many reloads after the first to refuse, standing in for the
         /// shepherd's own refusal to start a reload while one is in flight.
         /// The first is never refused, because that is the deploy's own and
@@ -1445,6 +1489,7 @@ mod tests {
                 replaces: true,
                 describe_fails_from: None,
                 plant: None,
+                flip_watch: None,
                 refusals: Cell::new(0),
                 refusal_code: RpcErrorCode::Internal,
                 refuse_from_the_first: Cell::new(false),
@@ -1506,6 +1551,15 @@ mod tests {
             shepherd.refusals.set(u32::MAX);
             shepherd.refuse_from_the_first.set(true);
             shepherd
+        }
+
+        /// As [`Self::ready`], but sets `watch = manual` in the record at
+        /// `record` when the reload arrives, as an operator would mid-deploy.
+        fn flipping_watch(record: PathBuf) -> Self {
+            Self {
+                flip_watch: Some(record),
+                ..Self::ready()
+            }
         }
 
         /// As [`Self::never_ready`], but leaves a file in the way at `plant`
@@ -1651,6 +1705,15 @@ mod tests {
                 .collect())
         }
         async fn reload(&self, sheep: &str) -> Result<(), Error> {
+            if let Some(record) = &self.flip_watch
+                && self.attempts.get() == 0
+            {
+                let mut state = State::read(record).expect("the record to flip");
+                state.watch = Watch::Manual;
+                state
+                    .write(record)
+                    .expect("flip watch to manual mid-deploy");
+            }
             self.attempts.set(self.attempts.get() + 1);
             let refusals = self.refusals.get();
             if (self.reloads.get() > 0 || self.refuse_from_the_first.get()) && refusals > 0 {
@@ -2624,6 +2687,151 @@ mod tests {
         );
     }
 
+    /// fails if a `current` an operator repointed at something that is not a
+    /// release is taken as the rollback target. `previous` is the raw text
+    /// of the link, and a rollback onto `<tree>/anything` wrote
+    /// `deployed = "anything"` into the record, which `State::read` then
+    /// refused on every later command of every kind. The record's own release
+    /// is what a rollback returns to instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_current_that_names_no_release_is_not_a_rollback_target() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        commit_on_origin(&fixture, "second.txt");
+        let elsewhere = fixture.tree.root().join("not-a-release");
+        fs::create_dir_all(&elsewhere).expect("a directory that is not a release");
+        swap::point_at(&fixture.tree.current(), &elsewhere).expect("repoint current by hand");
+
+        let outcome = deploy(
+            &Shepherd::never_ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("rolled back onto the recorded release");
+
+        assert!(
+            matches!(&outcome, Outcome::RolledBack { to, .. } if *to == previous),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous))
+        );
+        State::read(&fixture.tree.state_file()).expect("the record is still readable");
+    }
+
+    /// fails if a deploy that LANDS puts back a `watch` the operator changed
+    /// while it ran. The deploy holds its `State` from its first read to
+    /// its last write, and the verified arm's write of it whole put a
+    /// mid-deploy `--watch manual` back to `auto`: the exact deploy the
+    /// operator was trying to make the last one for a while.
+    #[tokio::test(start_paused = true)]
+    async fn a_landed_deploy_keeps_the_watch_the_operator_set_meanwhile() {
+        let mut fixture = fixture_with_previous_release();
+        fixture.state.watch = Watch::Auto;
+        fixture
+            .state
+            .write(&fixture.tree.state_file())
+            .expect("watched");
+        let second = commit_on_origin(&fixture, "second.txt");
+
+        let outcome = deploy(
+            &Shepherd::flipping_watch(fixture.tree.state_file()),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("lands");
+
+        assert!(matches!(outcome, Outcome::Deployed { .. }), "{outcome:?}");
+        let written = State::read(&fixture.tree.state_file()).expect("reads");
+        assert_eq!(
+            written.watch,
+            Watch::Manual,
+            "the operator's setting survives"
+        );
+        assert_eq!(
+            written.deployed.as_deref(),
+            Some(second.as_str()),
+            "and the deploy is recorded by the same write"
+        );
+    }
+
+    /// fails if `record`'s own write, the one a FAILED deploy makes, puts
+    /// back a `watch` the operator changed while it ran. The landed case
+    /// has its own test above; this drives `record` directly.
+    #[test]
+    fn a_failed_deploys_record_write_keeps_the_watch_the_operator_set_meanwhile() {
+        let fixture = fixture_with_previous_release();
+        // The copy a deploy holds from its first read: watched.
+        let mut in_flight = fixture.state.clone();
+        in_flight.watch = Watch::Auto;
+
+        // The operator, mid-deploy.
+        let mut on_disk = fixture.state.clone();
+        on_disk.watch = Watch::Manual;
+        on_disk
+            .write(&fixture.tree.state_file())
+            .expect("--watch manual");
+
+        let failed: Result<Outcome, Error> = Err(Error::Build { status: Some(1) });
+        record(
+            &fixture.tree,
+            &mut in_flight,
+            fixtures::OTHER_SHA,
+            &failed,
+            5,
+        );
+
+        let written = State::read(&fixture.tree.state_file()).expect("reads");
+        assert_eq!(
+            written.watch,
+            Watch::Manual,
+            "the operator's setting survives"
+        );
+        assert_eq!(
+            written.failed.as_deref(),
+            Some(fixtures::OTHER_SHA),
+            "and the deploy's own fact is recorded"
+        );
+    }
+
+    /// fails if the release the record on DISK names can be reclaimed after
+    /// a verified deploy whose record could not be written. Memory names the
+    /// new sha then, disk still names the old one, and the old one is what
+    /// the next run rolls back to.
+    #[test]
+    fn the_release_the_disk_record_names_is_spared_after_a_lost_write() {
+        let mut fixture = fixture_with_previous_release();
+        let old = fixture.state.deployed.clone().expect("a previous release");
+        // Three newer releases, all fresher than `old`, so that with
+        // `keep = 2` the old one is a candidate unless something spares it.
+        let mut newest = String::new();
+        for n in 0..3 {
+            newest = commit_on_origin(&fixture, &format!("release-{n}.txt"));
+            crate::git::fetch(
+                &fixture.tree.git(),
+                fixture.origin.path().to_str().expect("utf-8"),
+                fixtures::TEST_BUDGET,
+            )
+            .expect("fetch");
+            install_release(&fixture, &newest);
+        }
+        // Memory has moved on; disk has not.
+        fixture.state.deployed = Some(newest.clone());
+
+        let landed: Result<Outcome, Error> = Ok(Outcome::Deployed { sha: newest });
+        record(&fixture.tree, &mut fixture.state, "unused", &landed, 2);
+
+        assert!(
+            fixture.tree.release(&old).is_dir(),
+            "the release the disk record names must survive"
+        );
+    }
+
     /// fails if a record that cannot be written after a verified deploy
     /// turns the deploy into a failure. The release is up and serving, so
     /// the outcome is `Deployed`; returning the write's error instead had
@@ -3297,13 +3505,14 @@ mod tests {
     /// unchanged.
     #[tokio::test]
     async fn setting_the_watch_mode_does_not_deploy() {
-        let mut fixture = fixture_with_previous_release();
+        let fixture = fixture_with_previous_release();
         let previous = fixture.state.deployed.clone().expect("a previous release");
         let second = commit_on_origin(&fixture, "second.txt");
 
-        set_watch(&fixture.tree, &mut fixture.state, Watch::Manual).expect("sets");
+        let (was, after) = set_watch(&fixture.tree, Watch::Manual).expect("sets");
 
-        assert_eq!(fixture.state.watch, Watch::Manual);
+        assert_eq!(was, fixture.state.watch, "what the record carried before");
+        assert_eq!(after.watch, Watch::Manual);
         assert_eq!(
             State::read(&fixture.tree.state_file())
                 .expect("deploy.toml was written")
@@ -3318,7 +3527,7 @@ mod tests {
             swap::resolve(&fixture.tree.current()).unwrap(),
             Some(fixture.tree.release(&previous))
         );
-        assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+        assert_eq!(after.deployed.as_deref(), Some(previous.as_str()));
     }
 
     /// fails if a tree the cutover never landed on can be put under the
@@ -3329,23 +3538,22 @@ mod tests {
     /// because it is the direction out.
     #[tokio::test]
     async fn a_tree_the_cutover_never_landed_on_cannot_be_watched() {
-        let mut fixture = fixture_before_any_release();
+        let fixture = fixture_before_any_release();
 
-        let err = set_watch(&fixture.tree, &mut fixture.state, Watch::Auto).expect_err("refuses");
+        let err = set_watch(&fixture.tree, Watch::Auto).expect_err("refuses");
 
         let shown = err.to_string();
         assert!(shown.contains("never cut over"), "{shown}");
         assert!(shown.contains("shep-deploy setup web"), "{shown}");
-        assert_eq!(fixture.state.watch, Watch::Manual, "unchanged in memory");
         assert_eq!(
             State::read(&fixture.tree.state_file())
                 .expect("deploy.toml still reads")
                 .watch,
             Watch::Manual,
-            "and unchanged on disk"
+            "unchanged on disk"
         );
 
-        set_watch(&fixture.tree, &mut fixture.state, Watch::Manual).expect("manual is allowed");
+        set_watch(&fixture.tree, Watch::Manual).expect("manual is allowed");
     }
 
     /// fails if a prune failure fails the deploy that triggered it. The

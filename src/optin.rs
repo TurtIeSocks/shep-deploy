@@ -46,7 +46,6 @@ use std::time::Duration;
 
 use shep_client::shep_core::config::AppConfig;
 use shep_client::shep_core::protocol::ProcessInfo;
-use shep_client::shep_core::status::ProcStatus;
 use tokio::time::{Instant, sleep};
 
 use crate::build;
@@ -153,18 +152,46 @@ pub async fn prepare<D: Daemon>(
         && crate::state::is_sha(sha)
         && release.is_dir()
     {
-        let mut recorded = State::read(&tree.state_file()).ok();
-        if let Some(state) = recorded.as_mut()
-            && state.deployed.is_none()
-        {
-            state.deployed = Some(sha.to_owned());
-            state.write(&tree.state_file())?;
-        }
+        // The tree exists in this case, so the hold litters nothing, and the
+        // repair below writes the record under it.
+        let _deploying = lock::hold(&tree)?;
+        let next = format!(
+            "Deploy it with `shep deploy {sheep}`, or change how it is watched with `shep \
+             deploy {sheep} --watch auto|manual`."
+        );
+        let record = match State::read(&tree.state_file()) {
+            Ok(mut state @ State { deployed: None, .. }) => {
+                state.deployed = Some(sha.to_owned());
+                state.write(&tree.state_file())?;
+                format!(
+                    "Its record named no deployed release and has been brought up to date \
+                     with that. {next}"
+                )
+            }
+            Ok(state) if state.deployed.as_deref() == Some(sha) => {
+                format!("Its record agrees. {next}")
+            }
+            Ok(State {
+                deployed: Some(other),
+                ..
+            }) => format!(
+                "Its record names {} instead, which is what a deploy whose record could not \
+                 be written leaves; the next deploy corrects it. {next}",
+                &other[..7.min(other.len())]
+            ),
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                "Its record is missing, and this dog cannot rebuild the origin fields removal \
+                 needs: write a deploy.toml by hand from another target's as a model, with \
+                 `deployed` set to that sha, before deploying."
+                    .to_owned()
+            }
+            Err(_) => "Its record cannot be read: repair it before deploying, and do NOT \
+                       remove the tree, the service runs from inside it."
+                .to_owned(),
+        };
         return Err(Error::Config(format!(
             "{sheep} is already a deploy target: the shepherd runs it from {}, which names {}. \
-             Its record has been brought up to date with that. Deploy it with `shep deploy \
-             {sheep}`, or change how it is watched with `shep deploy {sheep} --watch \
-             auto|manual`.",
+             {record}",
             tree.current().display(),
             &sha[..7]
         )));
@@ -262,12 +289,24 @@ pub async fn prepare<D: Daemon>(
         origin_script: Some(previous_config.script.clone()),
         checkout,
     };
+    // Checked here, before the fetch, the worktree and the build, rather
+    // than found out by the record write at the very end. Neither value was
+    // typed by the operator: `remote` is what `git remote get-url origin`
+    // answered in the checkout and `checkout` is the cwd shep registered.
+    state.validate(Path::new("deploy.toml")).map_err(|err| {
+        Error::Config(format!(
+            "{sheep} cannot be recorded as it is registered ({err}). `remote` is the \
+                 checkout's `origin`, `branch` is the checkout's HEAD, and `checkout` is the cwd \
+                 shep has for {sheep}; fix whichever is named and run setup again"
+        ))
+    })?;
 
     // Same hold a deploy takes, for the same reason: everything below writes
     // to this tree, and a poll tick can be doing the same at the same moment.
-    // First, before the tree has a directory: `hold` makes the tree's root
-    // itself, so the lock file is the first thing written into it. Carried
-    // out in `Prepared` so the cutover runs under it too.
+    // After every refusal that needs no tree, so a `setup` that fails on a
+    // detached HEAD or a missing `origin` leaves nothing behind: `hold` makes
+    // the tree's root itself. Carried out in `Prepared` so the cutover runs
+    // under it too.
     let hold = lock::hold(&tree)?;
 
     std::fs::create_dir_all(tree.releases()).map_err(Error::at(tree.releases()))?;
@@ -513,16 +552,15 @@ enum CutOver {
     Failed(Error),
 }
 
-/// Whether a newcomer's row says it is dead: a pid that is no longer alive,
-/// or, for a row with no pid, a status only a dead process has.
+/// Whether a newcomer's row says it is dead.
+///
+/// The same answer with or without a pid: a row the shepherd has accepted
+/// and not yet spawned has no pid and says `Starting`, which [`is_alive`]
+/// accepts, and every other status without a pid is a process on its way
+/// out or already gone. One predicate rather than two hand-kept complements
+/// of `ProcStatus`, so a status added upstream is judged one way.
 fn died(info: &ProcessInfo) -> bool {
-    match info.pid {
-        Some(_) => !is_alive(info),
-        None => matches!(
-            info.status,
-            ProcStatus::Errored | ProcStatus::WaitingRestart
-        ),
-    }
+    !is_alive(info)
 }
 
 /// What a first cutover most often runs into, said once.
@@ -1707,15 +1745,107 @@ mod tests {
         );
     }
 
-    /// fails if a scaled sheep loses only one of the instances it was
-    /// running. `Start` adds one newcomer per configured instance beside
-    /// every existing one, so a cutover that deleted a single id would
-    /// leave the rest serving the pre-adoption checkout indefinitely.
+    /// fails if a sheep running two instances loses only one of them at
+    /// the cutover. Every original is deleted by id once the newcomer is
+    /// verified, so a cutover that deleted a single id would leave the rest
+    /// serving the pre-adoption checkout indefinitely. The Flockfile here
+    /// asks for one instance; the scaled cutover has its own tests.
     #[tokio::test(start_paused = true)]
     async fn every_replaced_instance_is_deleted() {
         let (daemon, prepared, _dirs) = cutover_fixture_with_instances(&[7, 8]).await;
         cut_over(&daemon, prepared).await.expect("cuts over");
         assert_eq!(daemon.deleted(), vec![7, 8]);
+    }
+
+    /// fails if a pidless newcomer is judged by anything but its status.
+    /// A row the shepherd has accepted and not yet spawned has no pid and
+    /// says `Starting`; one that died hard has no pid and says `Errored`.
+    /// The first is waited for and the second ends the cutover.
+    #[test]
+    fn a_pidless_newcomer_is_dead_only_when_its_status_says_so() {
+        let row = |status| ProcessInfo::builder(99, "bpm", status).build();
+        for alive in [ProcStatus::Starting, ProcStatus::Online] {
+            assert!(
+                !died(&row(alive)),
+                "{alive:?} without a pid is not yet a verdict"
+            );
+        }
+        for dead in [
+            ProcStatus::Errored,
+            ProcStatus::WaitingRestart,
+            ProcStatus::Stopped,
+            ProcStatus::Stopping,
+        ] {
+            assert!(died(&row(dead)), "{dead:?} without a pid is dead");
+        }
+        let with_pid = ProcessInfo::builder(99, "bpm", ProcStatus::Stopping)
+            .pid(Some(4242))
+            .build();
+        assert!(
+            died(&with_pid),
+            "with a pid the status decides the same way"
+        );
+    }
+
+    /// fails if a sheep the shepherd already runs from `current` is treated
+    /// as one to take over. That is what a cutover that landed and could not
+    /// write its record leaves, and the old refusal told the operator to
+    /// remove the tree the service runs from. The record is repaired from
+    /// what `current` names and the sheep is refused as the target it is.
+    #[tokio::test]
+    async fn a_sheep_already_running_from_current_has_its_record_repaired() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "bpm");
+        let release = tree.release(fixtures::SHA);
+        std::fs::create_dir_all(&release).expect("a release directory");
+        swap::point_at(&tree.current(), &release).expect("current");
+        write_target(home.path(), "bpm", Watch::Manual, None);
+        let current = tree.current();
+        let entries = [("bpm", current.as_path())];
+        let daemon = RollOf(&entries);
+
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
+            .await
+            .expect_err("already a target");
+
+        let shown = err.to_string();
+        assert!(shown.contains("already a deploy target"), "{shown}");
+        assert!(shown.contains("brought up to date"), "{shown}");
+        assert!(
+            !shown.contains("Remove"),
+            "must never say to remove the tree: {shown}"
+        );
+        assert_eq!(
+            State::read(&tree.state_file())
+                .expect("reads")
+                .deployed
+                .as_deref(),
+            Some(fixtures::SHA),
+            "the record now names what current names"
+        );
+    }
+
+    /// fails if the same sheep with NO record at all is told anything but
+    /// that the record is missing. Nothing can rebuild the origin fields, so
+    /// the operator writes the file; the tree still must not be removed.
+    #[tokio::test]
+    async fn a_sheep_running_from_current_with_no_record_is_told_to_write_one() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let tree = Tree::for_sheep(home.path(), "bpm");
+        let release = tree.release(fixtures::SHA);
+        std::fs::create_dir_all(&release).expect("a release directory");
+        swap::point_at(&tree.current(), &release).expect("current");
+        let current = tree.current();
+        let entries = [("bpm", current.as_path())];
+        let daemon = RollOf(&entries);
+
+        let err = prepare(&daemon, home.path(), "bpm", &fixtures::dog_config())
+            .await
+            .expect_err("already a target");
+
+        let shown = err.to_string();
+        assert!(shown.contains("record is missing"), "{shown}");
+        assert!(!shown.contains("Remove"), "{shown}");
     }
 
     /// fails if a scaled sheep's cutover settles for fewer newcomers than

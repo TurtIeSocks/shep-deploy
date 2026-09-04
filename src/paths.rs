@@ -31,7 +31,8 @@ pub struct Targets {
     /// The targets, sorted by name.
     pub named: Vec<String>,
     /// Directories holding a `deploy.toml` whose name cannot be a sheep's:
-    /// not valid UTF-8, or carrying a control character. Each is a target
+    /// not valid UTF-8, or carrying a character that would rewrite a log
+    /// line (see `shared::forges_a_line`). Each is a target
     /// the dog cannot poll or restore, reported by every caller as its own
     /// row rather than skipped, and rather than stopping the listing for the
     /// targets that can be named.
@@ -76,6 +77,7 @@ pub fn targets(shep_home: &Path) -> Result<Targets, Error> {
         }
     }
     found.named.sort();
+    found.unnamed.sort();
     Ok(found)
 }
 
@@ -103,20 +105,25 @@ pub struct Tree {
 /// line. The poll loop's names come from directory entries under
 /// `$SHEP_HOME/deploy` that this crate created, so they are already inside.
 ///
-/// The test is that the string is exactly one ordinary path component with no
-/// control character in it: that rejects the empty string, `.`, `..`, anything
-/// absolute, anything with a separator in it and anything that could forge a
-/// log line, without a charset rule that would have to guess at what an
-/// operator may call their app.
+/// The test is that the string is exactly one ordinary path component with
+/// nothing in it that would rewrite a log line (`shared::forges_a_line`'s
+/// set): that rejects the empty string, `.`, `..`, anything absolute,
+/// anything with a separator in it and anything invisible or bidirectional,
+/// without a charset rule that would have to guess at what an operator may
+/// call their app.
 #[must_use]
 pub fn is_sheep_name(sheep: &str) -> bool {
     let mut components = Path::new(sheep).components();
     let one_ordinary_component =
         matches!(components.next(), Some(Component::Normal(only)) if only == sheep);
 
-    // No control character either. The name is interpolated into every log
-    // line about the target, and a newline in it forges a second line.
-    one_ordinary_component && components.next().is_none() && !sheep.chars().any(char::is_control)
+    // Nothing that forges a line either. The name is interpolated into every
+    // log line about the target, and a newline or a bidi override in it
+    // rewrites the line around it; the set is `shared::forges_a_line`'s, the
+    // same one messages replace.
+    one_ordinary_component
+        && components.next().is_none()
+        && !sheep.chars().any(crate::shared::forges_a_line)
 }
 
 impl Tree {

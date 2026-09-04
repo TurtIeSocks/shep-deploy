@@ -199,7 +199,9 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
     for dir in found.unnamed {
         results.push(Restored::Unlisted {
             why: "its directory's name cannot be a sheep's, so it was never polled and is not \
-                  restored; rename the directory and run the restore by hand"
+                  restored. A sheep may still be running from inside it: `shep flock` lists \
+                  every sheep and `shep describe <sheep>` its cwd. Rename the directory once \
+                  none does, then restore by hand"
                 .to_owned(),
             dir,
         });
@@ -430,12 +432,10 @@ pub fn report(results: &[Restored]) -> String {
             Restored::Failed { sheep, why } => {
                 format!("{sheep} could not be restored ({why}); nothing was changed by this dog\n")
             }
-            Restored::Unlisted { dir, why } => {
-                format!(
-                    "{} could not be listed ({why}); nothing under it was changed by this dog\n",
-                    dir.display()
-                )
-            }
+            Restored::Unlisted { dir, why } => format!(
+                "{} could not be listed ({why}); nothing under it was changed by this dog\n",
+                crate::shared::printable(dir.display())
+            ),
             // NOT the same wording as `Failed`: this sheep was stopped and
             // a fresh instance started to get its own previous config back,
             // so nothing mid-flight survived even though the config an

@@ -583,17 +583,15 @@ fn copy_artifact(
     // opening it for writing then truncates and rewrites the far file at the
     // dog's uid. `remove_file` takes the link away without touching what it
     // pointed at, and `create_new` refuses to open anything that appeared in
-    // between, symlink or otherwise. That also covers the `O_NOFOLLOW` case
-    // below on its own terms: a symlink here is gone before the open.
+    // between.
     //
     // Only a regular file is unlinked. A directory, a symlink or anything
     // else at the destination is not an artifact the build left, and
     // unlinking it would take the release's own `target -> cache` link with
-    // it when `artifacts` names `target` itself: `remove_file` removes a
-    // link where the old `O_NOFOLLOW` open refused one. The window between
-    // this look, the unlink and the open is the one `docs/specs/deferred.md`
-    // records; what a job swapping a parent for a link inside it can now
-    // cost is a file unlinked as well as one written.
+    // it when `artifacts` names `target` itself, so those are refused. The
+    // window between this look, the unlink and the open is the one
+    // `docs/specs/deferred.md` records; what a job swapping a parent for a
+    // link inside it can cost is a file unlinked as well as one written.
     match fs::symlink_metadata(&to) {
         Ok(there) if !there.file_type().is_file() => {
             return Err(Error::Config(format!(
@@ -602,7 +600,13 @@ fn copy_artifact(
                 printable(artifact.display())
             )));
         }
-        Ok(_) => fs::remove_file(&to).map_err(Error::at(&to))?,
+        Ok(_) => match fs::remove_file(&to) {
+            Ok(()) => {}
+            // Gone between the look and the unlink: the window the comment
+            // above names, and nothing to remove is not a failure.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(Error::at(&to)(err)),
+        },
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
             return Err(Error::Io {

@@ -69,9 +69,11 @@ rather than ignored and silently building nothing.
 2. `git worktree add` the new sha, sharing the object store.
 3. Symlink the shared files in: whatever git ignores and `.shepignore` does
    not. A `.shepignore` line is a bare name, matched at any depth, or a path
-   with a `/` in it, anchored to the checkout. A leading `/` anchors too and
-   a trailing `/` is dropped, as in `.gitignore`; a glob, a `!` negation or a
-   `..` is refused by name rather than matched against nothing.
+   with a `/` in it, anchored to the checkout. A leading `/` anchors too, a
+   leading `./` and a trailing `/` are dropped, and `\!name` names a file
+   that begins with `!`, as in `.gitignore`. A glob, a bare `!` negation, any
+   other backslash escape or a `..` is refused by name rather than matched
+   against nothing.
 4. Run the build, as the app's `user` if it sets one.
 5. `rename(2)` `current` onto the new release.
 6. `Reload` the sheep.

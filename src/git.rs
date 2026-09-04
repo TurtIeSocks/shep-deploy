@@ -186,6 +186,15 @@ pub fn fetch(git_dir: &Path, remote: &str, budget: Duration) -> Result<(), Error
     run_git_within(
         git_dir,
         &[
+            // `ext::<command>` is a git transport that runs the command. git
+            // refuses it by default, and this pins that whatever the host's
+            // own git config says (a `GIT_ALLOW_PROTOCOL` in this process's
+            // environment is consulted ahead of config and is the
+            // operator's to set), so a `remote` can only ever be a place to
+            // fetch from. Measured 2026-09-03: refused with and without
+            // this on a stock git; the line is for the host that is not.
+            "-c",
+            "protocol.ext.allow=never",
             "fetch",
             "--prune",
             "--",
@@ -463,6 +472,29 @@ mod tests {
             !marker.exists(),
             "the remote must never be run as a command"
         );
+    }
+
+    /// fails if the `ext::` transport can run a command. It is refused by
+    /// a stock git already; this pins the refusal against a host whose
+    /// config allows it. The marker file is the assertion, as above.
+    #[test]
+    fn the_ext_transport_never_runs_a_command() {
+        let git_dir = bare_git_dir();
+        // The host that allows it, which is what the `-c` is for: without
+        // this the test passes on git's own default and pins nothing.
+        fixtures::run_git(git_dir.path(), &["config", "protocol.ext.allow", "always"]);
+        let marker = git_dir.path().join("ext-ran");
+        let remote = format!("ext::sh -c 'touch {}'", marker.display());
+
+        let err = fetch(git_dir.path(), &remote, fixtures::TEST_BUDGET).expect_err("refused");
+
+        // The transport named in git's own refusal is the positive signal;
+        // a missing marker alone is also what a mis-parsed command gives.
+        assert!(
+            matches!(&err, Error::Git { stderr, .. } if stderr.contains("ext")),
+            "{err}"
+        );
+        assert!(!marker.exists(), "the transport must never be run");
     }
 
     /// fails if a worktree stops being added detached.

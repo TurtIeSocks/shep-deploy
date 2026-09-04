@@ -219,8 +219,31 @@ pub(crate) fn kill_group(pid: u32) {
 pub(crate) fn printable(text: impl std::fmt::Display) -> String {
     text.to_string()
         .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if forges_a_line(c) { '?' } else { c })
         .collect()
+}
+
+/// Whether `c` can change how a log line is read: a control character, or
+/// one of the Unicode format and separator characters that reverse, split
+/// or hide text (the bidi marks, overrides and isolates, the zero-width and
+/// soft-hyphen family, the line and paragraph separators, the byte order
+/// mark, and the tag block that carries invisible text). None of them
+/// belongs in a file name or a TOML key an operator meant. Shared with
+/// `paths::is_sheep_name` and `State::validate`, so what is refused in a
+/// name is the same set that is replaced in a message.
+pub(crate) fn forges_a_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
 }
 
 /// Kills a timed-out child and everything it spawned, then reaps it.
@@ -414,7 +437,10 @@ pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
         let Some((status, path)) = entry.split_at_checked(3) else {
             continue;
         };
-        if status[..2].contains(['R', 'C']) {
+        if status.as_bytes()[..2]
+            .iter()
+            .any(|b| matches!(b, b'R' | b'C'))
+        {
             fields.next();
         }
         if status == "!! " {
@@ -448,18 +474,19 @@ pub enum Pattern {
 ///
 /// Every spelling `.gitignore` allows and this file does not is refused with
 /// [`Error::Config`] naming the pattern, never accepted and silently matched
-/// against nothing: a glob (`*`, `?`, `[`), a negation (`!name`), and a `..`
-/// component. `.shepignore`'s syntax is narrower than `.gitignore`'s, see
+/// against nothing: a glob (`*`, `?`, `[`), a negation (`!name`), any
+/// backslash escape other than `\!`, and a `..` component. `.shepignore`'s syntax is narrower than `.gitignore`'s, see
 /// [`to_link`] for what it does support, and an operator who writes `*.log`
 /// believing otherwise deserves a failure they see immediately rather than
 /// an artifact this subtraction was built to keep out quietly staying shared
 /// forever because the glob never matched anything.
 ///
-/// Two spellings `.gitignore` allows ARE honoured, because each used to be
+/// Three spellings `.gitignore` allows ARE honoured, because each used to be
 /// accepted and then matched nothing: a leading `/` anchors the pattern to
-/// the checkout root, and a trailing `/` is not part of the name. Before
-/// 2026-09-03 `/dist` was read as a two-component path that no relative
-/// entry could ever start with, so the build output it named stayed shared.
+/// the checkout root, a leading `./` is dropped, and a trailing `/` is not
+/// part of the name. Before 2026-09-03 `/dist` was read as a two-component
+/// path that no relative entry could ever start with, so the build output it
+/// named stayed shared. `\!name` names a file that really begins with `!`.
 ///
 /// # Errors
 /// [`Error::Io`], naming `checkout/.shepignore`, if the file exists but
@@ -484,8 +511,9 @@ pub fn shepignore_patterns(checkout: &Path) -> Result<Vec<Pattern>, Error> {
 /// One trimmed, non-blank, non-comment `.shepignore` line as a [`Pattern`].
 ///
 /// # Errors
-/// [`Error::Config`] naming the line, for a glob, a negation, a `..`
-/// component, or a line that is nothing but slashes.
+/// [`Error::Config`] naming the line, for a glob, a negation, a backslash
+/// other than the leading `\!` escape, a `..` component, or a line that is
+/// nothing but slashes and dots.
 fn parse_pattern(line: &str) -> Result<Pattern, Error> {
     let refuse = |why: &str| {
         Error::Config(format!(
@@ -517,18 +545,36 @@ fn parse_pattern(line: &str) -> Result<Pattern, Error> {
         }
         None => line,
     };
+    // Every other backslash is a `.gitignore` escape this file does not
+    // read, and a pattern carrying one would be kept verbatim and match
+    // nothing: `\#name` never names `#name`.
+    if line.contains('\\') {
+        return Err(refuse(
+            "carries a backslash; the only escape this file reads is a leading `\\!`",
+        ));
+    }
 
     let anchored_by_slash = line.starts_with('/');
-    let body = line
-        .trim_start_matches("./")
-        .trim_start_matches('/')
-        .trim_end_matches('/');
-    // A lone `.` (or `./.`) is a name no path component ever is, so it would
-    // match nothing in silence, which is the failure this parser refuses.
+    // Leading `/` and `./` are stripped until neither is left: one pass
+    // each left `.//x` as `/x`, which no relative entry starts with. What
+    // remains is either empty, or a body whose first component is a name.
+    let mut body = line;
+    loop {
+        let stripped = body.trim_start_matches('/').trim_start_matches("./");
+        if stripped == body {
+            break;
+        }
+        body = stripped;
+    }
+    let body = body.trim_end_matches('/');
+    // Nothing left, or a lone `.`, is a name no path component ever has.
+    // `Path` keeps only a leading `.` as a component and drops interior ones,
+    // so this catches `.` and `/./` while `x/./y` is left alone: it matches
+    // as `x/y`, the same way on both sides of the comparison.
     if body.is_empty()
         || Path::new(body)
             .components()
-            .all(|component| component == Component::CurDir)
+            .any(|component| component == Component::CurDir)
     {
         return Err(refuse("names nothing"));
     }
@@ -1032,13 +1078,40 @@ mod tests {
             parse_pattern("\\!weird").expect("the escape is honoured"),
             Pattern::Anywhere("!weird".to_owned())
         );
-        for pattern in [".", "./.", "./"] {
+        for pattern in [".", "./.", "./", ".//", "/./"] {
             let err = parse_pattern(pattern).expect_err(pattern);
             assert!(
                 err.to_string().contains("names nothing"),
                 "{pattern}: {err}"
             );
         }
+        // And the spellings that mean something still parse to it. `/./x`
+        // used to come out as `Anchored("./x")`, which no entry starts with.
+        assert_eq!(
+            parse_pattern("./dist").expect("a leading ./ is dropped"),
+            Pattern::Anywhere("dist".to_owned())
+        );
+        assert_eq!(
+            parse_pattern("/./x").expect("a leading /./ is an anchor"),
+            Pattern::Anchored(PathBuf::from("x"))
+        );
+        assert_eq!(
+            parse_pattern(".//x").expect("stripped to a fixed point"),
+            Pattern::Anywhere("x".to_owned())
+        );
+        let err = parse_pattern("\\#name").expect_err("an escape this file does not read");
+        assert!(err.to_string().contains("backslash"), "{err}");
+    }
+
+    /// fails if `printable` lets a character through that can reverse,
+    /// split or hide a log line. Control characters are the obvious half;
+    /// the bidi override and the zero-width space are format characters
+    /// `is_control` does not cover.
+    #[test]
+    fn printable_replaces_everything_that_can_forge_a_line() {
+        let shown = printable("a\u{1b}[2Jb\u{202e}c\u{200b}d\ne\u{061c}f\u{e0041}g");
+        assert_eq!(shown, "a?[2Jb?c?d?e?f?g");
+        assert_eq!(printable("plain/name.txt"), "plain/name.txt");
     }
 
     /// fails if a rename in the operator's checkout is read as an ignored

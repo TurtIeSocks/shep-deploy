@@ -571,10 +571,10 @@ async fn on_remove() -> ExitCode {
 /// Sets `sheep`'s watch mode and returns, without deploying.
 ///
 /// # Errors
-/// [`Error::Config`] if `mode` is neither `auto` nor `manual`, or if `auto`
-/// was asked for on a tree the cutover never landed on - see
-/// [`deploy::set_watch`]. [`Error::Io`] if `deploy.toml` cannot be read or
-/// written.
+/// [`Error::Config`] if `mode` is neither `auto` nor `manual`, if `auto` was
+/// asked for on a tree the cutover never landed on, or if `deploy.toml` does
+/// not parse or fails validation - see [`deploy::set_watch`]. [`Error::Io`]
+/// if it cannot be read or written.
 fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
     let watch = match mode {
         "auto" => Watch::Auto,
@@ -587,10 +587,10 @@ fn set_watch(sheep: &str, mode: &str) -> Result<u8, Error> {
     };
 
     let tree = Tree::for_sheep(&shep_home()?, sheep);
-    let mut state = State::read(&tree.state_file())?;
-    let was = state.watch;
-
-    deploy::set_watch(&tree, &mut state, watch)?;
+    // Both the record before and the record after come back from the write:
+    // `set_watch` reads immediately before writing, and a read made here
+    // would be the older copy the "was already" line must not be true of.
+    let (was, state) = deploy::set_watch(&tree, watch)?;
 
     if was == watch {
         println!("{sheep} was already watch = {}", named(watch));

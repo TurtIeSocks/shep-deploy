@@ -12,6 +12,8 @@ use std::time::Duration;
 use shep_client::shep_core::protocol::{RpcErrorCode, SmitError};
 use shep_client::{ConnectError, RequestError};
 
+use crate::shared::printable;
+
 /// Anything that can go wrong in one deploy.
 ///
 /// Deliberately `#[derive(Debug)]` rather than a hand-written impl: nothing
@@ -440,14 +442,27 @@ impl fmt::Display for Error {
                  run `shep-deploy setup {sheep}`.",
                 tree.display()
             ),
-            Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            // Through `printable`, because a path here can be one the deployed
+            // repository chose (an artifact's), and git's stderr quotes ref
+            // names the repository chose too.
+            Self::Io { path, source } => {
+                write!(f, "{}: {source}", printable(path.display()))
+            }
             Self::Git {
                 command,
                 status,
                 stderr,
             } => match status {
-                Some(code) => write!(f, "`{command}` exited with status {code}: {stderr}"),
-                None => write!(f, "`{command}` was killed by a signal: {stderr}"),
+                Some(code) => write!(
+                    f,
+                    "`{command}` exited with status {code}: {}",
+                    printable(stderr)
+                ),
+                None => write!(
+                    f,
+                    "`{command}` was killed by a signal: {}",
+                    printable(stderr)
+                ),
             },
             Self::Raced {
                 sheep,
@@ -666,6 +681,24 @@ mod tests {
             source: std::io::Error::other("permission denied"),
         };
         assert!(err.to_string().contains("/srv/x/releases/abc/dist"));
+    }
+
+    /// fails if a path or a git message reaches the log with a character
+    /// that would rewrite the line. An artifact's path is the repository's
+    /// choice, and git quotes ref names, which are too.
+    #[test]
+    fn a_repository_chosen_string_cannot_forge_a_log_line() {
+        let io = Error::Io {
+            path: PathBuf::from("/srv/x/a\nb"),
+            source: std::io::Error::other("denied"),
+        };
+        assert!(io.to_string().contains("a?b"), "{io}");
+        let git = Error::Git {
+            command: "git fetch".to_owned(),
+            status: Some(128),
+            stderr: "fatal: bad ref a\u{202e}b".to_owned(),
+        };
+        assert!(git.to_string().contains("a?b"), "{git}");
     }
 
     /// fails if a git failure hides stderr. git's own message is the only

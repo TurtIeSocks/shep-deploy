@@ -70,6 +70,11 @@ pub enum Standing {
     /// appeared in no row of the one command meant to say where everything
     /// stands.
     Orphaned,
+    /// A deploy tree whose directory name cannot be a sheep's.
+    ///
+    /// Not [`Self::Unreadable`]: the record reads fine, the name is the
+    /// problem, and the way out is a rename rather than a repair.
+    Unnamed,
     /// A deploy tree whose record cannot be read, and what reading it said.
     ///
     /// Its own standing rather than a fall-through, because the fall-through
@@ -185,6 +190,7 @@ impl Standing {
             Self::Eligible => "eligible",
             Self::NotEligible(_) => "not eligible",
             Self::Orphaned => "orphaned",
+            Self::Unnamed => "unnamed",
             Self::Unreadable(_) => "unreadable",
         }
     }
@@ -221,6 +227,11 @@ impl Standing {
             Self::Orphaned => "has a deploy tree, and the shepherd has no sheep by that name. \
                                Re-register the app from its Flockfile with `cwd` set to the \
                                tree's `current`, or remove the tree if the app is gone"
+                .to_owned(),
+            Self::Unnamed => "has a deploy tree whose directory name cannot be a sheep's, so \
+                              nothing polls or restores it. `shep flock` lists every sheep and \
+                              `shep describe <sheep>` its cwd: check none runs from inside it, \
+                              then rename the directory"
                 .to_owned(),
             // Says what to do and, more to the point, what NOT to do: the
             // one wrong move here is treating it as a sheep with no tree.
@@ -296,16 +307,12 @@ fn rows(
             .filter(|name| !apps.contains_key(*name))
             .map(|name| (name.clone(), Standing::Orphaned)),
     );
-    rows.extend(targets.unnamed.iter().map(|dir| {
-        (
-            dir.display().to_string(),
-            Standing::Unreadable(
-                "its directory's name cannot be a sheep's, so nothing polls or restores it; \
-                 rename the directory"
-                    .to_owned(),
-            ),
-        )
-    }));
+    rows.extend(
+        targets
+            .unnamed
+            .iter()
+            .map(|dir| (crate::shared::printable(dir.display()), Standing::Unnamed)),
+    );
     rows
 }
 
@@ -372,6 +379,30 @@ mod tests {
         );
         let shown = render(&rows);
         assert!(shown.contains("orphaned"), "{shown}");
+    }
+
+    /// fails if a deploy tree whose directory name cannot be a sheep's is
+    /// missing from the survey, or is printed with the character that made
+    /// it unnameable. Its standing is its own: the record reads fine, the
+    /// name is the problem, and the way out is a rename.
+    #[test]
+    fn a_tree_whose_name_cannot_be_a_sheeps_is_an_unnamed_row() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("deploy").join("bad\nname");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("deploy.toml"), "").expect("record");
+        let targets = paths::targets(home.path()).expect("lists");
+        assert_eq!(targets.unnamed, vec![dir]);
+
+        let rows = rows(home.path(), &std::collections::BTreeMap::new(), &targets);
+        let shown = render(&rows);
+
+        assert!(shown.contains("unnamed"), "{shown}");
+        assert!(shown.contains("rename the directory"), "{shown}");
+        assert!(
+            !shown.contains("bad\nname"),
+            "the name is printed with its newline replaced: {shown:?}"
+        );
     }
 
     /// An `AppConfig` with just the two fields this module reads.

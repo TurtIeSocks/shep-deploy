@@ -108,14 +108,20 @@ async fn tick<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Ti
     // and nothing restores it, and the operator has to be the one to rename
     // it.
     for dir in found.unnamed {
-        let shown = dir.display().to_string();
+        // The key is the path's `Debug` form: escaped, so it prints as one
+        // line, and exact, so two such directories never share a mute entry
+        // (`display` is lossy and folds distinct non-UTF-8 names together).
+        // `report` puts the key at the front of the line, so the message
+        // does not name the directory again.
         results.push((
-            shown.clone(),
-            Err(Error::Config(format!(
-                "{shown} holds a deploy.toml, and its name cannot be a sheep's (not valid \
-                 UTF-8, or carrying a control character), so it is neither polled nor \
-                 restored. Rename or remove the directory"
-            ))),
+            format!("{dir:?}"),
+            Err(Error::Config(
+                "holds a deploy.toml, and its name cannot be a sheep's (not valid UTF-8, or \
+                 carrying a character that would rewrite a log line), so it is neither polled \
+                 nor restored. `shep flock` lists every sheep and `shep describe <sheep>` its \
+                 cwd: check none runs from inside it, then rename the directory"
+                    .to_owned(),
+            )),
         ));
     }
     for name in found.named {
@@ -252,6 +258,10 @@ impl Said {
 /// land, which is why it does not belong in the log an operator reads to
 /// see what shipped.
 fn report(sheep: &str, outcome: &Result<Outcome, Error>) -> Option<Said> {
+    // Every key is printed as the line's label, and one kind of key is a
+    // directory name that exists precisely because it carries something a
+    // log line cannot.
+    let sheep = &crate::shared::printable(sheep);
     match outcome {
         Ok(Outcome::UpToDate) => None,
         Ok(Outcome::Deployed { sha }) => Some(Said::Note(format!("{sheep} deployed {sha}"))),
@@ -451,6 +461,33 @@ mod tests {
     use crate::fixtures;
 
     use super::*;
+
+    /// fails if a target the dog cannot name is skipped, keyed by a lossy
+    /// name, or printed with the character that made it unnameable. The
+    /// key is the path's `Debug` form so two such directories never share a
+    /// mute entry; the line an operator reads has the newline replaced.
+    #[tokio::test]
+    async fn an_unnameable_target_is_a_row_that_cannot_forge_a_line() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("deploy").join("bad\nname");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("deploy.toml"), "").expect("record");
+
+        let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
+            .await
+            .results;
+
+        assert_eq!(results.len(), 1, "{results:?}");
+        let (key, outcome) = &results[0];
+        assert_eq!(key, &format!("{dir:?}"));
+        let said = report(key, outcome).expect("a complaint");
+        assert!(!said.text().contains('\n'), "{:?}", said.text());
+        assert!(
+            said.text().contains("rename the directory"),
+            "{}",
+            said.text()
+        );
+    }
 
     /// fails if a panic inside a deploy stops being caught. The loop's one
     /// promise is that a target's failure does not stop the others, and a

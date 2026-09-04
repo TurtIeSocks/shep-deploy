@@ -149,11 +149,12 @@ impl State {
     /// # Errors
     /// [`Error::Config`], naming `path` and the field, for: an empty
     /// `remote`, `branch` or `checkout`; a `remote` or `branch` beginning
-    /// with `-` or carrying a control character; a relative `checkout`; a
+    /// with `-` or carrying a character that would rewrite a log line; a
+    /// relative `checkout`; a
     /// `deployed` or `failed` that is not a full commit sha; `deployed` and
     /// `failed` naming the same sha; or exactly one of `origin_cwd` and
     /// `origin_script` set.
-    fn validate(&self, path: &Path) -> Result<(), Error> {
+    pub(crate) fn validate(&self, path: &Path) -> Result<(), Error> {
         let refuse =
             |field: &str, why: &str| Error::Config(format!("{}: `{field}` {why}", path.display()));
 
@@ -167,8 +168,11 @@ impl State {
                     "begins with `-`, which git would read as an option rather than a name",
                 ));
             }
-            if value.chars().any(char::is_control) {
-                return Err(refuse(field, "carries a control character"));
+            if value.chars().any(crate::shared::forges_a_line) {
+                return Err(refuse(
+                    field,
+                    "carries a control or invisible character that would rewrite a log line",
+                ));
             }
         }
 
@@ -220,7 +224,7 @@ impl State {
 
     /// Serialise to TOML and write to `path` atomically and durably.
     ///
-    /// The write lands at `<path>.tmp` in the same directory first, is
+    /// The write lands at `<path>.<pid>.tmp` in the same directory first, is
     /// flushed to disk, then `rename(2)`d over `path`, and the directory is
     /// flushed after that. `rename(2)` within one directory is a single
     /// atomic syscall, so a process killed mid-write leaves either the old
@@ -236,7 +240,7 @@ impl State {
     ///
     /// # Errors
     /// [`Error::Config`] if the record fails [`Self::validate`]: nothing is
-    /// written. [`Error::Io`], naming whichever of `path` or `<path>.tmp` the
+    /// written. [`Error::Io`], naming whichever of `path` or `<path>.<pid>.tmp` the
     /// failing operation touched. This includes the (practically
     /// unreachable, but not impossible) case of a `checkout` or
     /// `origin_cwd` containing non-UTF-8 bytes, which TOML cannot represent
@@ -253,8 +257,13 @@ impl State {
             source: io::Error::other(source),
         })?;
 
+        // The pid in the name, because `set_watch` writes without the tree
+        // lock (see its doc for why) and two processes staging into one
+        // `<path>.tmp` would truncate each other's file: the second rename
+        // then fails, and a rename landing between the other's truncate and
+        // write exposes an empty record.
         let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
+        tmp.push(format!(".{}.tmp", std::process::id()));
         let tmp = PathBuf::from(tmp);
         let at_tmp = |source| Error::Io {
             path: tmp.clone(),
@@ -371,6 +380,15 @@ verfiy = "alive"
         assert_eq!(back, original);
     }
 
+    /// Whether any `*.tmp` sits in `dir`: the staging file a write leaves
+    /// behind when it does not finish.
+    fn any_tmp(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .expect("list")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+    }
+
     /// Writes `text` as a record and reads it back through `State::read`,
     /// so the validation runs the way it does in production.
     fn read_text(text: &str) -> Result<State, Error> {
@@ -479,7 +497,7 @@ verfiy = "alive"
             .expect_err("cannot rename onto a directory");
 
         assert!(
-            !dir.path().join("deploy.toml.tmp").exists(),
+            !any_tmp(dir.path()),
             "the temporary file must be removed with the failure"
         );
     }
@@ -545,20 +563,20 @@ verfiy = "alive"
     fn write_survives_a_second_write_and_leaves_no_tmp_file_behind() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("deploy.toml");
-        let tmp = dir.path().join("deploy.toml.tmp");
+        let tmp = dir.path();
 
         let first = sample(None);
         first.write(&path).expect("first write");
         assert!(path.exists(), "the state file must exist after a write");
         assert!(
-            !tmp.exists(),
+            !any_tmp(tmp),
             "a completed write must not leave a .tmp file"
         );
 
         let second = sample(Some(fixtures::OTHER_SHA));
         second.write(&path).expect("second write");
         assert!(
-            !tmp.exists(),
+            !any_tmp(tmp),
             "a second, overwriting write must also leave no .tmp file"
         );
 
