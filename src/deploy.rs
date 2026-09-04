@@ -384,6 +384,14 @@ async fn go<D: Daemon>(
 /// So the marker is written here, after `git worktree add` returns, and only
 /// a release carrying it is reused.
 ///
+/// What it covers is a killed process, not a lost power supply. Nothing
+/// syncs the checkout before the marker is written, so a crash of the host
+/// can leave the marker durable and part of the checkout not; the next
+/// deploy of that sha would then reuse it. Closing that needs a sync of
+/// every file the worktree wrote, which is git's job rather than this
+/// crate's, and a host that loses power mid-deploy has larger problems than
+/// one release.
+///
 /// # Errors
 /// [`Error::Io`] if a stale directory cannot be removed or the marker cannot
 /// be written. Whatever [`git::worktree_prune`] and [`git::worktree_add`]
@@ -401,10 +409,7 @@ pub(crate) fn checkout_release(tree: &Tree, sha: &str) -> Result<(), Error> {
     }
 
     if release.exists() {
-        fs::remove_dir_all(&release).map_err(|source| Error::Io {
-            path: release.clone(),
-            source,
-        })?;
+        fs::remove_dir_all(&release).map_err(Error::at(&release))?;
         // Removing the directory is not enough on its own: git still has the
         // path registered and refuses the next add with "missing but already
         // registered worktree". Verified 2026-08-28.
@@ -414,15 +419,9 @@ pub(crate) fn checkout_release(tree: &Tree, sha: &str) -> Result<(), Error> {
     git::worktree_add(&git_dir, &release, sha)?;
 
     if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent).map_err(|source| Error::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
+        fs::create_dir_all(parent).map_err(Error::at(parent))?;
     }
-    fs::write(&marker, b"").map_err(|source| Error::Io {
-        path: marker,
-        source,
-    })
+    fs::write(&marker, b"").map_err(Error::at(marker))
 }
 
 /// Everything from the release directory to the verdict, for one sha that

@@ -11,7 +11,7 @@ use shep_client::shep_core::config::AppConfig;
 
 use crate::daemon::Daemon;
 use crate::error::Error;
-use crate::paths::Tree;
+use crate::paths::{self, Tree};
 use crate::roll;
 use crate::state::{State, Watch};
 
@@ -63,6 +63,13 @@ pub enum Standing {
     Eligible,
     /// Left alone, and why.
     NotEligible(String),
+    /// A deploy tree with no registered sheep behind it.
+    ///
+    /// The one row the roll cannot produce, because the roll is what it is
+    /// missing from: a sheep deleted from shep while its tree stayed on disk
+    /// appeared in no row of the one command meant to say where everything
+    /// stands.
+    Orphaned,
     /// A deploy tree whose record cannot be read, and what reading it said.
     ///
     /// Its own standing rather than a fall-through, because the fall-through
@@ -177,6 +184,7 @@ impl Standing {
             Self::NeedsSetup => "needs setup",
             Self::Eligible => "eligible",
             Self::NotEligible(_) => "not eligible",
+            Self::Orphaned => "orphaned",
             Self::Unreadable(_) => "unreadable",
         }
     }
@@ -210,6 +218,10 @@ impl Standing {
             Self::NeedsSetup => "a git checkout that ships a Flockfile".to_owned(),
             Self::Eligible => "a git checkout, nothing declares a deploy".to_owned(),
             Self::NotEligible(why) => why.clone(),
+            Self::Orphaned => "has a deploy tree, and the shepherd has no sheep by that name. \
+                               Re-register the app from its Flockfile with `cwd` set to the \
+                               tree's `current`, or remove the tree if the app is gone"
+                .to_owned(),
             // Says what to do and, more to the point, what NOT to do: the
             // one wrong move here is treating it as a sheep with no tree.
             Self::Unreadable(why) => format!(
@@ -244,11 +256,33 @@ fn short(sha: &str) -> &str {
 /// Whatever [`crate::roll::registered`] returns.
 pub async fn survey<D: Daemon>(daemon: &D, shep_home: &Path) -> Result<String, Error> {
     let apps = roll::registered(daemon).await?;
-    let rows: Vec<(String, Standing)> = apps
+    let targets = paths::targets(shep_home)?;
+    Ok(render(&rows(shep_home, &apps, &targets)))
+}
+
+/// One row per registered sheep, then one per deploy tree no registered
+/// sheep accounts for.
+///
+/// Split from [`survey`] so the join is testable without a daemon: the
+/// roll comes from one, the target list from the filesystem, and the row a
+/// tree gets when it is in the second and not the first is the whole of
+/// what this adds.
+fn rows(
+    shep_home: &Path,
+    apps: &std::collections::BTreeMap<String, AppConfig>,
+    targets: &[String],
+) -> Vec<(String, Standing)> {
+    let mut rows: Vec<(String, Standing)> = apps
         .values()
         .map(|app| (app.name.clone(), classify(shep_home, app)))
         .collect();
-    Ok(render(&rows))
+    rows.extend(
+        targets
+            .iter()
+            .filter(|name| !apps.contains_key(*name))
+            .map(|name| (name.clone(), Standing::Orphaned)),
+    );
+    rows
 }
 
 #[cfg(test)]
@@ -286,6 +320,33 @@ mod tests {
         let shown = render(&[("web".to_owned(), standing)]);
         assert!(!shown.contains("needs setup"), "{shown}");
         assert!(shown.contains("do not run setup"), "{shown}");
+    }
+
+    /// fails if a deploy tree whose sheep is no longer registered appears in
+    /// no row. The roll cannot name it, because the roll is what it is
+    /// missing from, and a tree on disk with a service that may still be
+    /// running out of it is exactly what an operator surveys for.
+    #[test]
+    fn a_tree_with_no_registered_sheep_is_a_row_of_its_own() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_target(home.path(), "gone", Watch::Auto, None, None);
+        let registered: std::collections::BTreeMap<String, AppConfig> =
+            [("web".to_owned(), app("web", None))].into_iter().collect();
+        let targets = paths::targets(home.path()).expect("lists");
+
+        let rows = rows(home.path(), &registered, &targets);
+
+        assert!(
+            rows.iter()
+                .any(|(name, standing)| name == "gone" && *standing == Standing::Orphaned),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(name, _)| name == "web"),
+            "the registered sheep is still listed: {rows:?}"
+        );
+        let shown = render(&rows);
+        assert!(shown.contains("orphaned"), "{shown}");
     }
 
     /// An `AppConfig` with just the two fields this module reads.

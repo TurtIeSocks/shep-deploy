@@ -280,14 +280,22 @@ struct Repeat {
 /// day. A condition that really can clear on its own says something
 /// different the moment it does, which re-arms the target without anything
 /// having to know which conditions those are.
-fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str) -> bool {
+///
+/// Answers how many repeats were swallowed since the line was last said,
+/// so a line said again after [`RESAY`] ticks can carry the count: an
+/// operator reading it an hour later can then tell "still broken" from
+/// "broke again, many times". `None` is silence; `Some(0)` is a line that
+/// is new.
+fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str) -> Option<u32> {
+    let mut swallowed = 0;
     if let Some(seen) = previous.get_mut(sheep)
         && seen.line == line
     {
         seen.muted += 1;
         if seen.muted < RESAY {
-            return false;
+            return None;
         }
+        swallowed = seen.muted;
     }
 
     previous.insert(
@@ -297,7 +305,7 @@ fn worth_saying(previous: &mut BTreeMap<String, Repeat>, sheep: &str, line: &str
             muted: 0,
         },
     );
-    true
+    Some(swallowed)
 }
 
 /// Polls forever, deploying what has moved.
@@ -402,12 +410,17 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
                 previous.remove(&sheep);
                 continue;
             };
-            if !worth_saying(&mut previous, &sheep, said.text()) {
+            let Some(swallowed) = worth_saying(&mut previous, &sheep, said.text()) else {
                 continue;
-            }
+            };
+            let repeats = if swallowed == 0 {
+                String::new()
+            } else {
+                format!(" (repeated {swallowed} times since it was last said)")
+            };
             let _ = match &said {
-                Said::Note(text) => writeln!(out, "{text}"),
-                Said::Complaint(text) => writeln!(err, "{text}"),
+                Said::Note(text) => writeln!(out, "{text}{repeats}"),
+                Said::Complaint(text) => writeln!(err, "{text}{repeats}"),
             };
         }
 
@@ -802,6 +815,10 @@ mod tests {
     /// everything - and idling quietly is what a dog with nothing to do
     /// looks like too. One row, named for the directory rather than for a
     /// sheep, because there is no sheep to name.
+    ///
+    /// Relies on mode bits, which root ignores: run as root (a container,
+    /// say) the listing succeeds and this test fails for a reason that has
+    /// nothing to do with the loop. CI runs unprivileged.
     #[tokio::test]
     async fn a_deploy_directory_that_cannot_be_listed_is_reported() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -911,27 +928,11 @@ mod tests {
     fn a_line_that_repeats_is_said_once() {
         let mut previous = BTreeMap::new();
 
-        assert!(worth_saying(
-            &mut previous,
-            "web",
-            "web: the remote is gone"
-        ));
-        assert!(!worth_saying(
-            &mut previous,
-            "web",
-            "web: the remote is gone"
-        ));
-        assert!(!worth_saying(
-            &mut previous,
-            "web",
-            "web: the remote is gone"
-        ));
+        assert!(worth_saying(&mut previous, "web", "web: the remote is gone").is_some());
+        assert!(worth_saying(&mut previous, "web", "web: the remote is gone").is_none());
+        assert!(worth_saying(&mut previous, "web", "web: the remote is gone").is_none());
         // A different target is a different line.
-        assert!(worth_saying(
-            &mut previous,
-            "koji",
-            "koji: the remote is gone"
-        ));
+        assert!(worth_saying(&mut previous, "koji", "koji: the remote is gone").is_some());
     }
 
     /// fails if the mute is keyed on anything narrower than the line. The
@@ -950,8 +951,8 @@ mod tests {
         ];
 
         for line in lines {
-            assert!(worth_saying(&mut previous, "web", line), "{line}");
-            assert!(!worth_saying(&mut previous, "web", line), "{line}");
+            assert!(worth_saying(&mut previous, "web", line).is_some(), "{line}");
+            assert!(worth_saying(&mut previous, "web", line).is_none(), "{line}");
         }
     }
 
@@ -963,10 +964,10 @@ mod tests {
         let mut previous = BTreeMap::new();
         let broken = "web: the remote is gone";
 
-        assert!(worth_saying(&mut previous, "web", broken));
-        assert!(!worth_saying(&mut previous, "web", broken));
-        assert!(worth_saying(&mut previous, "web", "web deployed abc1234"));
-        assert!(worth_saying(&mut previous, "web", broken));
+        assert!(worth_saying(&mut previous, "web", broken).is_some());
+        assert!(worth_saying(&mut previous, "web", broken).is_none());
+        assert!(worth_saying(&mut previous, "web", "web deployed abc1234").is_some());
+        assert!(worth_saying(&mut previous, "web", broken).is_some());
     }
 
     /// fails if a muted line is muted forever. A dog runs for months, and a
@@ -978,9 +979,9 @@ mod tests {
         let mut previous = BTreeMap::new();
         let line = "web: the remote is gone";
 
-        assert!(worth_saying(&mut previous, "web", line));
+        assert!(worth_saying(&mut previous, "web", line).is_some());
         let said = (0..RESAY * 2)
-            .filter(|_| worth_saying(&mut previous, "web", line))
+            .filter(|_| worth_saying(&mut previous, "web", line).is_some())
             .count();
 
         assert_eq!(said, 2, "once every RESAY ticks, not once ever");
