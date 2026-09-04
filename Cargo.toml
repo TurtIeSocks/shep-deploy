@@ -10,7 +10,7 @@ keywords = ["shep", "process-manager", "deploy", "git"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-shep-client = "0.1.23"
+shep-client = "0.2.0"
 # Already in the tree: shep-core depends on it, so this is a direct edge on
 # something every build of this crate already compiles. `fs` for `flock(2)`,
 # `signal` for `killpg(2)`; both are safe wrappers, which is what lets a crate

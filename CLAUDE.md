@@ -42,16 +42,23 @@ passes for the wrong reason. That happened on 2026-08-28: the local tier was
 green against an installed 0.1.8 while CI, which installs the current release,
 failed.
 
-The floor moves with `shep-client`, too. The lockfile pins shep-client 0.1.28,
-which speaks protocol 2; an installed shep 0.1.10 speaks protocol 1, and every
-integration test then fails at connect with `protocol mismatch (this client
-speaks 2)`. Measured 2026-09-03. Check `shep --version` before trusting either
-a green or a red integration run. To test against the current release without
-touching the machine's own shep, install one into a scratch root and point
-`SHEP_BIN` at it:
+The floor moves with `shep-client`, too, and in both directions. The lockfile
+pins shep-client 0.2.0, which speaks protocol 3, so a shep older than 0.2.0
+fails every integration test at connect with `protocol mismatch (this client
+speaks 3)`. The other direction bit on 2026-09-04: the lockfile spoke 2, shep
+0.2.0 shipped speaking 3 within the hour, and CI, which installs the current
+release, failed all seven tests at connect while the local tier was green
+against a scratch 0.1.31. When that happens the fix is the dependency, not
+the tests: bump `shep-client` in Cargo.toml and `cargo update -p
+shep-client`. Note that `cargo info shep-client` reports the newest
+semver-compatible version as "latest", so a 0.1.x lockfile never sees a
+0.2.0; ask for it by name, `cargo info shep-client@0.2.0`. Check
+`shep --version` before trusting either a green or a red integration run. To
+test against the current release without touching the machine's own shep,
+install one into a scratch root and point `SHEP_BIN` at it:
 
 ```bash
-cargo install shep --locked --root /tmp/shep-root
+cargo install shep --locked --force --root /tmp/shep-root
 ```
 
 ```bash
