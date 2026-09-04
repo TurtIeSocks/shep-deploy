@@ -256,8 +256,21 @@ fn short(sha: &str) -> &str {
 /// Whatever [`crate::roll::registered`] returns.
 pub async fn survey<D: Daemon>(daemon: &D, shep_home: &Path) -> Result<String, Error> {
     let apps = roll::registered(daemon).await?;
-    let targets = paths::targets(shep_home)?;
-    Ok(render(&rows(shep_home, &apps, &targets)))
+    // A deploy directory that cannot be listed is a row, not a refusal: this
+    // is the read-only command whose one job is to say where everything
+    // stands, and one unreadable entry must not cost every other row.
+    let (targets, unlisted) = match paths::targets(shep_home) {
+        Ok(targets) => (targets, None),
+        Err(err) => (
+            paths::Targets::default(),
+            Some((shep_home.join("deploy"), err.to_string())),
+        ),
+    };
+    let mut rows = rows(shep_home, &apps, &targets);
+    if let Some((dir, why)) = unlisted {
+        rows.push((dir.display().to_string(), Standing::Unreadable(why)));
+    }
+    Ok(render(&rows))
 }
 
 /// One row per registered sheep, then one per deploy tree no registered
@@ -270,7 +283,7 @@ pub async fn survey<D: Daemon>(daemon: &D, shep_home: &Path) -> Result<String, E
 fn rows(
     shep_home: &Path,
     apps: &std::collections::BTreeMap<String, AppConfig>,
-    targets: &[String],
+    targets: &paths::Targets,
 ) -> Vec<(String, Standing)> {
     let mut rows: Vec<(String, Standing)> = apps
         .values()
@@ -278,10 +291,21 @@ fn rows(
         .collect();
     rows.extend(
         targets
+            .named
             .iter()
             .filter(|name| !apps.contains_key(*name))
             .map(|name| (name.clone(), Standing::Orphaned)),
     );
+    rows.extend(targets.unnamed.iter().map(|dir| {
+        (
+            dir.display().to_string(),
+            Standing::Unreadable(
+                "its directory's name cannot be a sheep's, so nothing polls or restores it; \
+                 rename the directory"
+                    .to_owned(),
+            ),
+        )
+    }));
     rows
 }
 

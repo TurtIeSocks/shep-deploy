@@ -201,6 +201,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// `dir`'s current `HEAD` sha.
+#[track_caller]
 fn head_of(dir: &Path) -> String {
     let out = Command::new("git")
         .current_dir(dir)

@@ -44,11 +44,11 @@ use crate::{git, swap};
 /// Removes every release beyond the newest `keep`, and answers with the
 /// shas it removed.
 ///
-/// Never removes the release `current` names, nor the one `recorded` names
-/// (the record's `deployed`), whatever their age. The first is what is
-/// serving; the second is what a rollback returns to when a deploy died
-/// between its swap and its record write. See the module doc for why both
-/// are needed.
+/// Never removes the release `current` names, nor any that `recorded` names
+/// (the record's `deployed`, in memory and on disk), whatever their age. The
+/// first is what is serving; the others are what a rollback returns to when
+/// a deploy died between its swap and its record write, or wrote its record
+/// and could not. See the module doc for why both are needed.
 ///
 /// A release's completion marker (see [`Tree::completion`]) goes with it,
 /// and so does any marker whose release is already gone by other means:
@@ -61,7 +61,7 @@ use crate::{git, swap};
 /// went, if the bookkeeping cannot be pruned. A caller is expected to warn
 /// on these rather than fail the deploy that triggered them: see this
 /// module's own doc.
-pub fn prune(tree: &Tree, keep: usize, recorded: Option<&str>) -> Result<Vec<String>, Error> {
+pub fn prune(tree: &Tree, keep: usize, recorded: &[&str]) -> Result<Vec<String>, Error> {
     let live = swap::resolve(&tree.current())?;
     let live = live.as_deref().and_then(sha_of);
 
@@ -104,7 +104,13 @@ pub fn prune(tree: &Tree, keep: usize, recorded: Option<&str>) -> Result<Vec<Str
     let git_dir = tree.git();
     let mut removed = Vec::new();
     let mut failure = None;
-    for sha in doomed(&found, keep, &[live.as_deref(), recorded]) {
+    let spared: Vec<Option<&str>> = live
+        .as_deref()
+        .into_iter()
+        .chain(recorded.iter().copied())
+        .map(Some)
+        .collect();
+    for sha in doomed(&found, keep, &spared) {
         match git::worktree_remove(&git_dir, &tree.release(&sha)) {
             Ok(()) => {
                 // The marker vouched for a checkout that is gone now.
@@ -128,8 +134,9 @@ pub fn prune(tree: &Tree, keep: usize, recorded: Option<&str>) -> Result<Vec<Str
     // but already registered worktree".
     //
     // Its failure is reported only when no removal failed: a `?` here threw
-    // away the removal failure the loop above went out of its way to keep,
-    // and `removed` with it.
+    // away the removal failure the loop above went out of its way to keep.
+    // A failure of either kind still costs the caller the list of what was
+    // removed, which the one caller does not read.
     let pruned = git::worktree_prune(&git_dir);
     sweep_markers(tree, &releases);
 
@@ -244,7 +251,7 @@ mod tests {
         at_second(&tree.release(&shas[2]), 30);
         at_second(&stray, 40);
 
-        prune(&tree, 2, None).expect("prunes");
+        prune(&tree, 2, &[]).expect("prunes");
 
         assert!(
             tree.release(&shas[1]).is_dir(),
@@ -281,7 +288,7 @@ mod tests {
         at_second(&tree.release(&shas[2]), 40);
         at_second(&tree.release(&shas[3]), 50);
 
-        let err = prune(&tree, 2, None).expect_err("the failure must still be reported");
+        let err = prune(&tree, 2, &[]).expect_err("the failure must still be reported");
 
         assert!(
             !tree.release(&shas[0]).exists() && !tree.release(&shas[1]).exists(),
@@ -380,7 +387,7 @@ mod tests {
 
         // keep is larger than the release count, so nothing is past it and
         // `removed` comes back empty. That is the case the gate broke.
-        let removed = prune(&tree, 5, None).expect("prune");
+        let removed = prune(&tree, 5, &[]).expect("prune");
         assert!(removed.is_empty(), "nothing was past the keep count");
 
         git::worktree_add(&tree.git(), &orphan, &shas[0])
@@ -435,7 +442,7 @@ mod tests {
     #[test]
     fn prune_removes_real_worktrees_and_leaves_the_live_one() {
         let (tree, shas) = fixture_tree_with_releases(4);
-        let removed = prune(&tree, 2, None).expect("prunes");
+        let removed = prune(&tree, 2, &[]).expect("prunes");
 
         assert_eq!(removed.len(), 2);
         assert!(tree.release(&shas[3]).exists(), "the newest survives");
@@ -503,7 +510,7 @@ mod tests {
         let orphan = tree.completion(&"3".repeat(40));
         fs::write(&orphan, b"").expect("a marker with no release");
 
-        let removed = prune(&tree, 2, None).expect("prunes");
+        let removed = prune(&tree, 2, &[]).expect("prunes");
 
         assert_eq!(removed, vec![doomed_sha.clone()]);
         assert!(

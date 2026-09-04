@@ -89,6 +89,17 @@ pub enum Restored {
         /// Why.
         why: String,
     },
+    /// A directory under the deploy root that could not be read as targets
+    /// at all: the root itself, or one entry with a name no sheep can have.
+    ///
+    /// Not a [`Self::Failed`], whose `sheep` names a sheep; this names a
+    /// path, and nothing under it was looked at.
+    Unlisted {
+        /// The directory.
+        dir: PathBuf,
+        /// Why.
+        why: String,
+    },
     /// The restore itself was refused, but the fallback put the shepherd's
     /// own previous config back.
     ///
@@ -158,20 +169,21 @@ pub enum Restored {
 /// of five sheep would not restart would be worse than one that did nothing
 /// at all.
 pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
-    let names = match paths::targets(shep_home) {
-        Ok(names) => names,
+    let found = match paths::targets(shep_home) {
+        Ok(found) => found,
         // The deploy directory exists but could not be listed. There is
         // nothing to iterate, but silence here reads as success: `report(&[])`
         // is empty, so `on_remove` prints nothing and exits 0 with every
         // sheep under the tree left running. One row naming the directory
         // says something instead.
         Err(err) => {
-            return vec![Restored::Failed {
-                sheep: shep_home.join("deploy").display().to_string(),
+            return vec![Restored::Unlisted {
+                dir: shep_home.join("deploy"),
                 why: err.to_string(),
             }];
         }
     };
+    let names = found.named;
     // Read once for every target rather than once per target: it costs a
     // SaveRoll round trip, and a removal is not the moment to make N of
     // them. Kept as a `Result` rather than `.unwrap_or_default()`: an empty
@@ -182,6 +194,16 @@ pub async fn all<D: Daemon>(daemon: &D, shep_home: &Path) -> Vec<Restored> {
     let registered = roll::registered(daemon).await;
 
     let mut results = Vec::new();
+    // A target the dog cannot name cannot be restored either, and a sheep
+    // may still be running out of it.
+    for dir in found.unnamed {
+        results.push(Restored::Unlisted {
+            why: "its directory's name cannot be a sheep's, so it was never polled and is not \
+                  restored; rename the directory and run the restore by hand"
+                .to_owned(),
+            dir,
+        });
+    }
     // Pre-existing sheep whose restore needs the roll, deferred here rather
     // than reported as they are found: a roll that cannot be read is one
     // failure shared by every one of them, not N separate ones.
@@ -407,6 +429,12 @@ pub fn report(results: &[Restored]) -> String {
             }
             Restored::Failed { sheep, why } => {
                 format!("{sheep} could not be restored ({why}); nothing was changed by this dog\n")
+            }
+            Restored::Unlisted { dir, why } => {
+                format!(
+                    "{} could not be listed ({why}); nothing under it was changed by this dog\n",
+                    dir.display()
+                )
             }
             // NOT the same wording as `Failed`: this sheep was stopped and
             // a fresh instance started to get its own previous config back,
@@ -1203,7 +1231,7 @@ mod tests {
             "the failure must be reported, not swallowed: {results:?}"
         );
         assert!(
-            matches!(&results[0], Restored::Failed { sheep, .. } if sheep.ends_with("deploy")),
+            matches!(&results[0], Restored::Unlisted { dir, .. } if dir.ends_with("deploy")),
             "got: {:?}",
             results[0]
         );

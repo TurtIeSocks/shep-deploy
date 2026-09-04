@@ -73,7 +73,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::error::Error;
-use crate::shared::{is_eloop, o_nofollow};
+use crate::shared::{is_eloop, o_nofollow, printable};
 
 /// The environment variables a build keeps from this process, by name.
 ///
@@ -178,7 +178,7 @@ where
             return Err(D::Error::custom(format!(
                 "build.artifacts entry `{}` is an absolute path; artifacts are \
                  copied into the release and must be relative to it",
-                artifact.display()
+                printable(artifact.display())
             )));
         }
         if artifact
@@ -188,7 +188,7 @@ where
             return Err(D::Error::custom(format!(
                 "build.artifacts entry `{}` contains `..`, which would name a \
                  path outside the release",
-                artifact.display()
+                printable(artifact.display())
             )));
         }
     }
@@ -446,7 +446,7 @@ fn copy_artifact(
     {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` would name a path outside the release",
-            artifact.display()
+            printable(artifact.display())
         )));
     }
 
@@ -464,7 +464,7 @@ fn copy_artifact(
             return Err(Error::Config(format!(
                 "build.artifacts entry `{}` resolves its {end} to `{}`, which is \
                  outside the release and its build cache",
-                artifact.display(),
+                printable(artifact.display()),
                 resolve_deepest(path)
                     .unwrap_or_else(|| path.clone())
                     .display()
@@ -488,7 +488,7 @@ fn copy_artifact(
             return Err(Error::Config(format!(
                 "build.artifacts names `{}`, which the build did not leave there; \
                  either the command did not produce it or the entry is wrong",
-                artifact.display()
+                printable(artifact.display())
             )));
         }
         return Ok(());
@@ -519,7 +519,7 @@ fn copy_artifact(
     if resolved.is_none() || !lands_within(roots, &from) {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
-            artifact.display()
+            printable(artifact.display())
         )));
     }
 
@@ -571,7 +571,7 @@ fn copy_artifact(
     if !lands_within(roots, &to) {
         return Err(Error::Config(format!(
             "build.artifacts entry `{}` changed underneath the check; refusing to copy it",
-            artifact.display()
+            printable(artifact.display())
         )));
     }
 
@@ -585,8 +585,24 @@ fn copy_artifact(
     // pointed at, and `create_new` refuses to open anything that appeared in
     // between, symlink or otherwise. That also covers the `O_NOFOLLOW` case
     // below on its own terms: a symlink here is gone before the open.
-    match fs::remove_file(&to) {
-        Ok(()) => {}
+    //
+    // Only a regular file is unlinked. A directory, a symlink or anything
+    // else at the destination is not an artifact the build left, and
+    // unlinking it would take the release's own `target -> cache` link with
+    // it when `artifacts` names `target` itself: `remove_file` removes a
+    // link where the old `O_NOFOLLOW` open refused one. The window between
+    // this look, the unlink and the open is the one `docs/specs/deferred.md`
+    // records; what a job swapping a parent for a link inside it can now
+    // cost is a file unlinked as well as one written.
+    match fs::symlink_metadata(&to) {
+        Ok(there) if !there.file_type().is_file() => {
+            return Err(Error::Config(format!(
+                "build.artifacts entry `{}` names a destination that is not a regular file; \
+                 refusing to replace it",
+                printable(artifact.display())
+            )));
+        }
+        Ok(_) => fs::remove_file(&to).map_err(Error::at(&to))?,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
             return Err(Error::Io {
@@ -610,7 +626,7 @@ fn copy_artifact(
                 Error::Config(format!(
                     "build.artifacts entry `{}` had its destination replaced underneath the \
                      copy; refusing to write through it",
-                    artifact.display()
+                    printable(artifact.display())
                 ))
             } else {
                 Error::Io {

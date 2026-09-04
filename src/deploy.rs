@@ -28,30 +28,30 @@
 //!
 //! # Two deploys of one sheep
 //!
-//! There is no lock. What there is instead is one cheap guard: `current` is
-//! read when a deploy starts and read again immediately before the swap,
-//! and a deploy whose `current` moved in between refuses rather than
-//! swapping on top of whatever moved it. The failure it exists for is
-//! specific and silent - a second deploy that finished a *newer* release
-//! while this one was still building would otherwise be reverted by this
-//! one's swap, verified and healthy, with nothing anywhere reporting a
-//! problem. The guard is not a lock and does not pretend to be: two deploys
-//! can still interleave inside the swap itself. It removes the case that
-//! loses a good release, which is the one worth removing before the poll
-//! loop exists to make concurrency ordinary.
+//! Two things, in this order. [`go`] takes an exclusive `flock` on the
+//! tree before anything else and holds it to the end, so two PROCESSES
+//! cannot both be inside a deploy of one sheep: the second is refused in one
+//! sentence rather than colliding somewhere inside git. See [`crate::lock`]
+//! for what that collision did before the lock existed. [`set_watch`] takes
+//! the same lock for its one write, so a `--watch` typed mid-tick cannot
+//! clobber what the tick is about to record.
 //!
-//! # A stale `current.tmp` is left alone, deliberately
+//! Behind the lock there is still one cheap guard: `current` is read when a
+//! deploy starts and read again immediately before the swap, and a deploy
+//! whose `current` moved in between refuses rather than swapping on top of
+//! whatever moved it. The lock makes that unreachable through this module,
+//! and it stays for anything that moves `current` without taking the lock,
+//! an operator's own hand, say. The failure it exists for is specific and
+//! silent: a *newer* release, verified and healthy, reverted by an older
+//! deploy's swap with nothing anywhere reporting a problem.
 //!
-//! [`crate::swap::point_at`] refuses rather than cleaning up a temporary
-//! symlink left by an interrupted swap, and this module does not clean one
-//! either. The window between creating that link and renaming it is two
-//! syscalls wide, so a `current.tmp` on disk is far more likely to mean
-//! another deploy of this sheep is running *right now* than that one died
-//! inside those two syscalls. Removing it would break the live deploy for
-//! the sake of a case that almost never happens. The refusal costs little:
-//! it lands at the swap, which is before anything has been disturbed, so
-//! the running app keeps serving and the operator's fix is one `rm` once
-//! they have checked no deploy is in flight.
+//! # A stale `current.tmp`
+//!
+//! [`crate::swap::point_at`] replaces a temporary symlink left by an
+//! interrupted swap, because the lock above means one on disk cannot belong
+//! to a deploy that is running now. Anything at that name that is NOT a
+//! symlink was not left by this dog, and is refused with the path to move
+//! aside.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -194,10 +194,13 @@ fn budget(app: &AppConfig, instances: u32) -> Duration {
 /// below runs again over it regardless.
 ///
 /// # Errors
-/// [`Error::NotCutOver`], before anything at all happens, if the target's
-/// record names no released sha - see the refusal in the body for why that
-/// deploy would report a success it did not achieve, and the variant's own
-/// doc for why the poll loop needs to recognise it.
+/// [`Error::AlreadyDeploying`] if another process holds the tree, and
+/// [`Error::Io`] if the lock file cannot be created - both from
+/// [`lock::hold`], which is the first thing that runs. Then
+/// [`Error::NotCutOver`] if the target's record names no released sha - see
+/// the refusal in the body for why that deploy would report a success it
+/// did not achieve, and the variant's own doc for why the poll loop needs to
+/// recognise it.
 ///
 /// Anything the steps before the swap return - see [`crate::git::fetch`],
 /// [`crate::shared::to_link`], [`crate::flockfile::read`] and
@@ -601,7 +604,20 @@ fn record(
         }
     }
 
-    if let Err(err) = retention::prune(tree, keep, state.deployed.as_deref()) {
+    // Both the record in memory and the one on disk. They differ after the
+    // one write this module swallows, a verified deploy whose record could
+    // not be written: memory names the new sha and disk still names the old
+    // one, and the old one is what the next run's rollback looks for.
+    let on_disk = State::read(&tree.state_file())
+        .ok()
+        .and_then(|recorded| recorded.deployed);
+    let spared: Vec<&str> = state
+        .deployed
+        .as_deref()
+        .into_iter()
+        .chain(on_disk.as_deref())
+        .collect();
+    if let Err(err) = retention::prune(tree, keep, &spared) {
         eprintln!("shep-deploy: {sheep}: could not reclaim old releases: {err}");
     }
 }
@@ -856,6 +872,14 @@ fn undo_swap(
 /// [`State::write`]. `state` is left alone when the refusal fires, and
 /// updated in memory whether or not the write succeeds.
 pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Error> {
+    // Under the same lock a deploy takes, and re-read under it. The caller's
+    // `state` was read before the lock, so a tick that recorded a `failed`
+    // sha in between would be written over with the caller's older copy,
+    // and the poll loop would rebuild that sha every interval: the one harm
+    // `failed` exists to stop.
+    let _deploying = lock::hold(tree)?;
+    *state = State::read(&tree.state_file())?;
+
     if watch == Watch::Auto && state.deployed.is_none() {
         return Err(Error::Config(format!(
             "{} has a deploy tree but was never cut over to it, so there is nothing for the \
@@ -868,6 +892,7 @@ pub fn set_watch(tree: &Tree, state: &mut State, watch: Watch) -> Result<(), Err
             tree.sheep()
         )));
     }
+
     state.watch = watch;
     state.write(&tree.state_file())
 }
@@ -1058,8 +1083,15 @@ fn rollback_target(
     previous: Option<&Path>,
     attempted: &str,
 ) -> Option<PathBuf> {
-    let usable =
-        |release: PathBuf| (sha_of(&release) != attempted && release.exists()).then_some(release);
+    // A candidate has to be a release: a full sha, other than the one that
+    // just failed, with a directory on disk. `previous` is the raw text of a
+    // link an operator can repoint by hand, and a `current -> /srv/anything`
+    // used to make `restore` write `deployed = "anything"`, which
+    // `State::read` then refused on every later run of every command.
+    let usable = |release: PathBuf| {
+        let sha = sha_of(&release);
+        (crate::state::is_sha(&sha) && sha != attempted && release.exists()).then_some(release)
+    };
 
     if let Some(release) = previous.map(Path::to_path_buf).and_then(usable) {
         return Some(release);
@@ -1359,8 +1391,10 @@ mod tests {
         /// is the step that used to sit outside the rollback boundary.
         describe_fails_from: Option<u32>,
         /// Created just before answering the first `describe`, standing in
-        /// for another process leaving a stale `current.tmp` behind at the
-        /// worst possible moment - after the swap, before the rollback.
+        /// for something that is not this dog's leaving a file at the
+        /// `current.tmp` path at the worst possible moment - after the swap,
+        /// before the rollback. A regular file, because a stale symlink there
+        /// is this dog's own leftover and the swap replaces it.
         plant: Option<PathBuf>,
         /// How many reloads after the first to refuse, standing in for the
         /// shepherd's own refusal to start a reload while one is in flight.
@@ -2555,6 +2589,71 @@ mod tests {
             "current must not be left on a release nothing verified"
         );
         assert_eq!(fixture.state.deployed.as_deref(), Some(previous.as_str()));
+    }
+
+    /// fails if a `current` already naming the attempted release, with no
+    /// earlier link to put back, is left there after a failure before the
+    /// reload. That is the shape a deploy killed between its swap and its
+    /// record write leaves, and `undo_swap` used to return `Ok` for it with
+    /// `current` on a release nothing verified. The record still names the
+    /// good release, and that is what goes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_before_the_reload_puts_current_back_from_the_record() {
+        let mut fixture = fixture_with_previous_release();
+        let previous = fixture.state.deployed.clone().expect("a previous release");
+        let attempted = commit_on_origin(&fixture, "second.txt");
+        // As a killed deploy leaves it: `current` already on the attempted
+        // release, the record still on the previous one.
+        swap::point_at(&fixture.tree.current(), &fixture.tree.release(&attempted))
+            .expect("point current at the attempted release");
+
+        let err = deploy(
+            &Shepherd::unreachable(),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect_err("the shepherd cannot be asked anything");
+
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&previous)),
+            "current goes back to the release the record names"
+        );
+    }
+
+    /// fails if a record that cannot be written after a verified deploy
+    /// turns the deploy into a failure. The release is up and serving, so
+    /// the outcome is `Deployed`; returning the write's error instead had
+    /// `record` write the sha into `failed` beside the same sha in
+    /// `deployed`. A directory at the record's path is what makes the
+    /// rename fail here.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_cannot_be_written_still_reports_deployed() {
+        let mut fixture = fixture_with_previous_release();
+        let head = commit_on_origin(&fixture, "second.txt");
+        let record = fixture.tree.state_file();
+        fs::remove_file(&record).expect("drop the record");
+        fs::create_dir(&record).expect("a directory where the record goes");
+
+        let outcome = deploy(
+            &Shepherd::ready(),
+            &fixture.tree,
+            &mut fixture.state,
+            &fixtures::dog_config(),
+        )
+        .await
+        .expect("the deploy landed whatever the record did");
+
+        assert_eq!(outcome, Outcome::Deployed { sha: head.clone() });
+        assert_eq!(fixture.state.deployed.as_deref(), Some(head.as_str()));
+        assert_eq!(fixture.state.failed, None, "a landed sha is never held");
+        assert_eq!(
+            swap::resolve(&fixture.tree.current()).unwrap(),
+            Some(fixture.tree.release(&head))
+        );
     }
 
     /// fails if a reload whose REPLY was lost is treated as one that never

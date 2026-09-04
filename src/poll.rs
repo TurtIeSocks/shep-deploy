@@ -92,19 +92,33 @@ const fn due(state: &State) -> bool {
 /// for the directory because there is no sheep left to name; silence there
 /// is indistinguishable from a dog with nothing to do.
 async fn tick<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Tick {
-    let names = match paths::targets(shep_home) {
-        Ok(names) => names,
+    let found = match paths::targets(shep_home) {
+        Ok(found) => found,
         Err(err) => {
             return Tick {
-                targets: 0,
+                targets: None,
                 results: vec![(shep_home.join("deploy").display().to_string(), Err(err))],
             };
         }
     };
 
     let mut results = Vec::new();
-    let targets = names.len();
-    for name in names {
+    let targets = Some(found.named.len() + found.unnamed.len());
+    // A target the dog cannot name is a row, not a skip: nothing polls it
+    // and nothing restores it, and the operator has to be the one to rename
+    // it.
+    for dir in found.unnamed {
+        let shown = dir.display().to_string();
+        results.push((
+            shown.clone(),
+            Err(Error::Config(format!(
+                "{shown} holds a deploy.toml, and its name cannot be a sheep's (not valid \
+                 UTF-8, or carrying a control character), so it is neither polled nor \
+                 restored. Rename or remove the directory"
+            ))),
+        ));
+    }
+    for name in found.named {
         let tree = Tree::for_sheep(shep_home, &name);
         let mut state = match State::read(&tree.state_file()) {
             Ok(state) => state,
@@ -128,8 +142,10 @@ async fn tick<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Ti
         // stream the caller chose and, more to the point, the mute: a daemon
         // that refuses every smit would otherwise say so once per target per
         // tick, forever.
+        // Keyed with a `/`, which no sheep name can carry, so the row and the
+        // target never share a mute entry.
         if let Err(err) = smit::publish(daemon, &name, &state).await {
-            results.push((format!("{name}'s smit"), Err(err)));
+            results.push((format!("{name}/smit"), Err(err)));
         }
         if !due(&state) {
             continue;
@@ -154,13 +170,15 @@ async fn tick<D: Daemon>(daemon: &D, shep_home: &Path, config: &DogConfig) -> Ti
 
 /// What one tick found and did.
 struct Tick {
-    /// How many targets were on disk, due or not.
+    /// How many targets were on disk, due or not, or `None` when the
+    /// directory could not be listed at all.
     ///
     /// Kept apart from the results because a manual target produces no
     /// result and is still a target: a tick with results and no targets is
     /// impossible, and a tick with targets and no results is the ordinary
-    /// quiet one.
-    targets: usize,
+    /// quiet one. `None` is kept apart from `Some(0)` because "gone" and
+    /// "unreadable" want different rows.
+    targets: Option<usize>,
     /// One row per target that had something to say, plus a row per smit
     /// that could not be published.
     results: Vec<(String, Result<Outcome, Error>)>,
@@ -374,7 +392,6 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
 ) -> Result<(), Error> {
     let mut previous: BTreeMap<String, Repeat> = BTreeMap::new();
     let deploy_dir = shep_home.join("deploy").display().to_string();
-    let mut had_targets = false;
     loop {
         let Tick {
             targets,
@@ -384,18 +401,19 @@ async fn run_with<D: Daemon, O: Write, E: Write>(
         // A deploy directory that is gone answers as an empty list, which is
         // also what a shepherd with no targets yet answers, so the loop went
         // silent the moment a directory was unmounted or removed from under
-        // it. Said once, through the mute, when the previous tick had
-        // targets and this one has none.
-        if targets == 0 && had_targets {
+        // it. Said on every tick with nothing to poll, and left to the mute
+        // to say once and then hourly: that covers a dog restarted after the
+        // directory went, which a "had targets last tick" flag did not. A
+        // listing that failed carries its own row and is not this case.
+        if targets == Some(0) {
             results.push((
                 deploy_dir.clone(),
                 Err(Error::Config(format!(
-                    "no deploy targets are left under {deploy_dir}: every target this dog was \
-                     polling is gone, so it deploys nothing until one is set up again"
+                    "no deploy targets under {deploy_dir}: nothing to poll until one is set up \
+                     with `shep-deploy setup <sheep>`"
                 ))),
             ));
         }
-        had_targets = targets > 0;
 
         // A target that is gone stops muting anything. Otherwise a target
         // deleted and recreated has its first line swallowed by the entry
@@ -697,7 +715,7 @@ mod tests {
         // A record naming a release, with no repository under it at all:
         // the fetch is what fails, which is the shape of a remote nobody
         // can reach.
-        write_target(home.path(), "broken", Watch::Auto, Some("old"));
+        write_target(home.path(), "broken", Watch::Auto, Some(fixtures::SHA));
         let _origin = write_target_ready(home.path(), "fine", Watch::Auto);
 
         let results = tick(&Ready::new(), home.path(), &fixtures::dog_config())
@@ -1009,7 +1027,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failure_is_written_once_however_many_ticks_repeat_it() {
         let home = tempfile::tempdir().expect("tempdir");
-        write_target(home.path(), "broken", Watch::Auto, Some("old"));
+        write_target(home.path(), "broken", Watch::Auto, Some(fixtures::SHA));
         let (mut out, mut err) = (Vec::new(), Vec::new());
 
         // Three ticks' worth, as the interval test above.
@@ -1198,7 +1216,7 @@ mod tests {
         // And the refusal is a row of its own, so it reaches the mute rather
         // than being printed once per target per tick forever.
         assert!(
-            row("fine's smit").1.is_err(),
+            row("fine/smit").1.is_err(),
             "the refusal is reported as its own row"
         );
     }

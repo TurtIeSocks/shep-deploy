@@ -89,6 +89,12 @@ jobs:
     # so an advisory against something in its own tree is worth a red job.
     # `cargo install` rather than a third-party action: one fewer moving tag
     # in a workflow, at the cost of a minute's compile.
+    #
+    # It scans the lockfile, so a dev-dependency's advisory goes red too.
+    # Deliberate: the two dev-dependencies are tokio's test-util and
+    # tempfile, and neither is worth a second opinion on. An advisory that
+    # genuinely does not apply is silenced by id with `cargo audit --ignore
+    # RUSTSEC-...`, next to a comment saying why.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -42,7 +42,7 @@ use toml::{Table, Value};
 
 use crate::build::BuildSpec;
 use crate::error::Error;
-use crate::shared::{is_eloop, o_nofollow};
+use crate::shared::{is_eloop, o_nofollow, printable};
 
 /// The most a Flockfile may be, in bytes.
 ///
@@ -95,7 +95,7 @@ impl Merged {
         app.try_into().map_err(|source: toml::de::Error| {
             Error::Config(format!(
                 "app {sheep:?} does not match shep's app schema: {}",
-                source.message()
+                printable(source.message())
             ))
         })
     }
@@ -143,7 +143,7 @@ impl Merged {
             Error::Config(format!(
                 "{}: `[dog.deploy.build]` does not match the build schema: {}",
                 self.release.display(),
-                source.message()
+                printable(source.message())
             ))
         })
     }
@@ -223,6 +223,7 @@ fn merged_document(release: &Path, shared: &[PathBuf]) -> Result<Value, Error> {
     // this host the dog reads. See `read_flockfile`.
     let committed = read_required(&release.join("Flockfile.toml"), Follow::Never)?;
     refuse_repo_privilege(&committed)?;
+    refuse_duplicate_apps(&committed)?;
 
     // The override is exempt from the privilege refusal only because it is the
     // OPERATOR's file, and that has to be established rather than assumed. A
@@ -399,12 +400,23 @@ fn read_flockfile(path: &Path, follow: Follow) -> Result<String, Error> {
 /// line's text is in the file.
 fn parse(path: &Path, text: &str) -> Result<Value, Error> {
     toml::from_str(text).map_err(|source| {
-        let line = source
-            .span()
-            .map(|span| text[..span.start.min(text.len())].matches('\n').count() + 1);
+        // Counted over bytes, because a span's start is a byte offset and
+        // slicing a `str` at a byte that is not a character boundary panics,
+        // on text the repository wrote.
+        let line = source.span().map(|span| {
+            let upto = span.start.min(text.len());
+            text.as_bytes()[..upto]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                + 1
+        });
+        // `printable`, because serde's own message carries the offending
+        // key by name, and a TOML key can be any quoted string.
+        let message = printable(source.message());
         Error::Config(match line {
-            Some(line) => format!("{}: {}, at line {line}", path.display(), source.message()),
-            None => format!("{}: {}", path.display(), source.message()),
+            Some(line) => format!("{}: {message}, at line {line}", path.display()),
+            None => format!("{}: {message}", path.display()),
         })
     })
 }
@@ -445,6 +457,32 @@ fn refuse_repo_privilege(committed: &Value) -> Result<(), Error> {
                      repo."
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a committed Flockfile that declares one app name twice.
+///
+/// Two entries named `web` are two answers to "which one is the sheep", and
+/// every reader here has to pick the same one. `select_app` takes the first;
+/// `merge_apps` used to index by name with the last winning, so the
+/// operator's override, `user` pin included, was merged onto an entry
+/// nobody then read. Refusing the shape is simpler than making every reader
+/// agree, and shep itself would not accept the file either.
+///
+/// # Errors
+/// [`Error::Config`] naming the app, if any name appears more than once.
+fn refuse_duplicate_apps(committed: &Value) -> Result<(), Error> {
+    let mut seen = std::collections::BTreeSet::new();
+    for app in apps(committed) {
+        if let Some(name) = app_name(app)
+            && !seen.insert(name)
+        {
+            return Err(Error::Config(format!(
+                "Flockfile.toml declares an app named {:?} more than once; one entry per name",
+                printable(name)
+            )));
         }
     }
     Ok(())
@@ -519,11 +557,17 @@ fn merge_apps(base: Value, over: Value) -> Value {
     // Indexed once rather than scanned per override entry. Both arrays come
     // from the repository, and a scan per entry made the merge quadratic in
     // files nothing else bounds the length of.
-    let mut by_name: BTreeMap<String, usize> = base_apps
-        .iter()
-        .enumerate()
-        .filter_map(|(index, app)| Some((app_name(app)?.to_owned(), index)))
-        .collect();
+    //
+    // First wins on a repeated name, the way `select_app` reads the array.
+    // `collect` into a map keeps the LAST, which put an override onto an
+    // entry nothing then read; `refuse_duplicate_apps` stops the shape at the
+    // door, and this keeps the two readers agreeing even so.
+    let mut by_name: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, app) in base_apps.iter().enumerate() {
+        if let Some(name) = app_name(app) {
+            by_name.entry(name.to_owned()).or_insert(index);
+        }
+    }
 
     for over_app in over_apps {
         let existing = app_name(&over_app).and_then(|name| by_name.get(name).copied());
@@ -535,7 +579,7 @@ fn merge_apps(base: Value, over: Value) -> Value {
             }
             None => {
                 if let Some(name) = app_name(&over_app) {
-                    by_name.insert(name.to_owned(), base_apps.len());
+                    by_name.entry(name.to_owned()).or_insert(base_apps.len());
                 }
                 base_apps.push(over_app);
             }
@@ -587,6 +631,52 @@ mod tests {
         assert!(
             !shown.contains("SECRET"),
             "must not quote the file: {shown}"
+        );
+    }
+
+    /// fails if a committed Flockfile naming one app twice is accepted.
+    ///
+    /// Found in round two of the review: the indexed merge kept the LAST
+    /// entry for a repeated name while `select_app` read the first, so the
+    /// operator's override, `user` pin included, landed on an entry nobody
+    /// read and the sheep started at the dog's own uid. Refused by name now,
+    /// and the index keeps the first regardless.
+    #[test]
+    fn a_committed_flockfile_naming_an_app_twice_is_refused() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./a\"\n[[app]]\nname = \"web\"\nscript = \"./b\"\n",
+        )
+        .expect("committed");
+
+        let err = app_config(rel.path(), "web", &[]).expect_err("two apps named web");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("web") && shown.contains("more than once"),
+            "{shown}"
+        );
+    }
+
+    /// fails if a message quotes a repository-chosen key with its control
+    /// characters intact. serde names an unknown field in its message, and
+    /// a TOML key can be any quoted string, so a committed
+    /// `"\u001b[2J" = 1` used to write a terminal escape into the log.
+    #[test]
+    fn a_parser_message_never_carries_a_control_character() {
+        let rel = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            rel.path().join("Flockfile.toml"),
+            "[[app]]\nname = \"web\"\nscript = \"./a\"\n[dog.deploy.build]\n\"a\\u001bb\" = 1\n",
+        )
+        .expect("committed");
+
+        let err = build_spec(rel.path(), &[]).expect_err("an unknown build key");
+        let shown = err.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(
+            shown.contains("a?b"),
+            "the key is still recognisable: {shown}"
         );
     }
 

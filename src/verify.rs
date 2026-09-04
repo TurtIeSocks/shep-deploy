@@ -256,9 +256,10 @@ pub(crate) fn bounded(budget: Duration) -> Duration {
 /// exactly what it exists for, and then dwells: it sleeps [`DWELL`], then
 /// polls for the same pids to still be there AND to have reached `Online`,
 /// for as long as the turnover left of `budget` or one more [`DWELL`],
-/// whichever is longer. So `Alive` can run past `budget` by up to two
-/// dwells, and that is the shape the spec asks for: "wait N seconds and
-/// confirm the process is still running". A process that came up and died
+/// whichever is longer. So `Alive` can run past `budget` by up to three
+/// dwells (the sleep, the floor on the deadline, and one `describe` that
+/// starts just inside it), and that is the shape the spec asks for: "wait N
+/// seconds and confirm the process is still running". A process that came up and died
 /// inside the dwell has a different pid by then (shep restarts it) or none
 /// at all, either of which fails. `WaitingRestart` is a fail throughout for
 /// the same reason.

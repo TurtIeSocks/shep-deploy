@@ -235,13 +235,19 @@ impl State {
     /// failure does not sit next to the record forever, unread by anything.
     ///
     /// # Errors
-    /// [`Error::Io`], naming whichever of `path` or `<path>.tmp` the
+    /// [`Error::Config`] if the record fails [`Self::validate`]: nothing is
+    /// written. [`Error::Io`], naming whichever of `path` or `<path>.tmp` the
     /// failing operation touched. This includes the (practically
     /// unreachable, but not impossible) case of a `checkout` or
     /// `origin_cwd` containing non-UTF-8 bytes, which TOML cannot represent
     /// as a string; that failure is reported against `path` before any
     /// write is attempted, so it never touches the temp file at all.
     pub fn write(&self, path: &Path) -> Result<(), Error> {
+        // Validated on the way out as well as on the way in, because every
+        // writer is inside this crate: a record this crate persists and then
+        // refuses to read on every later command is a target nothing can
+        // touch, and the mistake is cheaper at the moment it is made.
+        self.validate(path)?;
         let text = toml::to_string_pretty(self).map_err(|source| Error::Io {
             path: path.to_owned(),
             source: io::Error::other(source),

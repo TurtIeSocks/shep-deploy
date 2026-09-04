@@ -80,6 +80,10 @@ pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
         .truncate(false)
         .write(true)
         .mode(LOCK_MODE)
+        // Never through a link. The tree is this dog's own, so nothing else
+        // should have put one here; if something has, the lock would land on
+        // whatever it points at, and that is not this tree.
+        .custom_flags(crate::shared::o_nofollow())
         .open(&path)
         .map_err(Error::at(&path))?;
 
@@ -91,7 +95,7 @@ pub fn hold(tree: &Tree) -> Result<Deploying, Error> {
     // default mode by an earlier version is tightened here as well. Best
     // effort: a file this process cannot chmod is one it does not own, and
     // the lock still works on it.
-    let _ = std::fs::set_permissions(&path, Permissions::from_mode(LOCK_MODE));
+    let _ = file.set_permissions(Permissions::from_mode(LOCK_MODE));
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(held) => Ok(Deploying { _held: held }),
         Err((_, errno)) => Err(refusal(tree.sheep(), path, errno)),

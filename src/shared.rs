@@ -198,9 +198,29 @@ pub(crate) fn run_git_within(dir: &Path, args: &[&str], budget: Duration) -> Res
 /// it that they have not already decided. A pid too large for `pid_t` is the
 /// same case: no such group can exist.
 pub(crate) fn kill_group(pid: u32) {
+    // Zero is not a group either: `killpg(0)` signals the CALLER's group,
+    // which is this dog and every build it has running.
+    if pid == 0 {
+        return;
+    }
     if let Ok(pid) = i32::try_from(pid) {
         let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
     }
+}
+
+/// `text` with every control character replaced by `?`, for a message that
+/// quotes something the deployed repository chose.
+///
+/// `Display` and `Path::display` pass control bytes through, so a committed
+/// `artifacts = ["\u{1b}[2J..."]` would write raw terminal escapes into the
+/// dog's log, and a newline would forge a second log line. Replaced rather
+/// than escaped, because the reader wants to recognise the entry, not
+/// reconstruct it: the file is right there.
+pub(crate) fn printable(text: impl std::fmt::Display) -> String {
+    text.to_string()
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Kills a timed-out child and everything it spawned, then reaps it.
@@ -384,11 +404,24 @@ pub fn ignored_present(checkout: &Path) -> Result<Vec<PathBuf>, Error> {
         &["status", "--ignored=matching", "--porcelain", "-z"],
     )?;
 
-    Ok(stdout
-        .split('\0')
-        .filter_map(|entry| entry.strip_prefix("!! "))
-        .map(|path| PathBuf::from(path.trim_end_matches('/')))
-        .collect())
+    // Walked as records rather than filtered as fields: a rename or a copy
+    // (`R` or `C` in either status column) is followed by a second field
+    // holding the original path, with no status of its own, and a bare field
+    // must not be read as an entry.
+    let mut fields = stdout.split('\0');
+    let mut found = Vec::new();
+    while let Some(entry) = fields.next() {
+        let Some((status, path)) = entry.split_at_checked(3) else {
+            continue;
+        };
+        if status[..2].contains(['R', 'C']) {
+            fields.next();
+        }
+        if status == "!! " {
+            found.push(PathBuf::from(path.trim_end_matches('/')));
+        }
+    }
+    Ok(found)
 }
 
 /// One `.shepignore` entry, with the two things it can mean told apart at
@@ -469,16 +502,34 @@ fn parse_pattern(line: &str) -> Result<Pattern, Error> {
     }
     if line.starts_with('!') {
         return Err(refuse(
-            "is a negation, which is not supported: everything is shared unless named here",
+            "is a negation, which is not supported: everything is shared unless named here. A \
+             name that really begins with `!` is written `\\!name`, as in .gitignore",
         ));
     }
+    // `.gitignore`'s escape for a name that begins with `!`, honoured for the
+    // same reason the bare form is refused: the two spellings mean different
+    // things, and this one is the only way to name such a file.
+    let unescaped;
+    let line = match line.strip_prefix("\\!") {
+        Some(rest) => {
+            unescaped = format!("!{rest}");
+            unescaped.as_str()
+        }
+        None => line,
+    };
 
     let anchored_by_slash = line.starts_with('/');
     let body = line
         .trim_start_matches("./")
         .trim_start_matches('/')
         .trim_end_matches('/');
-    if body.is_empty() {
+    // A lone `.` (or `./.`) is a name no path component ever is, so it would
+    // match nothing in silence, which is the failure this parser refuses.
+    if body.is_empty()
+        || Path::new(body)
+            .components()
+            .all(|component| component == Component::CurDir)
+    {
         return Err(refuse("names nothing"));
     }
     if Path::new(body)
@@ -969,6 +1020,49 @@ mod tests {
         ]);
         let linked = to_link(repo.path()).expect("computes");
         assert!(!linked.contains(&PathBuf::from("dist")), "{linked:?}");
+    }
+
+    /// fails if `\!name` stops naming a file that really begins with `!`,
+    /// or if a lone `.` is accepted. The first is `.gitignore`'s own escape
+    /// and the only way to name such a file once the bare form is refused;
+    /// the second is a name no path component ever has.
+    #[test]
+    fn an_escaped_bang_names_the_file_and_a_lone_dot_is_refused() {
+        assert_eq!(
+            parse_pattern("\\!weird").expect("the escape is honoured"),
+            Pattern::Anywhere("!weird".to_owned())
+        );
+        for pattern in [".", "./.", "./"] {
+            let err = parse_pattern(pattern).expect_err(pattern);
+            assert!(
+                err.to_string().contains("names nothing"),
+                "{pattern}: {err}"
+            );
+        }
+    }
+
+    /// fails if a rename in the operator's checkout is read as an ignored
+    /// entry. With `-z` a rename is two fields, the second a bare path with
+    /// no status, and a field-by-field filter would take a second field that
+    /// happens to begin `!! ` for an entry.
+    #[test]
+    fn a_staged_rename_is_one_record_not_two() {
+        let repo = fixture_repo(&[
+            (".gitignore", "dist/\n"),
+            ("dist/app.js", "//"),
+            ("old.txt", "x"),
+        ]);
+        // A file whose new name would parse as an ignored entry if its record
+        // were split into two.
+        fixtures::run_git(repo.path(), &["mv", "old.txt", "!! x"]);
+
+        let found = ignored_present(repo.path()).expect("enumerates");
+
+        assert!(found.contains(&PathBuf::from("dist")), "{found:?}");
+        assert!(
+            !found.iter().any(|p| p.ends_with("x")),
+            "the rename's own path must not be read as ignored: {found:?}"
+        );
     }
 
     /// fails if a spelling this file cannot honour is accepted and silently

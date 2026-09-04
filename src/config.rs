@@ -93,11 +93,13 @@ const MINIMUM_DURATION: Duration = Duration::from_secs(1);
 pub struct DogConfig {
     /// How long the poll loop sleeps between ticks.
     pub interval: Duration,
-    /// How many releases per target retention keeps.
+    /// How many of the newest releases per target retention keeps.
     ///
-    /// This is a count of releases kept *besides* the live one, so a target
-    /// holds up to `retention + 1` directories. See `crate::retention::doomed`
-    /// for why the live release is spared unconditionally.
+    /// The release `current` names and the one `deploy.toml` names are
+    /// spared whatever their age, so a target holds `retention` directories
+    /// in the ordinary case and up to two more after a deploy that died
+    /// between its swap and its record write. See `crate::retention` for
+    /// why those two are named rather than counted.
     pub retention: usize,
     /// How long any single git subprocess may run before it is abandoned.
     pub git_timeout: Duration,

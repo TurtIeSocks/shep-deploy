@@ -23,7 +23,23 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::Error;
 
-/// Every sheep that is a deploy target, by name.
+/// What is under `<shep_home>/deploy`: every sheep that is a deploy target,
+/// by name, and every directory there that holds a record and cannot be
+/// named.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Targets {
+    /// The targets, sorted by name.
+    pub named: Vec<String>,
+    /// Directories holding a `deploy.toml` whose name cannot be a sheep's:
+    /// not valid UTF-8, or carrying a control character. Each is a target
+    /// the dog cannot poll or restore, reported by every caller as its own
+    /// row rather than skipped, and rather than stopping the listing for the
+    /// targets that can be named.
+    pub unnamed: Vec<PathBuf>,
+}
+
+/// Every sheep that is a deploy target, by name, and every directory that
+/// holds a record and cannot be named.
 ///
 /// A target is a directory under `<shep_home>/deploy` holding a
 /// `deploy.toml`. Reading the directory rather than a list held anywhere
@@ -35,34 +51,31 @@ use crate::error::Error;
 /// # Errors
 /// [`Error::Io`], naming `<shep_home>/deploy`, if it exists but cannot be
 /// listed. An absent directory is an empty list, not an error: that is
-/// every shepherd with no targets yet. Also [`Error::Io`], naming the
-/// offending entry, if a target directory's name is not valid UTF-8: a
-/// target the dog cannot name is a broken target, not an absent one.
-pub fn targets(shep_home: &Path) -> Result<Vec<String>, Error> {
+/// every shepherd with no targets yet. A directory that cannot be named is
+/// not an error either, it is in [`Targets::unnamed`]: one such entry used
+/// to stop the whole listing and with it every deploy of every target.
+pub fn targets(shep_home: &Path) -> Result<Targets, Error> {
     let root = shep_home.join("deploy");
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Targets::default());
+        }
         Err(source) => return Err(Error::Io { path: root, source }),
     };
 
-    let mut found = Vec::new();
+    let mut found = Targets::default();
     for entry in entries {
         let entry = entry.map_err(Error::at(&root))?;
         if !entry.path().join("deploy.toml").is_file() {
             continue;
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            return Err(Error::Io {
-                path: entry.path(),
-                source: std::io::Error::other(
-                    "directory name is not valid UTF-8, so it cannot name a sheep",
-                ),
-            });
-        };
-        found.push(name);
+        match entry.file_name().to_str() {
+            Some(name) if is_sheep_name(name) => found.named.push(name.to_owned()),
+            _ => found.unnamed.push(entry.path()),
+        }
     }
-    found.sort();
+    found.named.sort();
     Ok(found)
 }
 
@@ -90,9 +103,10 @@ pub struct Tree {
 /// line. The poll loop's names come from directory entries under
 /// `$SHEP_HOME/deploy` that this crate created, so they are already inside.
 ///
-/// The test is that the string is exactly one ordinary path component: that
-/// rejects the empty string, `.`, `..`, anything absolute, and anything with a
-/// separator in it, without a charset rule that would have to guess at what an
+/// The test is that the string is exactly one ordinary path component with no
+/// control character in it: that rejects the empty string, `.`, `..`, anything
+/// absolute, anything with a separator in it and anything that could forge a
+/// log line, without a charset rule that would have to guess at what an
 /// operator may call their app.
 #[must_use]
 pub fn is_sheep_name(sheep: &str) -> bool {
@@ -100,7 +114,9 @@ pub fn is_sheep_name(sheep: &str) -> bool {
     let one_ordinary_component =
         matches!(components.next(), Some(Component::Normal(only)) if only == sheep);
 
-    one_ordinary_component && components.next().is_none()
+    // No control character either. The name is interpolated into every log
+    // line about the target, and a newline in it forges a second line.
+    one_ordinary_component && components.next().is_none() && !sheep.chars().any(char::is_control)
 }
 
 impl Tree {
@@ -302,9 +318,32 @@ mod tests {
         }
         std::fs::write(bad_dir.join("deploy.toml"), "").expect("write deploy.toml");
 
-        let err = targets(home.path()).expect_err("non-UTF-8 name");
-        assert!(matches!(err, Error::Io { .. }));
-        assert!(format!("{err}").contains("UTF-8"));
+        let found = targets(home.path()).expect("the listing itself succeeds");
+        assert_eq!(
+            found.unnamed,
+            vec![bad_dir],
+            "the entry is reported, not skipped"
+        );
+        assert!(found.named.is_empty());
+    }
+
+    /// fails if a target the dog cannot name stops the targets it can. One
+    /// such entry used to abort the whole listing, and `poll::tick` then
+    /// deployed nothing, every tick, for as long as it sat there.
+    #[test]
+    fn an_unnameable_target_does_not_hide_the_named_ones() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let deploy = home.path().join("deploy");
+        for name in ["web", "bad\nname"] {
+            let dir = deploy.join(name);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join("deploy.toml"), "").expect("record");
+        }
+
+        let found = targets(home.path()).expect("lists");
+
+        assert_eq!(found.named, vec!["web".to_owned()]);
+        assert_eq!(found.unnamed, vec![deploy.join("bad\nname")]);
     }
 
     /// fails if a tree stops knowing which sheep it belongs to. The

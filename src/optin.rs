@@ -46,6 +46,7 @@ use std::time::Duration;
 
 use shep_client::shep_core::config::AppConfig;
 use shep_client::shep_core::protocol::ProcessInfo;
+use shep_client::shep_core::status::ProcStatus;
 use tokio::time::{Instant, sleep};
 
 use crate::build;
@@ -121,6 +122,70 @@ pub async fn prepare<D: Daemon>(
     config: &DogConfig,
 ) -> Result<Prepared, Error> {
     let tree = Tree::for_sheep(shep_home, sheep);
+
+    // Cloned rather than borrowed, and named `previous_config` rather than
+    // `app`, because the release's own definition shadows the name below and
+    // these two must never be confused: this one is the operator's, and it
+    // is the only copy of it that exists once Task 8 sends its Start.
+    let registered = roll::registered(daemon).await?;
+    let previous_config = registered.get(sheep).cloned().ok_or_else(|| {
+        Error::Config(format!(
+            "the shepherd has no sheep named {sheep:?} registered, so there is nothing to take \
+             over: `shep-deploy survey` lists every registered sheep and where it stands"
+        ))
+    })?;
+    let checkout = PathBuf::from(previous_config.cwd.as_deref().ok_or_else(|| {
+        Error::Config(format!(
+            "shep records no working directory for {sheep}, so there is no checkout to deploy \
+             from"
+        ))
+    })?);
+    // The shepherd already runs the sheep from this tree's `current`: a
+    // cutover landed and its record was not written, or the record was lost
+    // afterwards. Either way the tree is live, and the advice the record
+    // branch below gives an unrecorded tree, remove it and run setup again,
+    // would take a running service's cwd with it. The record is repaired
+    // from what `current` names instead, and the sheep is then what it is:
+    // a deploy target, refused here like any other.
+    if checkout == tree.current()
+        && let Some(release) = swap::resolve(&tree.current())?
+        && let Some(sha) = release.file_name().and_then(|name| name.to_str())
+        && crate::state::is_sha(sha)
+        && release.is_dir()
+    {
+        let mut recorded = State::read(&tree.state_file()).ok();
+        if let Some(state) = recorded.as_mut()
+            && state.deployed.is_none()
+        {
+            state.deployed = Some(sha.to_owned());
+            state.write(&tree.state_file())?;
+        }
+        return Err(Error::Config(format!(
+            "{sheep} is already a deploy target: the shepherd runs it from {}, which names {}. \
+             Its record has been brought up to date with that. Deploy it with `shep deploy \
+             {sheep}`, or change how it is watched with `shep deploy {sheep} --watch \
+             auto|manual`.",
+            tree.current().display(),
+            &sha[..7]
+        )));
+    }
+
+    // A cwd anywhere else inside this sheep's own deploy tree is what an
+    // abandoned cutover leaves in the shepherd's record once the tree's own
+    // record is gone, and capturing it as the origin would make removal put
+    // the sheep back INTO the tree. Refused by name rather than left to
+    // `current_branch`, which happened to refuse it only because releases
+    // are detached worktrees.
+    if checkout.starts_with(tree.root()) {
+        return Err(Error::Config(format!(
+            "{sheep} is registered with its working directory inside its own deploy tree ({}), \
+             so there is no operator checkout to take it over from. That is what an abandoned \
+             cutover leaves in the shepherd's record: re-register {sheep} from its own \
+             Flockfile in the checkout it should deploy from, then run setup again",
+            checkout.display()
+        )));
+    }
+
     if tree.state_file().is_file() {
         // Two very different situations share this one condition, and
         // telling them apart is not a nicety. A target that was cut over
@@ -170,39 +235,6 @@ pub async fn prepare<D: Daemon>(
                 tree.root().display()
             )
         }));
-    }
-
-    // Cloned rather than borrowed, and named `previous_config` rather than
-    // `app`, because the release's own definition shadows the name below and
-    // these two must never be confused: this one is the operator's, and it
-    // is the only copy of it that exists once Task 8 sends its Start.
-    let registered = roll::registered(daemon).await?;
-    let previous_config = registered.get(sheep).cloned().ok_or_else(|| {
-        Error::Config(format!(
-            "the shepherd has no sheep named {sheep:?} registered, so there is nothing to take \
-             over: `shep-deploy survey` lists every registered sheep and where it stands"
-        ))
-    })?;
-    let checkout = PathBuf::from(previous_config.cwd.as_deref().ok_or_else(|| {
-        Error::Config(format!(
-            "shep records no working directory for {sheep}, so there is no checkout to deploy \
-             from"
-        ))
-    })?);
-    // A cwd inside this sheep's own deploy tree is what an abandoned cutover
-    // leaves in the shepherd's record once the tree's own record is gone,
-    // and capturing it as the origin would make removal put the sheep back
-    // INTO the tree. Refused by name rather than left to `current_branch`,
-    // which happened to refuse it only because releases are detached
-    // worktrees.
-    if checkout.starts_with(tree.root()) {
-        return Err(Error::Config(format!(
-            "{sheep} is registered with its working directory inside its own deploy tree ({}), \
-             so there is no operator checkout to take it over from. That is what an abandoned \
-             cutover leaves in the shepherd's record: re-register {sheep} from its own \
-             Flockfile in the checkout it should deploy from, then run setup again",
-            checkout.display()
-        )));
     }
 
     // Both of these refuse rather than guess: a checkout with no `origin`
@@ -481,6 +513,18 @@ enum CutOver {
     Failed(Error),
 }
 
+/// Whether a newcomer's row says it is dead: a pid that is no longer alive,
+/// or, for a row with no pid, a status only a dead process has.
+fn died(info: &ProcessInfo) -> bool {
+    match info.pid {
+        Some(_) => !is_alive(info),
+        None => matches!(
+            info.status,
+            ProcStatus::Errored | ProcStatus::WaitingRestart
+        ),
+    }
+}
+
 /// What a first cutover most often runs into, said once.
 ///
 /// Appended to every `why` where it could be the cause, and deliberately not
@@ -597,13 +641,17 @@ async fn attempt<D: Daemon>(
             .filter(|info| !previous.contains(&info.id))
             .collect();
 
-        if newcomers.iter().any(|info| !is_alive(info)) {
+        // A row with a pid is judged by `is_alive`. A row without one is
+        // judged only by a status that says it died (`Errored`,
+        // `WaitingRestart`): a row the shepherd has accepted and not yet
+        // spawned has no pid either, and whatever status it carries in that
+        // instant is not a verdict.
+        if newcomers.iter().any(|info| died(info)) {
             return CutOver::NotVerified(format!(
                 "The new instance failed before it finished starting. {PORT_COLLISION}"
             ));
         }
-        // Up, with a process: a row the shepherd has accepted but not yet
-        // spawned has no pid, and the dwell below compares pids.
+        // Up, with a process: the dwell below compares pids.
         let up: Vec<&ProcessInfo> = newcomers
             .iter()
             .copied()
@@ -714,6 +762,7 @@ async fn undo_start<D: Daemon>(
     // Individual failures are recorded rather than returned: this path is
     // already failing, and an operator needs the reason they got here
     // rather than a second error about the cleanup.
+    let seen: Vec<u32> = flock.iter().map(|info| info.id).collect();
     let mut removed = drain(daemon, &flock, previous).await;
 
     let patience = cutover_budget(&original);
@@ -741,7 +790,14 @@ async fn undo_start<D: Daemon>(
                 recorded: true,
             };
         };
-        if flock.iter().any(|info| !previous.contains(&info.id)) {
+        // A row that is new to both the pre-cutover flock AND the listing the
+        // first drain worked from. A newcomer that drain could not delete is
+        // in the second and must not pass for the repair instance, or the
+        // wait ends before that instance appears and it is left running.
+        if flock
+            .iter()
+            .any(|info| !previous.contains(&info.id) && !seen.contains(&info.id))
+        {
             removed &= drain(daemon, &flock, previous).await;
             break;
         }
@@ -848,11 +904,13 @@ mod tests {
     /// reads, and a checkout is a perfectly fetchable remote for its own
     /// history.
     fn checkout_with_commit() -> tempfile::TempDir {
+        checkout_declaring("[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\n")
+    }
+
+    /// As [`checkout_with_commit`], with the Flockfile's text given.
+    fn checkout_declaring(flockfile: &str) -> tempfile::TempDir {
         let dir = fixtures::checkout(&[
-            (
-                "Flockfile.toml",
-                "[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\n",
-            ),
+            ("Flockfile.toml", flockfile),
             ("run.sh", "#!/bin/sh\necho hi\n"),
         ]);
         // Itself, so `git::remote_url` has an answer. Nothing fetches from it.
@@ -1157,6 +1215,9 @@ mod tests {
         attempts: Cell<usize>,
         /// When the cutover's own `Start` was accepted.
         accepted_at: Cell<Option<Instant>>,
+        /// At most this many newcomers appear, whatever the `Start` asked
+        /// for: a shepherd that spawned one of two and no more.
+        newcomers_at_most: Option<u32>,
         /// How many instances the repair `Start`s have spawned.
         repairs: Cell<u32>,
         /// When the first repair `Start` was accepted; its instance appears
@@ -1182,9 +1243,17 @@ mod tests {
                 deletes: RefCell::new(Vec::new()),
                 attempts: Cell::new(0),
                 accepted_at: Cell::new(None),
+                newcomers_at_most: None,
                 repairs: Cell::new(0),
                 repaired_at: Cell::new(None),
             }
+        }
+
+        /// The same double, spawning at most `n` newcomers however many the
+        /// `Start` asked for.
+        fn spawning_at_most(mut self, n: u32) -> Self {
+            self.newcomers_at_most = Some(n);
+            self
         }
 
         /// The same double, with every `describe` failing from `after`
@@ -1280,8 +1349,16 @@ mod tests {
                     restarts,
                 } = shape_at(&self.script, elapsed)
             {
-                for offset in 0..self.originals.len() {
-                    let offset = u32::try_from(offset).expect("a handful of instances");
+                // As many as the accepted `Start` asked for, which is what a
+                // shepherd spawns; the originals' count is a different
+                // number and using it hid the multi-instance wait entirely.
+                let asked = self
+                    .starts
+                    .borrow()
+                    .first()
+                    .map_or(1, |app| app.instances.max(1));
+                let spawned = self.newcomers_at_most.map_or(asked, |cap| asked.min(cap));
+                for offset in 0..spawned {
                     let id = NEWCOMER_ID - offset;
                     if !self.is_deleted(id) {
                         flock.push(self.row(id, status, pid + offset, restarts));
@@ -1361,8 +1438,17 @@ mod tests {
         script: Vec<(Duration, Shape)>,
         refuses: Option<usize>,
     ) -> (CutOverDouble, Prepared, Dirs) {
+        cutover_fixture_from(checkout_with_commit(), originals, script, refuses).await
+    }
+
+    /// As [`cutover_fixture_of`], from a checkout the test built itself.
+    async fn cutover_fixture_from(
+        checkout: tempfile::TempDir,
+        originals: &[u32],
+        script: Vec<(Duration, Shape)>,
+        refuses: Option<usize>,
+    ) -> (CutOverDouble, Prepared, Dirs) {
         let home = tempfile::tempdir().expect("tempdir");
-        let checkout = checkout_with_commit();
         let entries = [("bpm", checkout.path())];
         let roll = RollOf(&entries);
         let prepared = prepare(&roll, home.path(), "bpm", &fixtures::dog_config())
@@ -1629,6 +1715,47 @@ mod tests {
     async fn every_replaced_instance_is_deleted() {
         let (daemon, prepared, _dirs) = cutover_fixture_with_instances(&[7, 8]).await;
         cut_over(&daemon, prepared).await.expect("cuts over");
+        assert_eq!(daemon.deleted(), vec![7, 8]);
+    }
+
+    /// fails if a scaled sheep's cutover settles for fewer newcomers than
+    /// the `Start` asked for. With `instances = 2` and a shepherd that
+    /// spawned one, the cutover used to freeze its generation on that one,
+    /// verify it, and delete both originals: the sheep came back at half
+    /// strength with the deploy reported landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_scaled_cutover_waits_for_every_instance_the_start_asked_for() {
+        let checkout =
+            checkout_declaring("[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\ninstances = 2\n");
+        let (daemon, prepared, _dirs) =
+            cutover_fixture_from(checkout, &[7, 8], comes_up(), None).await;
+        let daemon = daemon.spawning_at_most(1);
+
+        let err = cut_over(&daemon, prepared)
+            .await
+            .expect_err("one of two is not a cutover");
+
+        let shown = err.to_string();
+        assert!(shown.contains("Only 1 of the 2"), "{shown}");
+        assert!(
+            !daemon.deleted().contains(&7) && !daemon.deleted().contains(&8),
+            "the originals are kept: {:?}",
+            daemon.deleted()
+        );
+    }
+
+    /// fails if a scaled sheep whose newcomers all appear is not cut over.
+    /// The other half of the test above: two asked for, two spawned, both
+    /// originals replaced.
+    #[tokio::test(start_paused = true)]
+    async fn a_scaled_cutover_lands_when_every_instance_appears() {
+        let checkout =
+            checkout_declaring("[[app]]\nname = \"bpm\"\nscript = \"./run.sh\"\ninstances = 2\n");
+        let (daemon, prepared, _dirs) =
+            cutover_fixture_from(checkout, &[7, 8], comes_up(), None).await;
+
+        cut_over(&daemon, prepared).await.expect("cuts over");
+
         assert_eq!(daemon.deleted(), vec![7, 8]);
     }
 
