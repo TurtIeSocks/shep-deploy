@@ -5,6 +5,16 @@ All notable changes to this crate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-09-04
+
+### Fixed
+
+- Walk both ends of an artifact copy from an approved root
+- Refuse an artifact that names a root or a directory, before anything is made
+- Open an artifact source O_NONBLOCK, so a named pipe cannot hang the dog
+- Walk both ends of an artifact copy from an approved root ([#14](https://github.com/shep-pm/shep-deploy/pull/14))
+
+
 ## [0.2.3] - 2026-09-04
 
 ### Changed
